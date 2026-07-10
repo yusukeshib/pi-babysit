@@ -312,7 +312,7 @@ async function rpcResponse(
 	if (e.code !== 0) {
 		const st = await statusOf(id);
 		if (st && st.state !== "running") {
-			const tail = (await bs(["log", "-s", id, "--tail", "15"])).stdout.trim();
+			const tail = clip((await bs(["log", "-s", id, "--tail", "15"])).stdout.trim());
 			return {
 				ok: false,
 				error:
@@ -336,7 +336,7 @@ async function rpcResponse(
 			const ev = JSON.parse(line);
 			if (ev.type === "response" && ev.command === command) {
 				if (ev.success === false) {
-					return { ok: false, error: String(ev.error ?? `${command} failed`) };
+					return { ok: false, error: clip(String(ev.error ?? `${command} failed`)) };
 				}
 				return { ok: true, data: ev.data as Record<string, unknown> | undefined };
 			}
@@ -355,6 +355,26 @@ function parseDurMs(s?: string): number | null {
 	const n = Number(m[1]);
 	const u = m[2] ?? "s";
 	return n * (u === "ms" ? 1 : u === "s" ? 1000 : u === "m" ? 60_000 : 3_600_000);
+}
+
+// ---------------------------------------------------------------------------
+// Context-size guard — every string that flows back into the agent's context
+// passes through clip(). Log tails are line-capped upstream (`--tail N`), but
+// a single pathological line (minified JS, a giant JSON blob) can still be
+// megabytes, so we also cap bytes, eliding the middle so both the head and
+// the tail of the output stay visible.
+
+const TAIL_MAX_BYTES = 8_000; // log tails / screens
+const ANSWER_MAX_BYTES = 24_000; // subagent answers / error messages
+
+function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
+	const buf = Buffer.from(s, "utf8");
+	if (buf.length <= maxBytes) return s;
+	const half = Math.floor(maxBytes / 2);
+	// Strip replacement chars from a mid-codepoint cut at the boundary.
+	const head = buf.subarray(0, half).toString("utf8").replace(/\uFFFD+$/, "");
+	const tail = buf.subarray(buf.length - half).toString("utf8").replace(/^\uFFFD+/, "");
+	return `${head}\n… [${buf.length - maxBytes} bytes elided] …\n${tail}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +817,10 @@ async function waitForTask(
 			(prog.cost != null ? ` $${prog.cost.toFixed(4)}` : "");
 
 		if (prog.done) {
-			const body = prog.finalText.trim() || prog.errorMsg || "(no answer text)";
+			const body = clip(
+				prog.finalText.trim() || prog.errorMsg || "(no answer text)",
+				ANSWER_MAX_BYTES,
+			);
 			const ok = prog.finalText.trim().length > 0 || !prog.errorMsg;
 			return {
 				id,
@@ -814,8 +837,11 @@ async function waitForTask(
 
 		if (!st || st.state !== "running") {
 			// Crash / timeout / external kill — make the cause visible.
-			const tail = (await bs(["log", "-s", id, "--tail", "20"])).stdout.trim();
-			const body = prog.finalText.trim() || prog.errorMsg || tail || "(no output)";
+			const tail = clip((await bs(["log", "-s", id, "--tail", "20"])).stdout.trim());
+			const body = clip(
+				prog.finalText.trim() || prog.errorMsg || tail || "(no output)",
+				ANSWER_MAX_BYTES,
+			);
 			return {
 				id,
 				kind: "exited",
@@ -895,7 +921,7 @@ async function waitForExit(
 			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
 		}
 		if (e.code === 0) {
-			const tail = (await bs(["log", "-s", id, "--tail", "10"])).stdout.trim();
+			const tail = clip((await bs(["log", "-s", id, "--tail", "10"])).stdout.trim());
 			return {
 				id,
 				kind: "done",
@@ -939,7 +965,7 @@ async function waitForExit(
 		return { id, kind: "exited", ok: false, text: `No such session: ${id}` };
 	}
 	suppressNotify(id); // the agent sees the exit here; don't notify again
-	const tail = (await bs(["log", "-s", id, "--tail", "20"])).stdout.trim();
+	const tail = clip((await bs(["log", "-s", id, "--tail", "20"])).stdout.trim());
 	const ok = st.exit_code === 0;
 	const meta = readMeta(id);
 	return {
@@ -999,7 +1025,7 @@ export default function (pi: ExtensionAPI) {
 			if (!meta || meta.kind !== "process" || meta.notified) continue;
 			meta.notified = true;
 			writeMeta(s.id, meta);
-			const tail = (await bs(["log", "-s", s.id, "--tail", "20"])).stdout.trim();
+			const tail = clip((await bs(["log", "-s", s.id, "--tail", "20"])).stdout.trim());
 			const ok = s.exit_code === 0;
 			const runtime = meta.startedAt
 				? `${Math.round((Date.now() - meta.startedAt) / 1000)}s`
@@ -1323,10 +1349,10 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			id: Type.Optional(Type.String({ description: "Session id. Omit to list all sessions." })),
 			tools: Type.Optional(
-				Type.Number({ description: "Subagent: how many recent tool calls to show (default 8)." }),
+				Type.Number({ description: "Subagent: how many recent tool calls to show (default 8, max 50)." }),
 			),
 			lines: Type.Optional(
-				Type.Number({ description: "Process: how many log lines to show (default 30)." }),
+				Type.Number({ description: "Process: how many log lines to show (default 30, max 200)." }),
 			),
 			screen: Type.Optional(
 				Type.Boolean({
@@ -1385,10 +1411,12 @@ export default function (pi: ExtensionAPI) {
 				parts.push(header);
 				if (params.screen) {
 					const sc = await bs(["screenshot", "-s", params.id, "--trim"]);
-					parts.push(`--- screen ---\n${sc.stdout.trimEnd() || "(blank screen)"}`);
+					parts.push(`--- screen ---\n${clip(sc.stdout.trimEnd()) || "(blank screen)"}`);
 				} else {
-					const tail = (await bs(["log", "-s", params.id, "--tail", String(params.lines ?? 30)]))
-						.stdout.trimEnd();
+					const nLines = Math.min(Math.max(1, params.lines ?? 30), 200);
+					const tail = clip(
+						(await bs(["log", "-s", params.id, "--tail", String(nLines)])).stdout.trimEnd(),
+					);
 					parts.push(tail ? `--- recent output ---\n${tail}` : "(no output yet)");
 				}
 				return {
@@ -1401,7 +1429,7 @@ export default function (pi: ExtensionAPI) {
 			const logArgs = ["log", "-s", params.id];
 			if (meta?.promptOffset) logArgs.push("--since", String(meta.promptOffset));
 			const prog = parseEvents((await bs(logArgs)).stdout);
-			const nTools = params.tools ?? 8;
+			const nTools = Math.min(Math.max(1, params.tools ?? 8), 50);
 			const recent = prog.toolCalls.slice(-nTools);
 
 			const parts: string[] = [];
@@ -1422,7 +1450,7 @@ export default function (pi: ExtensionAPI) {
 			if (st.note) header += ` ⚑ ${st.note}`;
 			parts.push(header);
 
-			if (prog.errorMsg) parts.push(`⚠ error: ${prog.errorMsg}`);
+			if (prog.errorMsg) parts.push(`⚠ error: ${clip(prog.errorMsg, ANSWER_MAX_BYTES)}`);
 
 			if (recent.length > 0) {
 				const skipped = prog.toolCalls.length - recent.length;
@@ -1433,11 +1461,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (prog.finalText.trim()) {
-				parts.push(`--- answer so far ---\n${prog.finalText.trim()}`);
+				parts.push(`--- answer so far ---\n${clip(prog.finalText.trim(), ANSWER_MAX_BYTES)}`);
 			} else if (prog.toolCalls.length === 0 && st.state !== "running") {
 				// Died before doing anything — show the log tail so the cause of
 				// death (model error, crash, timeout) is visible, not hidden.
-				const tail = (await bs(["log", "-s", params.id, "--tail", "15"])).stdout.trim();
+				const tail = clip((await bs(["log", "-s", params.id, "--tail", "15"])).stdout.trim());
 				parts.push(tail ? `--- last output ---\n${tail}` : "(no output)");
 			} else if (prog.toolCalls.length === 0) {
 				parts.push("(starting up… no events yet)");

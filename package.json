@@ -1,6 +1,6 @@
 {
   "name": "pi-babysit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run anything long-lived under babysit — one supervision substrate for processes and pi subagents, surfaced to the agent as babysit_run/check/send/wait/kill.",
   "keywords": [
     "pi-package",
