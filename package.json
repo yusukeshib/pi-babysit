@@ -1,0 +1,28 @@
+{
+  "name": "pi-babysit",
+  "version": "0.1.0",
+  "description": "Run anything long-lived under babysit — one supervision substrate for processes and pi subagents, surfaced to the agent as babysit_run/check/send/wait/kill.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "babysit"
+  ],
+  "license": "MIT",
+  "author": "Yusuke Shibata <yusukeshib@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yusukeshib/pi-babysit.git"
+  },
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
