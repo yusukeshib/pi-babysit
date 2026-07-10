@@ -84,10 +84,23 @@ const POLL_MS = 2500;
 interface BsSession {
 	id: string;
 	state: string; // "running" | "exited" | "dead" ...
+	alive?: boolean; // whether the PTY worker process is still live
 	exit_code?: number | null;
 	note?: string | null;
 	output_bytes?: number;
 	screen_seq?: number | null;
+}
+
+// A worker whose PTY process is gone (alive:false) can still report state
+// "running" if it crashed BEFORE recording its exit transition (e.g. the child
+// died in the first few ms). Treat that as finished so it never shows or counts
+// as running. This normalizes at the source so every downstream
+// `state === "running"` check is correct.
+function normalizeSession(s: BsSession): BsSession {
+	if (s.alive === false && s.state === "running") {
+		return { ...s, state: s.exit_code != null ? "exited" : "dead" };
+	}
+	return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +189,8 @@ async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }
 	}
 	try {
 		const parsed = JSON.parse(r.stdout);
-		return { sessions: Array.isArray(parsed) ? parsed : (parsed.sessions ?? []) };
+		const raw: BsSession[] = Array.isArray(parsed) ? parsed : (parsed.sessions ?? []);
+		return { sessions: raw.map(normalizeSession) };
 	} catch {
 		return { sessions: [], error: `could not parse babysit list output: ${r.stdout.slice(0, 200)}` };
 	}
@@ -190,9 +204,15 @@ async function statusOf(id: string): Promise<BsSession | null> {
 	try {
 		const parsed = JSON.parse(r.stdout);
 		const inner = parsed.status ?? parsed;
-		const note =
-			(await listSessions()).sessions.find((s) => s.id === id)?.note ?? null;
-		return { id: parsed.session ?? id, note, ...inner };
+		// `note` and `alive` live only in `list --json`, so fold them in from there
+		// (alive is what lets us detect a crashed-but-"running" worker).
+		const listed = (await listSessions()).sessions.find((s) => s.id === id);
+		return normalizeSession({
+			id: parsed.session ?? id,
+			note: listed?.note ?? null,
+			alive: listed?.alive,
+			...inner,
+		});
 	} catch {
 		return null;
 	}
