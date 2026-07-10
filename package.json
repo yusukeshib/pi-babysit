@@ -14,6 +14,14 @@
     "url": "git+https://github.com/yusukeshib/pi-babysit.git"
   },
   "type": "module",
+  "files": [
+    "index.ts",
+    "agents.ts",
+    "self-reap.ts",
+    "format-stream.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
