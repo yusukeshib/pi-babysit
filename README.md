@@ -9,7 +9,7 @@ It retires both `@mjakl/pi-processes` (the `process` tool) and the old
 ## Install
 
 ```sh
-pi install git:github.com/yusukeshib/pi-babysit
+pi install npm:@yusukeshib/pi-babysit
 ```
 
 Then install the [`babysit`](https://github.com/yusukeshib/babysit) binary
