@@ -1,5 +1,5 @@
 {
-  "name": "pi-babysit",
+  "name": "@yusukeshib/pi-babysit",
   "version": "0.2.0",
   "description": "Run anything long-lived under babysit — one supervision substrate for processes and pi subagents, surfaced to the agent as babysit_run/check/send/wait/kill.",
   "keywords": [
@@ -9,9 +9,13 @@
   ],
   "license": "MIT",
   "author": "Yusuke Shibata <yusukeshib@gmail.com>",
+  "homepage": "https://github.com/yusukeshib/pi-babysit#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yusukeshib/pi-babysit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yusukeshib/pi-babysit/issues"
   },
   "type": "module",
   "files": [
@@ -22,6 +26,9 @@
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "release": "npm publish --access public"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
