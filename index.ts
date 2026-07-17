@@ -746,6 +746,51 @@ function renderWidgetLines(procs: number, busy: number, idle: number): string[] 
 	return [`\x1b[44;97m ${parts.join(" \u00b7 ")} \x1b[0m`];
 }
 
+// How many trailing output lines to show per running session in the widget.
+const WIDGET_TAIL_LINES = 5;
+const WIDGET_TAIL_WIDTH = 100;
+
+// Strip ANSI/control escapes and clamp width so raw PTY output can't wrap or
+// corrupt the widget area.
+function sanitizeTailLine(s: string): string {
+	const clean = s
+		.replace(/\r/g, "")
+		// CSI / OSC / other escape sequences
+		.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+		.replace(/\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		// remaining non-printable control chars (keep tab)
+		.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+	return clean.length > WIDGET_TAIL_WIDTH ? `${clean.slice(0, WIDGET_TAIL_WIDTH - 1)}…` : clean;
+}
+
+// Trailing lines to show for a running session, indented under its header.
+// process → raw log tail; subagent → derived activity (recent tool calls /
+// partial answer), since its log is RPC JSONL, not human-readable.
+async function widgetTail(id: string, isSub: boolean): Promise<string[]> {
+	let raw: string[];
+	if (!isSub) {
+		const out = (await bs(["log", "-s", id, "--tail", String(WIDGET_TAIL_LINES)])).stdout;
+		raw = out.split("\n");
+	} else {
+		const meta = readMeta(id);
+		const logArgs = ["log", "-s", id];
+		if (meta?.promptOffset) logArgs.push("--since", String(meta.promptOffset));
+		const prog = parseEvents((await bs(logArgs)).stdout);
+		if (prog.finalText.trim()) {
+			raw = prog.finalText.trim().split("\n");
+		} else if (prog.toolCalls.length > 0) {
+			raw = prog.toolCalls.map((t) => t.summary);
+		} else {
+			raw = prog.errorMsg ? [`⚠ ${prog.errorMsg}`] : [];
+		}
+	}
+	return raw
+		.map(sanitizeTailLine)
+		.filter((l) => l.trim().length > 0)
+		.slice(-WIDGET_TAIL_LINES)
+		.map((l) => `     │ ${l}`);
+}
+
 // Classify a running subagent as busy or idle by analyzing the current task's
 // log slice (same logic babysit_check uses).
 async function isTaskDone(id: string): Promise<boolean> {
@@ -1060,12 +1105,16 @@ export default function (pi: ExtensionAPI) {
 		const lines = renderWidgetLines(procs, subs.length - idle, idle);
 		// Per-session elapsed time (live: refreshed every poll tick).
 		const doneById = new Map(subs.map((s, i) => [s.id, doneFlags[i]]));
-		for (const s of active) {
+		const tails = await Promise.all(
+			active.map((s) => widgetTail(s.id, kindOf(s.id) === "subagent")),
+		);
+		active.forEach((s, i) => {
 			const isSub = kindOf(s.id) === "subagent";
 			const tag = isSub ? (doneById.get(s.id) ? "sub idle" : "sub") : "proc";
 			const el = elapsedOf(s.id);
 			lines.push(`  ⏳ ${s.id} [${tag}]${el ? ` ${el}` : ""}`);
-		}
+			lines.push(...tails[i]);
+		});
 		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });
 	};
 
