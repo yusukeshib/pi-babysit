@@ -763,7 +763,7 @@ function sanitizeTailLine(s: string): string {
 	return clean.length > WIDGET_TAIL_WIDTH ? `${clean.slice(0, WIDGET_TAIL_WIDTH - 1)}…` : clean;
 }
 
-// Trailing lines to show for a running session, indented under its header.
+// Trailing lines to show for a running session (sanitized, unprefixed).
 // process → raw log tail; subagent → derived activity (recent tool calls /
 // partial answer), since its log is RPC JSONL, not human-readable.
 async function widgetTail(id: string, isSub: boolean): Promise<string[]> {
@@ -787,8 +787,7 @@ async function widgetTail(id: string, isSub: boolean): Promise<string[]> {
 	return raw
 		.map(sanitizeTailLine)
 		.filter((l) => l.trim().length > 0)
-		.slice(-WIDGET_TAIL_LINES)
-		.map((l) => `     │ ${l}`);
+		.slice(-WIDGET_TAIL_LINES);
 }
 
 // Classify a running subagent as busy or idle by analyzing the current task's
@@ -1112,8 +1111,14 @@ export default function (pi: ExtensionAPI) {
 			const isSub = kindOf(s.id) === "subagent";
 			const tag = isSub ? (doneById.get(s.id) ? "sub idle" : "sub") : "proc";
 			const el = elapsedOf(s.id);
-			lines.push(`  ⏳ ${s.id} [${tag}]${el ? ` ${el}` : ""}`);
-			lines.push(...tails[i]);
+			const header = `  ⏳ ${s.id} [${tag}]${el ? ` ${el}` : ""}`;
+			if (tails[i].length === 1) {
+				// Single tail line: keep it on the same row as the header.
+				lines.push(`${header}  │ ${tails[i][0]}`);
+			} else {
+				lines.push(header);
+				for (const t of tails[i]) lines.push(`     │ ${t}`);
+			}
 		});
 		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });
 	};
