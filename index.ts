@@ -747,7 +747,7 @@ function renderWidgetLines(procs: number, busy: number, idle: number): string[] 
 }
 
 // How many trailing output lines to show per running session in the widget.
-const WIDGET_TAIL_LINES = 5;
+const WIDGET_TAIL_LINES = 1;
 const WIDGET_TAIL_WIDTH = 100;
 
 // Strip ANSI/control escapes and clamp width so raw PTY output can't wrap or
