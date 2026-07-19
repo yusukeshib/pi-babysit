@@ -1197,6 +1197,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Babysit: run",
 		description:
 			"Start a supervised background session under babysit (NON-BLOCKING; returns a session id). " +
+			"In non-interactive mode (`pi -p`, no UI) process mode instead BLOCKS until the command " +
+			"exits and returns its output inline — there is no notification loop to resume a parked turn. " +
 			"Two modes: (1) `command` — run any long-lived or slow command (build, tests, dev server, " +
 			"watcher, interactive TUI) in a PTY; you get an AUTOMATIC notification when it exits, and " +
 			"you can type into it with babysit_send and read its screen with babysit_check. " +
@@ -1311,6 +1313,23 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				await refreshWidget(ctx);
+
+				// One-shot / non-interactive mode (e.g. `pi -p`): there is no live
+				// event loop to deliver the exit notification, and ending the turn
+				// would exit pi entirely — orphaning the babysat process and losing
+				// the session (the agent "settles" the moment it is told the turn will
+				// stop). So block inline like a normal command and return the full
+				// outcome in THIS turn. The process still runs under babysit (logged,
+				// killable), we just wait for it here instead of fire-and-forget.
+				if (!ctx.hasUI) {
+					const outcome = await waitForExit(res.id, parseDurMs(params.timeout), _signal);
+					return {
+						content: [{ type: "text", text: outcome.text }],
+						isError: !outcome.ok,
+						details: { id: res.id, kind: "process", command: params.command },
+					};
+				}
+
 				const continueAfter = params.continueAfterStart === true;
 				const nextStep = continueAfter
 					? "Continue with specific non-polling work now; the exit notification will arrive on its own."
