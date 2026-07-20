@@ -1209,7 +1209,7 @@ export default function (pi: ExtensionAPI) {
 			"Run a command or a pi subagent as a supervised background session (non-blocking); returns a session id",
 		promptGuidelines: [
 			"Run every long-lived or slow command through babysit_run instead of bash: builds, test suites, dev servers, watchers, `tail -f`, anything expected to take more than a few seconds. Give it a clear stable `name` (e.g. cargo-build).",
-			"babysit_run { command } ENDS YOUR TURN by default — you are resumed by the automatic process-end notification, so just stop; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
+			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
 			"Delegate self-contained tasks (codebase recon, a parallelizable subtask, work that would pollute your context) with babysit_run { profile: \"subagent\", task }. Launch several for independent subtasks; they run concurrently.",
 			"After spawning subagents, do not idle-wait and do not end your turn to wait for them: keep making progress, then call babysit_wait (ids + mode any/all) when you need their results. Steer or send follow-up tasks with babysit_send; kill runaways with babysit_kill.",
@@ -1346,11 +1346,13 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: { id: res.id, kind: "process", command: params.command },
-					// Same contract as the old `process` tool: end the turn so the
-					// exit notification can resume the agent. This also makes the
-					// parked-turn rule deterministic — the toolResult (with
-					// NOTIFY_MARKER) is guaranteed to be the turn's LAST message.
-					terminate: !continueAfter,
+					// Do not return `terminate: true` here. In RPC/subagent hosts that hint
+					// can shut down the hosting pi worker, whose process-tree cleanup then
+					// kills the otherwise detached babysit supervisor and closes its PTY
+					// (observed as an immediate `^D`). The prompt contract tells the model
+					// to stop after this result instead; the NOTIFY_MARKER still identifies
+					// a parked turn to the parent/self-reaper logic.
+					terminate: false,
 				};
 			}
 
