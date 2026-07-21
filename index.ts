@@ -1092,6 +1092,30 @@ function backgroundsItself(command: string): boolean {
 	return false;
 }
 
+function boundedLineCount(command: string): number | null {
+	const matches = [...command.matchAll(/(?:^|\|)\s*(?:head|tail)\s+(?:-n\s+|--lines(?:=|\s+)|-)(\d+)\b/g)];
+	if (matches.length === 0) return null;
+	return Math.max(...matches.map((m) => Number(m[1])));
+}
+
+/** Commands allowed to bypass babysit: tiny scalar observations and strictly
+ * bounded reads of captured log files. This is deliberately conservative;
+ * uncertain shell syntax belongs in babysit_run where output is capped. */
+export function isAllowedDirectBash(command: string): boolean {
+	if (process.env.PI_BABYSIT_ALLOW_BASH === "1") return true;
+	const s = command.trim();
+	if (/^(pwd|git status --short|git branch --show-current)$/.test(s)) return true;
+	if (!s || /[;&`\n\r]|\$\(|>|\b(?:bash|sh|zsh)\s+-c\b/.test(s)) return false;
+	if (!/(?:output\.log|\/(?:tmp|var\/tmp)\/[^\s'\"]*\.log)\b/.test(s)) return false;
+	if (/^wc\s+-(?:l|c)\s+/.test(s) && !s.includes("|")) return true;
+	if (!/^(?:tail|head|rg)\b/.test(s)) return false;
+	const limit = boundedLineCount(s);
+	if (limit == null || limit > 100) return false;
+	// rg must feed a bounded head/tail; direct head/tail is already bounded.
+	if (/^rg\b/.test(s) && !/\|\s*(?:head|tail)\b/.test(s)) return false;
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // extension
 // ---------------------------------------------------------------------------
@@ -1228,17 +1252,27 @@ export default function (pi: ExtensionAPI) {
 		pollTimer = undefined;
 	});
 
-	// Block bash commands that background themselves — they belong in
-	// babysit_run (which supervises, logs, and notifies on exit).
+	// Keep unpredictable command output out of model context. Direct bash is
+	// reserved for tiny scalar observations and tightly bounded log inspection;
+	// everything else belongs in babysit_run.
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "bash") return;
 		const command = String((event.input as { command?: unknown }).command ?? "");
-		if (!backgroundsItself(command)) return;
+		if (backgroundsItself(command)) {
+			return {
+				block: true,
+				reason:
+					`This bash command tries to run in the background. Use babysit_run instead, e.g. ` +
+					`babysit_run({ name: "background-process", command: ${JSON.stringify(command.replace(/\s*&\s*$/, ""))} })`,
+			};
+		}
+		if (isAllowedDirectBash(command)) return;
 		return {
 			block: true,
 			reason:
-				`This bash command tries to run in the background. Use babysit_run instead, e.g. ` +
-				`babysit_run({ name: "background-process", command: ${JSON.stringify(command.replace(/\s*&\s*$/, ""))} })`,
+				"Use babysit_run for this command so potentially large output is captured outside model context. " +
+				"Direct bash is allowed only for pwd, short git status/branch checks, or log-file tail/rg commands explicitly bounded to at most 100 lines. " +
+				`Retry as babysit_run({ command: ${JSON.stringify(command)} }).`,
 		};
 	});
 

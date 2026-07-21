@@ -1,14 +1,17 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import extension from "./index.ts";
+import extension, { isAllowedDirectBash } from "./index.ts";
 
 const tools = new Map<string, any>();
+const hooks = new Map<string, any>();
 
 extension({
 	registerTool(tool: { name: string }) {
 		tools.set(tool.name, tool);
 	},
-	on() {},
+	on(name: string, handler: unknown) {
+		hooks.set(name, handler);
+	},
 	registerMessageRenderer() {},
 	registerCommand() {},
 	sendMessage() {},
@@ -30,6 +33,30 @@ async function run(command: string, extras: Record<string, unknown> = {}) {
 		isError?: boolean;
 	}>;
 }
+
+test("direct bash policy allows only tiny observations and bounded log reads", () => {
+	expect(isAllowedDirectBash("pwd")).toBe(true);
+	expect(isAllowedDirectBash("git status --short")).toBe(true);
+	expect(isAllowedDirectBash("tail -n 50 /tmp/build.log")).toBe(true);
+	expect(isAllowedDirectBash("rg -n 'error' /tmp/build.log | head -n 80")).toBe(true);
+	expect(isAllowedDirectBash("tail -n 101 /tmp/build.log")).toBe(false);
+	expect(isAllowedDirectBash("rg -n 'error' /tmp/build.log")).toBe(false);
+	expect(isAllowedDirectBash("git diff --stat && git diff")).toBe(false);
+	expect(isAllowedDirectBash("gh api repos/x/y/actions/jobs/1/logs > /tmp/ci.log")).toBe(false);
+	expect(isAllowedDirectBash("bash -c 'tail -n 10 /tmp/build.log'")).toBe(false);
+	expect(isAllowedDirectBash("tail -n 10 /tmp/build.log; cat /etc/hosts")).toBe(false);
+});
+
+test("tool hook blocks broad bash with a concrete babysit_run redirect", async () => {
+	const hook = hooks.get("tool_call");
+	const blocked = await hook({ toolName: "bash", input: { command: "git diff" } });
+	const allowed = await hook({ toolName: "bash", input: { command: "tail -n 40 /tmp/build.log" } });
+
+	expect(blocked.block).toBe(true);
+	expect(blocked.reason).toContain("babysit_run");
+	expect(blocked.reason).toContain("git diff");
+	expect(allowed).toBeUndefined();
+});
 
 test("small process output is returned with metadata and a log path", async () => {
 	const result = await run("printf '\\160\\162\\151\\166\\141\\164\\145\\055\\157\\165\\164\\160\\165\\164\\055\\154\\151\\156\\145\\012'");

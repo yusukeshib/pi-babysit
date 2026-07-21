@@ -84,6 +84,13 @@ rg -n 'FAIL|ERROR' /path/to/output.log
 `babysit_check { id, lines }` remains available as a convenient bounded tail.
 Do not read a potentially large log file in full.
 
+To enforce this policy, the extension blocks direct `bash` except for `pwd`,
+short Git status/branch checks, and `head`/`tail`/`rg` reads of `.log` files that
+are explicitly bounded to at most 100 lines. Broad searches, diffs, API calls,
+multiple commands, redirects, and shell wrappers are redirected to
+`babysit_run`. Set `PI_BABYSIT_ALLOW_BASH=1` only as an emergency escape hatch
+to disable this gate.
+
 ## External worker death
 
 If endpoint security or another external actor kills the babysit supervisor,
