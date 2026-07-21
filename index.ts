@@ -232,6 +232,7 @@ interface Meta {
 	name?: string;
 	command?: string;
 	notified?: boolean;
+	completionObservedAt?: number;
 	startedAt?: number;
 	// subagent
 	task?: string;
@@ -1103,6 +1104,15 @@ export default function (pi: ExtensionAPI) {
 			if (s.state === "running") continue;
 			const meta = readMeta(s.id);
 			if (!meta || meta.kind !== "process" || meta.notified) continue;
+			// Delay delivery by one poll interval. This gives an agent that chose
+			// babysit_wait immediately after babysit_run enough time to claim the
+			// completion and suppress the otherwise duplicate automatic message.
+			if (!meta.completionObservedAt) {
+				meta.completionObservedAt = Date.now();
+				writeMeta(s.id, meta);
+				continue;
+			}
+			if (Date.now() - meta.completionObservedAt < POLL_MS) continue;
 			meta.notified = true;
 			writeMeta(s.id, meta);
 			const ok = s.exit_code === 0;
