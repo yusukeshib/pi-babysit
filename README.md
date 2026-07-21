@@ -49,7 +49,7 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`) or start a subagent (`profile: "subagent"`, `task`, optional `agent`/`model`/`tools`). Quick commands return inline; longer ones continue in the background |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`) or start a subagent (`profile: "subagent"`, `task`, optional `agent`/`model`/`tools`). Quick commands return inline; longer ones continue in the background |
 | `babysit_check` | List all sessions, or inspect one: process → state + log tail (or `screen: true` for TUIs); subagent → live progress (turns, recent tool calls, partial answer) |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when idle (`mode: auto/steer/task`) |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: `ids` + `mode: "any"\|"all"` |
@@ -83,6 +83,15 @@ rg -n 'FAIL|ERROR' /path/to/output.log
 
 `babysit_check { id, lines }` remains available as a convenient bounded tail.
 Do not read a potentially large log file in full.
+
+## External worker death
+
+If endpoint security or another external actor kills the babysit supervisor,
+pi-babysit normalizes the stale `running` state to `worker-dead`, returns
+immediately instead of hanging, and explains that the command may have started.
+For commands known to be safe and idempotent, set `retryOnWorkerDeath: true` to
+retry once with a new session id. It is opt-in because blindly rerunning an
+arbitrary command can duplicate side effects.
 
 ## How completion detection works
 

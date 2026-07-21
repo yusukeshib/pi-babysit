@@ -1047,6 +1047,7 @@ async function waitForExit(
 	}
 	suppressNotify(id); // the agent sees the exit here; don't notify again
 	const meta = readMeta(id);
+	const workerDead = st.state === "dead" && st.exit_code == null;
 	const ok = st.exit_code === 0;
 	const output = await inlineOutput(id, st);
 	return {
@@ -1055,8 +1056,13 @@ async function waitForExit(
 		ok,
 		text:
 			`Process ${id}${meta?.command ? ` (${meta.command})` : ""} ` +
-			`${ok ? "completed successfully" : `exited with code ${st.exit_code ?? "?"}`}` +
+			(workerDead
+				? "worker-dead: the babysit supervisor disappeared without an exit status"
+				: ok ? "completed successfully" : `exited with code ${st.exit_code ?? "?"}`) +
 			`${expectPattern ? ` before /${expectPattern}/ appeared` : ""}.` +
+			(workerDead
+				? " This commonly indicates an external kill (for example endpoint security). The command may have started, so retry only if it is safe and idempotent."
+				: "") +
 			`\nLog: ${logPath(id)}` + output,
 		status: st,
 	};
@@ -1248,8 +1254,8 @@ export default function (pi: ExtensionAPI) {
 			"In non-interactive mode (`pi -p`, no UI), process mode blocks until exit because there is no " +
 			"notification loop. Two modes: (1) `command` — run any shell command, including builds, tests, " +
 			"dev servers, watchers, and interactive TUIs; you can type into it with babysit_send and read " +
-			"its screen with babysit_check. " +
-			"you can type into it with babysit_send and read its screen with babysit_check. " +
+			"its screen with babysit_check. If endpoint security kills a worker at startup, " +
+			"`retryOnWorkerDeath` can retry one idempotent command once. " +
 			"(2) `profile: \"subagent\"` + `task` — spawn a pi subagent that works on the task in the " +
 			"background; poll with babysit_check, steer with babysit_send, block with babysit_wait, " +
 			"stop with babysit_kill.",
@@ -1259,7 +1265,7 @@ export default function (pi: ExtensionAPI) {
 			"Use babysit_run as the default for shell commands, not only long-running work. Small output is returned directly; large stdout/stderr stays out of model context in the returned log path. Give meaningful commands a clear stable `name`.",
 			"Inspect a babysit log only with explicitly bounded commands such as `tail -n N` or focused `rg`; never read or cat a potentially large log in full. Those small inspection commands may use bash directly to avoid recursively creating babysit sessions.",
 			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
-			"babysit_run returns only minimal lifecycle information and a path to the complete log. Inspect that file with bounded shell commands such as `tail` or `rg`; never read a potentially large log in full.",
+			"If a babysit worker is killed externally, babysit_run reports it as worker-dead rather than hanging. Set retryOnWorkerDeath: true only for safe, idempotent commands; it retries at most once and may otherwise duplicate side effects.",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
 			"Delegate self-contained tasks (codebase recon, a parallelizable subtask, work that would pollute your context) with babysit_run { profile: \"subagent\", task }. Launch several for independent subtasks; they run concurrently.",
 			"After spawning subagents, do not idle-wait and do not end your turn to wait for them: keep making progress, then call babysit_wait (ids + mode any/all) when you need their results. Steer or send follow-up tasks with babysit_send; kill runaways with babysit_kill.",
@@ -1319,6 +1325,12 @@ export default function (pi: ExtensionAPI) {
 						"Process mode only. Default false: starting a process ENDS the current turn (you are resumed by the exit notification). Set true only when you have immediate, specific, non-polling work to do after starting.",
 				}),
 			),
+			retryOnWorkerDeath: Type.Optional(
+				Type.Boolean({
+					description:
+						"Process mode only. Retry once if the babysit worker is killed externally during startup. Use only for safe, idempotent commands because the first attempt may have produced side effects.",
+				}),
+			),
 
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1348,14 +1360,15 @@ export default function (pi: ExtensionAPI) {
 
 			// --- process mode ---
 			if (!isSubagent) {
-				const res = await spawnProcess({
+				const spawnOpts: ProcOpts = {
 					name: params.name,
 					command: params.command as string,
 					cwd: ctx.cwd,
 					timeout: params.timeout,
 					idleTimeout: params.idleTimeout,
 					pty: params.pty ?? true,
-					});
+				};
+				let res = await spawnProcess(spawnOpts);
 				if ("error" in res) {
 					return {
 						content: [{ type: "text", text: `Failed to start process: ${res.error}` }],
@@ -1373,11 +1386,20 @@ export default function (pi: ExtensionAPI) {
 				// outcome in THIS turn. The process still runs under babysit (logged,
 				// killable), we just wait for it here instead of fire-and-forget.
 				if (!ctx.hasUI) {
-					const outcome = await waitForExit(res.id, parseDurMs(params.timeout), _signal);
+					let outcome = await waitForExit(res.id, parseDurMs(params.timeout), _signal);
+					let retried = false;
+					if (params.retryOnWorkerDeath && outcome.status?.state === "dead" && outcome.status.exit_code == null) {
+						const retry = await spawnProcess(spawnOpts);
+						if (!("error" in retry)) {
+							res = retry;
+							retried = true;
+							outcome = await waitForExit(res.id, parseDurMs(params.timeout), _signal);
+						}
+					}
 					return {
-						content: [{ type: "text", text: outcome.text }],
+						content: [{ type: "text", text: `${retried ? "Retried once after external worker death.\n" : ""}${outcome.text}` }],
 						isError: !outcome.ok,
-						details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id) },
+						details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id), retried },
 					};
 				}
 
@@ -1386,14 +1408,24 @@ export default function (pi: ExtensionAPI) {
 				// A timeout means it is genuinely background work and follows the normal
 				// parked-turn / automatic-notification contract below.
 				await bs(["wait", "-s", res.id, "--timeout", QUICK_COMMAND_GRACE], { signal: _signal });
-				const quickStatus = await statusOf(res.id);
+				let quickStatus = await statusOf(res.id);
+				let retried = false;
+				if (params.retryOnWorkerDeath && quickStatus?.state === "dead" && quickStatus.exit_code == null) {
+					const retry = await spawnProcess(spawnOpts);
+					if (!("error" in retry)) {
+						res = retry;
+						retried = true;
+						await bs(["wait", "-s", res.id, "--timeout", QUICK_COMMAND_GRACE], { signal: _signal });
+						quickStatus = await statusOf(res.id);
+					}
+				}
 				if (quickStatus && quickStatus.state !== "running") {
 					const outcome = await waitForExit(res.id, null, _signal);
 					await refreshWidget(ctx);
 					return {
-						content: [{ type: "text", text: outcome.text }],
+						content: [{ type: "text", text: `${retried ? "Retried once after external worker death.\n" : ""}${outcome.text}` }],
 						isError: !outcome.ok,
-						details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id) },
+						details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id), retried },
 					};
 				}
 
@@ -1406,13 +1438,14 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
+								`${retried ? "Retried once after external worker death.\n" : ""}` +
 								`Process started (id: ${res.id}). ${NOTIFY_MARKER}\nLog: ${logPath(res.id)}\n${nextStep}\n` +
 								`Inspect: babysit_check { id: "${res.id}" } (screen: true for TUIs) · ` +
 								`Wait: babysit_wait { id: "${res.id}" } · Kill: babysit_kill { id: "${res.id}" }\n` +
 								`Human can watch/take over: /babysit`,
 						},
 					],
-					details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id) },
+					details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id), retried },
 					// Do not return `terminate: true` here. In RPC/subagent hosts that hint
 					// can shut down the hosting pi worker, whose process-tree cleanup then
 					// kills the otherwise detached babysit supervisor and closes its PTY
