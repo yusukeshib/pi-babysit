@@ -1,7 +1,7 @@
 {
   "name": "@yusukeshib/pi-babysit",
-  "version": "0.2.3",
-  "description": "Run anything long-lived under babysit — one supervision substrate for processes and pi subagents, surfaced to the agent as babysit_run/check/send/wait/kill.",
+  "version": "0.2.4",
+  "description": "Run long-lived processes and pi subagents under babysit, with bounded local reports over captured logs.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -27,6 +27,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "test": "bun test",
     "release": "npm publish --access public"
   },
   "pi": {

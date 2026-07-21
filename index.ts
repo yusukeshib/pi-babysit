@@ -26,7 +26,7 @@
  * surface (babysit_run/check/send/wait/kill) covers both, and domain knowledge
  * (RPC bookkeeping, byte offsets, parked-turn detection) stays in code.
  *
- * Tools (LLM):  babysit_run, babysit_check, babysit_send, babysit_wait, babysit_kill
+ * Tools (LLM):  babysit_run, babysit_check, babysit_analyze, babysit_send, babysit_wait, babysit_kill
  * Commands:     /babysit (arrow-key picker: attach/tail/inspect)
  * Widget:       live counts (processes running · subagents working · idle)
  */
@@ -225,11 +225,20 @@ async function statusOf(id: string): Promise<BsSession | null> {
 // kind=process: name/command + `notified` (exit notification dedup).
 // kind=subagent: task + the raw-log byte offset of the last prompt, which lets
 // check/wait analyze only the CURRENT task's events (important for follow-ups).
+type ReportLanguage = "javascript" | "python" | "shell";
+
+interface ReportSpec {
+	language: ReportLanguage;
+	code: string;
+	timeout?: string;
+}
+
 interface Meta {
 	kind: "process" | "subagent";
 	// process
 	name?: string;
 	command?: string;
+	report?: ReportSpec;
 	notified?: boolean;
 	startedAt?: number;
 	// subagent
@@ -366,6 +375,9 @@ function parseDurMs(s?: string): number | null {
 
 const TAIL_MAX_BYTES = 8_000; // log tails / screens
 const ANSWER_MAX_BYTES = 24_000; // subagent answers / error messages
+const REPORT_MAX_INPUT_BYTES = 64 * 1024 * 1024; // analyzer input log
+const REPORT_MAX_OUTPUT_BYTES = 12_000; // analyzer stdout/stderr returned to the agent
+const REPORT_DEFAULT_TIMEOUT_MS = 30_000;
 
 function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 	const buf = Buffer.from(s, "utf8");
@@ -375,6 +387,132 @@ function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 	const head = buf.subarray(0, half).toString("utf8").replace(/\uFFFD+$/, "");
 	const tail = buf.subarray(buf.length - half).toString("utf8").replace(/^\uFFFD+/, "");
 	return `${head}\n… [${buf.length - maxBytes} bytes elided] …\n${tail}`;
+}
+
+// ---------------------------------------------------------------------------
+// Report analyzers — a report receives the complete captured process log, but
+// only its bounded stdout is returned to the model. It intentionally runs in
+// a child process: report code is arbitrary user/model-authored code and must
+// never be evaluated inside pi's extension host.
+
+interface ReportOutcome {
+	ok: boolean;
+	text: string;
+}
+
+async function saveSessionLog(id: string, destination: string, signal?: AbortSignal): Promise<string | null> {
+	return new Promise((resolve) => {
+		const child = spawn(BABYSIT_BIN, ["log", "-s", id], {
+			env: { ...process.env, BABYSIT_DIR: ROOT },
+		});
+		const output = fs.createWriteStream(destination);
+		let bytes = 0;
+		let finished = false;
+		const finish = (error: string | null) => {
+			if (finished) return;
+			finished = true;
+			signal?.removeEventListener("abort", abort);
+			output.end(() => resolve(error));
+		};
+		const abort = () => {
+			child.kill("SIGTERM");
+			finish("report analysis was cancelled");
+		};
+		if (signal?.aborted) return abort();
+		signal?.addEventListener("abort", abort, { once: true });
+		child.stdout?.on("data", (chunk: Buffer) => {
+			if (finished) return;
+			bytes += chunk.length;
+			if (bytes > REPORT_MAX_INPUT_BYTES) {
+				child.kill("SIGTERM");
+				finish(`process log exceeds the ${REPORT_MAX_INPUT_BYTES / 1024 / 1024} MiB report limit`);
+				return;
+			}
+			output.write(chunk);
+		});
+		child.on("error", (error) => finish(`could not read process log: ${error.message}`));
+		child.on("close", (code) => {
+			if (finished) return;
+			finish(code === 0 ? null : `could not read process log (babysit log exited ${code ?? 1})`);
+		});
+	});
+}
+
+async function executeReport(spec: ReportSpec, inputPath: string, signal?: AbortSignal): Promise<ReportOutcome> {
+	const dir = path.dirname(inputPath);
+	const scriptPath = path.join(dir, spec.language === "python" ? "report.py" : spec.language === "shell" ? "report.sh" : "report.cjs");
+	const script =
+		spec.language === "javascript"
+			? `const fs = require("node:fs");\nconst FILE_CONTENT = fs.readFileSync(process.env.BABYSIT_REPORT_INPUT, "utf8");\nconst INPUT = FILE_CONTENT;\n(async () => {\n${spec.code}\n})().catch((error) => { console.error(error?.stack ?? String(error)); process.exitCode = 1; });\n`
+			: spec.language === "python"
+				? `import os\nfrom pathlib import Path\nFILE_CONTENT = Path(os.environ["BABYSIT_REPORT_INPUT"]).read_text()\nINPUT = FILE_CONTENT\n${spec.code}\n`
+				: `# Read the complete log from $BABYSIT_REPORT_INPUT.\n${spec.code}\n`;
+	fs.writeFileSync(scriptPath, script, { mode: 0o700 });
+	const command = spec.language === "javascript" ? process.execPath : spec.language === "python" ? "python3" : SHELL;
+	const args = spec.language === "shell" ? [scriptPath] : [scriptPath];
+	const timeoutMs = parseDurMs(spec.timeout) ?? REPORT_DEFAULT_TIMEOUT_MS;
+
+	return new Promise((resolve) => {
+		const child = spawn(command, args, {
+			env: { ...process.env, BABYSIT_REPORT_INPUT: inputPath },
+		});
+		let stdout = "";
+		let stderr = "";
+		let outputTruncated = false;
+		let timedOut = false;
+		let settled = false;
+		const append = (current: string, chunk: Buffer) => {
+			const remaining = REPORT_MAX_OUTPUT_BYTES - Buffer.byteLength(current);
+			if (remaining <= 0) {
+				outputTruncated = true;
+				return current;
+			}
+			const text = chunk.subarray(0, remaining).toString("utf8");
+			if (text.length < chunk.length) outputTruncated = true;
+			return current + text;
+		};
+		const finish = (code: number | null) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			const body = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+			const suffix = outputTruncated ? "\n[report output truncated]" : "";
+			if (timedOut) {
+				resolve({ ok: false, text: `Report timed out after ${Math.ceil(timeoutMs / 1000)}s.${body ? `\n${clip(body, REPORT_MAX_OUTPUT_BYTES)}` : ""}${suffix}` });
+			} else if (code === 0) {
+				resolve({ ok: true, text: `${body || "(report produced no output)"}${suffix}` });
+			} else {
+				resolve({ ok: false, text: `Report failed (exit ${code ?? 1}).${body ? `\n${clip(body, REPORT_MAX_OUTPUT_BYTES)}` : ""}${suffix}` });
+			}
+		};
+		const abort = () => child.kill("SIGTERM");
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+		}, timeoutMs);
+		if (signal?.aborted) abort();
+		signal?.addEventListener("abort", abort, { once: true });
+		child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
+		child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+		child.on("error", (error) => {
+			stderr = append(stderr, Buffer.from(error.message));
+			finish(1);
+		});
+		child.on("close", finish);
+	});
+}
+
+async function runReport(id: string, spec: ReportSpec, signal?: AbortSignal): Promise<ReportOutcome> {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-babysit-report-"));
+	try {
+		const inputPath = path.join(dir, "process.log");
+		const error = await saveSessionLog(id, inputPath, signal);
+		if (error) return { ok: false, text: `Could not prepare report input: ${error}` };
+		return await executeReport(spec, inputPath, signal);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +691,7 @@ interface ProcOpts {
 	timeout?: string; // default: none — dev servers may run indefinitely
 	idleTimeout?: string;
 	pty: boolean;
+	report?: ReportSpec;
 }
 
 async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: string }> {
@@ -582,6 +721,7 @@ async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: s
 		kind: "process",
 		name: opts.name ?? id,
 		command: opts.command,
+		report: opts.report,
 		notified: false,
 		startedAt: Date.now(),
 	});
@@ -1009,9 +1149,10 @@ async function waitForExit(
 		return { id, kind: "exited", ok: false, text: `No such session: ${id}` };
 	}
 	suppressNotify(id); // the agent sees the exit here; don't notify again
-	const tail = clip((await bs(["log", "-s", id, "--tail", "20"])).stdout.trim());
-	const ok = st.exit_code === 0;
 	const meta = readMeta(id);
+	const report = meta?.report ? await runReport(id, meta.report, signal) : null;
+	const tail = report ? "" : clip((await bs(["log", "-s", id, "--tail", "20"])).stdout.trim());
+	const ok = st.exit_code === 0;
 	return {
 		id,
 		kind: "exited",
@@ -1020,7 +1161,9 @@ async function waitForExit(
 			`Process ${id}${meta?.command ? ` (${meta.command})` : ""} ` +
 			`${ok ? "completed successfully" : `exited with code ${st.exit_code ?? "?"}`}` +
 			`${expectPattern ? ` before /${expectPattern}/ appeared` : ""}.` +
-			(tail ? `\n\nLast output:\n${tail}` : ""),
+			(report
+				? `\n\nReport${report.ok ? "" : " (failed)"}:\n${report.text}`
+				: tail ? `\n\nLast output:\n${tail}` : ""),
 		status: st,
 	};
 }
@@ -1069,7 +1212,8 @@ export default function (pi: ExtensionAPI) {
 			if (!meta || meta.kind !== "process" || meta.notified) continue;
 			meta.notified = true;
 			writeMeta(s.id, meta);
-			const tail = clip((await bs(["log", "-s", s.id, "--tail", "20"])).stdout.trim());
+			const report = meta.report ? await runReport(s.id, meta.report) : null;
+			const tail = report ? "" : clip((await bs(["log", "-s", s.id, "--tail", "20"])).stdout.trim());
 			const ok = s.exit_code === 0;
 			const runtime = meta.startedAt
 				? `${Math.round((Date.now() - meta.startedAt) / 1000)}s`
@@ -1084,10 +1228,12 @@ export default function (pi: ExtensionAPI) {
 					customType: "pi-babysit-process-end",
 					content:
 						`${summary}\nCommand: ${meta.command ?? "?"}` +
-						(tail ? `\n\nRecent output:\n${tail}` : "") +
+						(report
+							? `\n\nReport${report.ok ? "" : " (failed)"}:\n${report.text}`
+							: tail ? `\n\nRecent output:\n${tail}` : "") +
 						`\n\nThis is the automatic process-end notification. Do not call babysit_check just to re-verify; use it once only if you need more logs for debugging.`,
 					display: true,
-					details: { id: s.id, exitCode: s.exit_code, success: ok, runtime },
+					details: { id: s.id, exitCode: s.exit_code, success: ok, runtime, report },
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
@@ -1201,7 +1347,8 @@ export default function (pi: ExtensionAPI) {
 			"exits and returns its output inline — there is no notification loop to resume a parked turn. " +
 			"Two modes: (1) `command` — run any long-lived or slow command (build, tests, dev server, " +
 			"watcher, interactive TUI) in a PTY; you get an AUTOMATIC notification when it exits, and " +
-			"you can type into it with babysit_send and read its screen with babysit_check. " +
+			"you can type into it with babysit_send and read its screen with babysit_check. Optional `report` " +
+			"runs local code over the full captured log and returns only its concise output on completion. " +
 			"(2) `profile: \"subagent\"` + `task` — spawn a pi subagent that works on the task in the " +
 			"background; poll with babysit_check, steer with babysit_send, block with babysit_wait, " +
 			"stop with babysit_kill.",
@@ -1210,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Run every long-lived or slow command through babysit_run instead of bash: builds, test suites, dev servers, watchers, `tail -f`, anything expected to take more than a few seconds. Give it a clear stable `name` (e.g. cargo-build).",
 			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
+			"For a build/test/API command with potentially large output, give babysit_run a `report` program that extracts the needed facts from FILE_CONTENT; the automatic completion notification will contain only that report rather than a raw log tail.",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
 			"Delegate self-contained tasks (codebase recon, a parallelizable subtask, work that would pollute your context) with babysit_run { profile: \"subagent\", task }. Launch several for independent subtasks; they run concurrently.",
 			"After spawning subagents, do not idle-wait and do not end your turn to wait for them: keep making progress, then call babysit_wait (ids + mode any/all) when you need their results. Steer or send follow-up tasks with babysit_send; kill runaways with babysit_kill.",
@@ -1269,6 +1417,20 @@ export default function (pi: ExtensionAPI) {
 						"Process mode only. Default false: starting a process ENDS the current turn (you are resumed by the exit notification). Set true only when you have immediate, specific, non-polling work to do after starting.",
 				}),
 			),
+			report: Type.Optional(
+				Type.Object({
+					language: StringEnum(["javascript", "python", "shell"] as const, {
+						description: "Language for the local report program.",
+					}),
+					code: Type.String({
+						description:
+							"Program that analyzes the complete captured log. JavaScript/Python receive FILE_CONTENT and INPUT strings; shell receives $BABYSIT_REPORT_INPUT. Print only the concise report.",
+					}),
+					timeout: Type.Optional(
+						Type.String({ description: "Report-program timeout (default 30s, e.g. '10s')." }),
+					),
+				}),
+			),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			await requireBabysit();
@@ -1294,6 +1456,13 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			if (isSubagent && params.report) {
+				return {
+					content: [{ type: "text", text: "`report` is available only for process sessions." }],
+					isError: true,
+					details: {},
+				};
+			}
 
 			// --- process mode ---
 			if (!isSubagent) {
@@ -1304,6 +1473,7 @@ export default function (pi: ExtensionAPI) {
 					timeout: params.timeout,
 					idleTimeout: params.idleTimeout,
 					pty: params.pty ?? true,
+					report: params.report,
 				});
 				if ("error" in res) {
 					return {
@@ -1326,7 +1496,7 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text: outcome.text }],
 						isError: !outcome.ok,
-						details: { id: res.id, kind: "process", command: params.command },
+						details: { id: res.id, kind: "process", command: params.command, report: params.report },
 					};
 				}
 
@@ -1345,7 +1515,7 @@ export default function (pi: ExtensionAPI) {
 								`Human can watch/take over: /babysit`,
 						},
 					],
-					details: { id: res.id, kind: "process", command: params.command },
+					details: { id: res.id, kind: "process", command: params.command, report: params.report },
 					// Do not return `terminate: true` here. In RPC/subagent hosts that hint
 					// can shut down the hosting pi worker, whose process-tree cleanup then
 					// kills the otherwise detached babysit supervisor and closes its PTY
@@ -1702,6 +1872,62 @@ export default function (pi: ExtensionAPI) {
 					},
 				],
 				details: { mode, kind: "subagent" },
+			};
+		},
+	});
+
+	// ----- babysit_analyze ----------------------------------------------------
+	pi.registerTool({
+		name: "babysit_analyze",
+		label: "Babysit: analyze",
+		description:
+			"Run a local analyzer over a babysit process's complete captured log. The raw log remains outside " +
+			"the model context; only the analyzer's bounded stdout is returned. JavaScript/Python receive " +
+			"FILE_CONTENT and INPUT strings; shell receives $BABYSIT_REPORT_INPUT. It can inspect a running " +
+			"session's output so far or a completed session.",
+		promptSnippet: "Analyze a babysit process log locally and return only a concise report",
+		promptGuidelines: [
+			"Use babysit_analyze to extract failures, counts, or other concise facts from a large babysit process log instead of calling babysit_check repeatedly or returning raw logs.",
+		],
+		parameters: Type.Object({
+			id: Type.String({ description: "Process session id whose captured log should be analyzed." }),
+			language: StringEnum(["javascript", "python", "shell"] as const, {
+				description: "Language for the local analyzer program.",
+			}),
+			code: Type.String({
+				description:
+					"Analyzer program. JavaScript/Python receive FILE_CONTENT and INPUT strings; shell reads $BABYSIT_REPORT_INPUT. Print only the concise result.",
+			}),
+			timeout: Type.Optional(
+				Type.String({ description: "Analyzer timeout (default 30s, e.g. '10s')." }),
+			),
+		}),
+		async execute(_id, params, signal) {
+			await requireBabysit();
+			const status = await statusOf(params.id);
+			if (!status) {
+				return {
+					content: [{ type: "text", text: `No such session: ${params.id}` }],
+					isError: true,
+					details: {},
+				};
+			}
+			if (kindOf(params.id) === "subagent") {
+				return {
+					content: [{ type: "text", text: "babysit_analyze supports process sessions only; use babysit_check for subagent progress." }],
+					isError: true,
+					details: {},
+				};
+			}
+			const report = await runReport(params.id, {
+				language: params.language,
+				code: params.code,
+				timeout: params.timeout,
+			}, signal);
+			return {
+				content: [{ type: "text", text: report.text }],
+				isError: !report.ok,
+				details: {},
 			};
 		},
 	});
