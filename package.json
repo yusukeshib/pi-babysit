@@ -1,7 +1,7 @@
 {
   "name": "@yusukeshib/pi-babysit",
-  "version": "0.2.4",
-  "description": "Run long-lived processes and pi subagents under babysit, with bounded local reports over captured logs.",
+  "version": "0.3.0",
+  "description": "Run any shell command and pi subagents under babysit, with context-safe captured output.",
   "keywords": [
     "pi-package",
     "pi-extension",
