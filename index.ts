@@ -381,9 +381,17 @@ function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 }
 
 async function inlineOutput(id: string, status: BsSession): Promise<string> {
-	const bytes = status.output_bytes ?? Number.POSITIVE_INFINITY;
+	let bytes = status.output_bytes;
+	if (bytes == null) {
+		try {
+			bytes = fs.statSync(logPath(id)).size;
+		} catch {
+			bytes = Number.POSITIVE_INFINITY;
+		}
+	}
 	if (bytes > INLINE_OUTPUT_MAX_BYTES) {
-		return `\nOutput omitted (${bytes} bytes; inline limit ${INLINE_OUTPUT_MAX_BYTES}).`;
+		const size = Number.isFinite(bytes) ? `${bytes} bytes` : "size unavailable";
+		return `\nOutput omitted (${size}; inline limit ${INLINE_OUTPUT_MAX_BYTES}).`;
 	}
 	const output = (await bs(["log", "-s", id])).stdout.trimEnd();
 	if (Buffer.byteLength(output) > INLINE_OUTPUT_MAX_BYTES) {
@@ -965,6 +973,14 @@ function suppressNotify(id: string): void {
 	}
 }
 
+function enableNotify(id: string): void {
+	const meta = readMeta(id);
+	if (meta && meta.kind === "process" && meta.notified) {
+		meta.notified = false;
+		writeMeta(id, meta);
+	}
+}
+
 // Wait for a PROCESS session: either until a regex appears in its output
 // (`expect` — e.g. "server listening") or until the process exits.
 async function waitForExit(
@@ -1000,14 +1016,19 @@ async function waitForExit(
 		}
 		// fall through: session exited before the pattern appeared
 	} else {
+		// An explicit wait owns completion delivery. Mark it before blocking so
+		// the exit poller cannot race us and inject a duplicate notification.
+		suppressNotify(id);
 		const w = await bs(["wait", "-s", id, "--timeout", t], { signal });
 		if (signal?.aborted || w.code === 130) {
+			enableNotify(id);
 			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
 		}
 		if (w.code === 124) {
 			// 124 is ambiguous (timeout vs child exiting 124) — disambiguate.
 			const st0 = await statusOf(id);
 			if (st0?.state === "running") {
+				enableNotify(id);
 				return {
 					id,
 					kind: "timeout",
