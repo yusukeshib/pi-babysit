@@ -49,10 +49,13 @@ test("process completion messages render semantic colored labels", () => {
 	const render = (details: Record<string, unknown>) => renderLines(details).join("\n");
 
 	expect(render({ status: "success" })).toContain(
-		"<success>✓ babysit_run SUCCESS</success>",
+		"<success>babysit_run SUCCESS</success>",
 	);
 	expect(render({ status: "success" })).toContain("<bg-toolSuccessBg>");
-	expect(render({ status: "failed" })).toContain("<error>✗ babysit_run FAILED</error>");
+	expect(render({ status: "success" })).toContain(
+		"<toolOutput>process details</toolOutput>",
+	);
+	expect(render({ status: "failed" })).toContain("<error>babysit_run FAILED</error>");
 	expect(render({ status: "terminated" })).toContain(
 		"<error>babysit_run TERMINATED</error>",
 	);
@@ -77,9 +80,9 @@ test("babysit_run renders a status label for quick and background results", () =
 		).render(100).join("\n");
 
 	expect(tool.renderCall().render(100)).toEqual([]);
-	expect(render("success")).toContain("<success>✓ babysit_run SUCCESS</success>");
+	expect(render("success")).toContain("<success>babysit_run SUCCESS</success>");
 	expect(render("started")).toContain("<accent>babysit_run STARTED</accent>");
-	expect(render("failed", true)).toContain("<error>✗ babysit_run FAILED</error>");
+	expect(render("failed", true)).toContain("<error>babysit_run FAILED</error>");
 	expect(
 		render(
 			"success",

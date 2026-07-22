@@ -1217,10 +1217,10 @@ export default function (pi: ExtensionAPI) {
 			{ icon: string; text: string; color: "accent" | "warning" | "success" | "error" }
 		> = {
 			started: { icon: "", text: "STARTED", color: "accent" },
-			running: { icon: "⏳", text: "RUNNING", color: "accent" },
-			idle: { icon: "●", text: "IDLE", color: "warning" },
-			success: { icon: "✓", text: "SUCCESS", color: "success" },
-			failed: { icon: "✗", text: "FAILED", color: "error" },
+			running: { icon: "", text: "RUNNING", color: "accent" },
+			idle: { icon: "", text: "IDLE", color: "warning" },
+			success: { icon: "", text: "SUCCESS", color: "success" },
+			failed: { icon: "", text: "FAILED", color: "error" },
 			terminated: { icon: "", text: "TERMINATED", color: "error" },
 		};
 		const label = labels[status];
@@ -1266,7 +1266,7 @@ export default function (pi: ExtensionAPI) {
 			d.status ?? (d.success ? "success" : d.exitCode == null ? "terminated" : "failed");
 		const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
 		box.addChild(new Text(renderStatus(status, theme, "babysit_run"), 0, 0));
-		box.addChild(new Text(content, 0, 0));
+		box.addChild(new Text(theme.fg("toolOutput", content), 0, 0));
 		return box;
 	});
 
