@@ -81,6 +81,7 @@ const SUBAGENT_GUIDANCE = [
 ].join(" ");
 const POLL_MS = 2500;
 const QUICK_COMMAND_GRACE = process.env.PI_BABYSIT_QUICK_GRACE ?? "1s";
+const KILL_CONFIRM_TIMEOUT = "4s";
 
 interface BsSession {
 	id: string;
@@ -241,6 +242,34 @@ async function statusOf(id: string): Promise<BsSession | null> {
 	}
 }
 
+export function isConfirmedTerminalState(state: string): boolean {
+	return state === "killed" || state === "exited";
+}
+
+export function validateKillResponse(stdout: string): string | null {
+	try {
+		const response = JSON.parse(stdout);
+		if (response.killed !== true || response.confirmed === false) {
+			return `Kill was not confirmed by babysit: ${stdout.trim()}`;
+		}
+		return null;
+	} catch {
+		return `Invalid kill response from babysit: ${stdout.trim() || "(empty)"}`;
+	}
+}
+
+async function awaitConfirmedTermination(id: string): Promise<BsSession | null> {
+	const initial = await statusOf(id);
+	if (!initial || isConfirmedTerminalState(initial.state) || initial.state === "dead") {
+		return initial;
+	}
+	// New babysit versions return only after persistence, so this is normally
+	// skipped. It is a bounded compatibility guard for older binaries that
+	// acknowledged signal delivery before the process actually exited.
+	await bs(["wait", "-s", id, "--timeout", KILL_CONFIRM_TIMEOUT]);
+	return statusOf(id);
+}
+
 // ---------------------------------------------------------------------------
 // per-session metadata
 // ---------------------------------------------------------------------------
@@ -254,6 +283,9 @@ interface Meta {
 	name?: string;
 	command?: string;
 	notified?: boolean;
+	// Temporary reservation while kill is in flight. Unlike `notified`, this
+	// must be cleared on failure so a real completion remains deliverable.
+	notificationPaused?: boolean;
 	completionObservedAt?: number;
 	startedAt?: number;
 	// subagent
@@ -389,8 +421,19 @@ function parseDurMs(s?: string): number | null {
 // megabytes, so we also cap bytes, eliding the middle so both the head and
 // the tail of the output stay visible.
 
-const TAIL_MAX_BYTES = 8_000; // explicit tails / screens
-const INLINE_OUTPUT_MAX_BYTES = 8_000; // complete output returned only below this threshold
+function byteLimitFromEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw == null || raw.trim() === "") return fallback;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+const TAIL_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_TAIL_MAX_BYTES", 8_000);
+// Direct run/wait results can carry more context because the caller explicitly
+// requested them. Unsolicited completion notifications default much smaller.
+const INLINE_OUTPUT_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES", 8_000);
+const NOTIFY_OUTPUT_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES", 2_000);
+const NOTIFY_COMMAND_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_COMMAND_MAX_BYTES", 240);
 const ANSWER_MAX_BYTES = 24_000; // subagent answers / error messages
 
 function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
@@ -465,7 +508,15 @@ async function searchLog(
 	});
 }
 
-async function inlineOutput(id: string, status: BsSession): Promise<string> {
+export function shouldInlineCompleteOutput(outputBytes: number, maxBytes: number): boolean {
+	return maxBytes > 0 && outputBytes <= maxBytes;
+}
+
+async function inlineOutput(
+	id: string,
+	status: BsSession,
+	maxBytes = INLINE_OUTPUT_MAX_BYTES,
+): Promise<string> {
 	let bytes = status.output_bytes;
 	if (bytes == null) {
 		try {
@@ -474,15 +525,22 @@ async function inlineOutput(id: string, status: BsSession): Promise<string> {
 			bytes = Number.POSITIVE_INFINITY;
 		}
 	}
-	if (bytes > INLINE_OUTPUT_MAX_BYTES) {
+	if (!shouldInlineCompleteOutput(bytes, maxBytes)) {
 		const size = Number.isFinite(bytes) ? `${bytes} bytes` : "size unavailable";
-		return `\nOutput omitted (${size}; inline limit ${INLINE_OUTPUT_MAX_BYTES}).`;
+		return `\nOutput omitted (${size}; inline limit ${maxBytes}).`;
 	}
 	const output = (await bs(["log", "-s", id])).stdout.trimEnd();
-	if (Buffer.byteLength(output) > INLINE_OUTPUT_MAX_BYTES) {
-		return `\nOutput omitted (exceeds inline limit ${INLINE_OUTPUT_MAX_BYTES} bytes).`;
+	if (Buffer.byteLength(output) > maxBytes) {
+		return `\nOutput omitted (exceeds inline limit ${maxBytes} bytes).`;
 	}
 	return output ? `\n\nOutput:\n${output}` : "";
+}
+
+export function summarizeNotificationCommand(command: string | undefined): string {
+	const compact = (command ?? "?").replace(/\s+/g, " ").trim() || "?";
+	const bytes = Buffer.from(compact, "utf8");
+	if (bytes.length <= NOTIFY_COMMAND_MAX_BYTES) return compact;
+	return `${bytes.subarray(0, NOTIFY_COMMAND_MAX_BYTES).toString("utf8").replace(/\uFFFD+$/, "")}…`;
 }
 
 
@@ -1052,8 +1110,9 @@ async function waitForTask(
 // doesn't send a duplicate message for something the agent just observed.
 function suppressNotify(id: string): void {
 	const meta = readMeta(id);
-	if (meta && meta.kind === "process" && !meta.notified) {
+	if (meta && meta.kind === "process") {
 		meta.notified = true;
+		delete meta.notificationPaused;
 		writeMeta(id, meta);
 	}
 }
@@ -1062,6 +1121,22 @@ function enableNotify(id: string): void {
 	const meta = readMeta(id);
 	if (meta && meta.kind === "process" && meta.notified) {
 		meta.notified = false;
+		writeMeta(id, meta);
+	}
+}
+
+function pauseNotify(id: string): void {
+	const meta = readMeta(id);
+	if (meta && meta.kind === "process" && !meta.notified && !meta.notificationPaused) {
+		meta.notificationPaused = true;
+		writeMeta(id, meta);
+	}
+}
+
+function resumeNotify(id: string): void {
+	const meta = readMeta(id);
+	if (meta && meta.kind === "process" && meta.notificationPaused) {
+		delete meta.notificationPaused;
 		writeMeta(id, meta);
 	}
 }
@@ -1139,7 +1214,7 @@ async function waitForExit(
 		kind: "exited",
 		ok,
 		text:
-			`Process ${id}${meta?.command ? ` (${meta.command})` : ""} ` +
+			`Process ${id}${meta?.command ? ` (${summarizeNotificationCommand(meta.command)})` : ""} ` +
 			(workerDead
 				? "worker-dead: the babysit supervisor disappeared without an exit status"
 				: ok ? "completed successfully" : `exited with code ${st.exit_code ?? "?"}`) +
@@ -1198,7 +1273,7 @@ export default function (pi: ExtensionAPI) {
 		for (const s of sessions) {
 			if (s.state === "running") continue;
 			const meta = readMeta(s.id);
-			if (!meta || meta.kind !== "process" || meta.notified) continue;
+			if (!meta || meta.kind !== "process" || meta.notified || meta.notificationPaused) continue;
 			// Delay delivery by one poll interval. This gives an agent that chose
 			// babysit_wait immediately after babysit_run enough time to claim the
 			// completion and suppress the otherwise duplicate automatic message.
@@ -1208,15 +1283,13 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			if (Date.now() - meta.completionObservedAt < POLL_MS) continue;
-			meta.notified = true;
-			writeMeta(s.id, meta);
 			const ok = s.exit_code === 0;
 			const status: DisplayStatus = ok
 				? "success"
 				: s.state === "dead" || s.exit_code == null
 					? "terminated"
 					: "failed";
-			const output = await inlineOutput(s.id, s);
+			const output = await inlineOutput(s.id, s, NOTIFY_OUTPUT_MAX_BYTES);
 			const runtime = meta.startedAt
 				? `${Math.round((Date.now() - meta.startedAt) / 1000)}s`
 				: "?";
@@ -1225,24 +1298,43 @@ export default function (pi: ExtensionAPI) {
 				: s.state === "dead" || s.exit_code == null
 					? `Process "${s.id}" was terminated after ${runtime}.`
 					: `Process "${s.id}" exited with code ${s.exit_code} after ${runtime}.`;
-			pi.sendMessage(
-				{
-					customType: "pi-babysit-process-end",
-					content:
-						`${summary}\nCommand: ${meta.command ?? "?"}\nLog: ${logPath(s.id)}${output}` +
-						`\n\nThis is the automatic process-end notification. Do not call babysit_check just to re-verify. Inspect the log only when needed with babysit_check { id: ${JSON.stringify(s.id)}, lines, pattern? }; never read it in full.`,
-					display: true,
-					details: {
-						id: s.id,
-						exitCode: s.exit_code,
-						success: ok,
-						status,
-						runtime,
-						logPath: logPath(s.id),
+			// Output loading is asynchronous. A kill/wait can claim completion in
+			// that window, so re-read metadata immediately before delivery.
+			const current = readMeta(s.id);
+			if (
+				!current ||
+				current.kind !== "process" ||
+				current.notified ||
+				current.notificationPaused
+			) {
+				continue;
+			}
+			try {
+				pi.sendMessage(
+					{
+						customType: "pi-babysit-process-end",
+						content:
+							`${summary}\nCommand: ${summarizeNotificationCommand(current.command)}\nLog: ${logPath(s.id)}${output}` +
+							"\n\nAutomatic completion notification. Inspect the bounded log with babysit_check only if needed.",
+						display: true,
+						details: {
+							id: s.id,
+							exitCode: s.exit_code,
+							success: ok,
+							status,
+							runtime,
+							logPath: logPath(s.id),
+						},
 					},
-				},
-				{ triggerTurn: true, deliverAs: "steer" },
-			);
+					{ triggerTurn: true, deliverAs: "steer" },
+				);
+			} catch {
+				// Leave it pending so the next poll can retry delivery.
+				continue;
+			}
+			current.notified = true;
+			delete current.notificationPaused;
+			writeMeta(s.id, current);
 		}
 	}
 
@@ -2181,17 +2273,46 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ id: Type.String({ description: "Session id." }) }),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			await requireBabysit();
-			suppressNotify(params.id); // tool-initiated kill → no end notification
-			const r = await bs(["kill", "-s", params.id, "--json"]);
-			await refreshWidget(ctx);
-			if (r.code !== 0) {
+			// Prevent the exit poller racing a requested kill, but restore delivery
+			// on every failure. Permanent suppression happens only after terminal
+			// state is independently confirmed.
+			pauseNotify(params.id);
+			const fail = async (message: string, status?: BsSession | null) => {
+				resumeNotify(params.id);
+				await refreshWidget(ctx);
 				return {
-					content: [{ type: "text", text: r.stderr || "kill failed" }],
+					content: [{ type: "text" as const, text: message }],
 					isError: true,
-					details: {},
+					details: { id: params.id, status: status?.state, logPath: logPath(params.id) },
 				};
+			};
+
+			const r = await bs(["kill", "-s", params.id, "--json"]);
+			if (r.code !== 0) return fail((r.stderr || r.stdout || "kill failed").trim());
+
+			const responseError = validateKillResponse(r.stdout);
+			if (responseError) return fail(responseError);
+
+			const status = await awaitConfirmedTermination(params.id);
+			if (!status) return fail(`Kill could not be verified: session ${params.id} disappeared.`);
+			if (!isConfirmedTerminalState(status.state)) {
+				return fail(
+					`Kill was acknowledged but ${params.id} is still ${status.state}; completion notifications were restored.`,
+					status,
+				);
 			}
-			return { content: [{ type: "text", text: `Killed ${params.id}.` }], details: {} };
+
+			suppressNotify(params.id);
+			await refreshWidget(ctx);
+			return {
+				content: [{ type: "text", text: `Killed ${params.id} (confirmed ${status.state}).` }],
+				details: {
+					id: params.id,
+					status: status.state,
+					exitCode: status.exit_code,
+					logPath: logPath(params.id),
+				},
+			};
 		},
 	});
 
