@@ -55,9 +55,8 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: `ids` + `mode: "any"\|"all"` |
 | `babysit_kill` | Terminate a session (suppresses the exit notification) |
 
-A `tool_call` hook also blocks bash commands that background themselves
-(`… &`, `nohup`, `setsid`, `disown`) and points the agent at `babysit_run`
-(carried over from pi-processes' `blockBackgroundCommands`).
+A `tool_call` hook blocks shell backgrounding (`… &`, `nohup`, `setsid`,
+`disown`) and redirects broad direct `bash` commands to `babysit_run`.
 
 ## Commands (human)
 
@@ -84,21 +83,19 @@ rg -n 'FAIL|ERROR' /path/to/output.log
 `babysit_check { id, lines }` remains available as a convenient bounded tail.
 Do not read a potentially large log file in full.
 
-To enforce this policy, the extension blocks direct `bash` except for `pwd`,
-short Git status/branch checks, and `head`/`tail`/`rg` reads of `.log` files that
-are explicitly bounded to at most 100 lines. Broad searches, diffs, API calls,
-multiple commands, redirects, and shell wrappers are redirected to
-`babysit_run`. Set `PI_BABYSIT_ALLOW_BASH=1` only as an emergency escape hatch
-to disable this gate.
+Direct `bash` is allowed for `pwd`, single Git commands without shell
+operators, and explicitly bounded log inspection. Other shell commands are
+redirected to `babysit_run`. `babysit_run` supports both quick and long-running
+commands.
 
-## External worker death
+## Unexpected worker loss
 
-If endpoint security or another external actor kills the babysit supervisor,
-pi-babysit normalizes the stale `running` state to `worker-dead`, returns
-immediately instead of hanging, and explains that the command may have started.
-For commands known to be safe and idempotent, set `retryOnWorkerDeath: true` to
-retry once with a new session id. It is opt-in because blindly rerunning an
-arbitrary command can duplicate side effects.
+If the babysit supervisor disappears without recording an exit, pi-babysit
+normalizes the stale `running` state to `worker-dead` and returns immediately
+instead of hanging. Possible causes include host process cleanup, endpoint
+security, or a supervisor crash. For commands known to be safe and idempotent,
+set `retryOnWorkerDeath: true` to retry once with a new session id. It is opt-in
+because blindly rerunning an arbitrary command can duplicate side effects.
 
 ## How completion detection works
 

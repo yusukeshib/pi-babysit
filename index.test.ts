@@ -92,28 +92,33 @@ test("babysit_run renders a status label for quick and background results", () =
 	).toContain("<error>babysit_run TERMINATED</error>");
 });
 
-test("direct bash policy allows only tiny observations and bounded log reads", () => {
+test("direct bash policy allows Git, tiny observations, and bounded log reads", () => {
 	expect(isAllowedDirectBash("pwd")).toBe(true);
 	expect(isAllowedDirectBash("git status --short")).toBe(true);
+	expect(isAllowedDirectBash("git diff")).toBe(true);
+	expect(isAllowedDirectBash("git commit -m 'test: direct git'")).toBe(true);
 	expect(isAllowedDirectBash("tail -n 50 /tmp/build.log")).toBe(true);
 	expect(isAllowedDirectBash("rg -n 'error' /tmp/build.log | head -n 80")).toBe(true);
 	expect(isAllowedDirectBash("tail -n 101 /tmp/build.log")).toBe(false);
 	expect(isAllowedDirectBash("rg -n 'error' /tmp/build.log")).toBe(false);
 	expect(isAllowedDirectBash("git diff --stat && git diff")).toBe(false);
+	expect(isAllowedDirectBash("git diff | cat")).toBe(false);
 	expect(isAllowedDirectBash("gh api repos/x/y/actions/jobs/1/logs > /tmp/ci.log")).toBe(false);
 	expect(isAllowedDirectBash("bash -c 'tail -n 10 /tmp/build.log'")).toBe(false);
 	expect(isAllowedDirectBash("tail -n 10 /tmp/build.log; cat /etc/hosts")).toBe(false);
 });
 
-test("tool hook blocks broad bash with a concrete babysit_run redirect", async () => {
+test("tool hook allows Git and redirects other broad bash to babysit_run", async () => {
 	const hook = hooks.get("tool_call");
-	const blocked = await hook({ toolName: "bash", input: { command: "git diff" } });
-	const allowed = await hook({ toolName: "bash", input: { command: "tail -n 40 /tmp/build.log" } });
+	const blocked = await hook({ toolName: "bash", input: { command: "ls -la" } });
+	const git = await hook({ toolName: "bash", input: { command: "git diff" } });
+	const log = await hook({ toolName: "bash", input: { command: "tail -n 40 /tmp/build.log" } });
 
 	expect(blocked.block).toBe(true);
 	expect(blocked.reason).toContain("babysit_run");
-	expect(blocked.reason).toContain("git diff");
-	expect(allowed).toBeUndefined();
+	expect(blocked.reason).toContain("ls -la");
+	expect(git).toBeUndefined();
+	expect(log).toBeUndefined();
 });
 
 test("small process output is returned with metadata and a log path", async () => {
@@ -137,7 +142,7 @@ test("failed commands return small stderr, exit status, and a usable log path", 
 	expect(readFileSync(result.details.logPath, "utf8")).toContain("fail-detail");
 });
 
-test("external worker death is diagnosed without replaying by default", async () => {
+test("unexpected worker loss is diagnosed without replaying by default", async () => {
 	const marker = `/tmp/pi-babysit-no-retry-${process.pid}-${Date.now()}`;
 	const result = await run(`printf x >> ${marker}; kill -9 $PPID; sleep 1`);
 	const text = result.content[0]?.text ?? "";
@@ -145,7 +150,7 @@ test("external worker death is diagnosed without replaying by default", async ()
 	expect(result.isError).toBe(true);
 	expect(result.details.retried).toBe(false);
 	expect(text).toContain("worker-dead");
-	expect(text).toContain("external kill");
+	expect(text).toContain("supervisor disappeared without recording an exit");
 	expect(readFileSync(marker, "utf8")).toBe("x");
 });
 

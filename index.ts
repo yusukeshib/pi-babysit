@@ -1061,7 +1061,7 @@ async function waitForExit(
 				: ok ? "completed successfully" : `exited with code ${st.exit_code ?? "?"}`) +
 			`${expectPattern ? ` before /${expectPattern}/ appeared` : ""}.` +
 			(workerDead
-				? " This commonly indicates an external kill (for example endpoint security). The command may have started, so retry only if it is safe and idempotent."
+				? " The supervisor disappeared without recording an exit; possible causes include host process cleanup, endpoint security, or a supervisor crash. The command may have started, so retry only if it is safe and idempotent."
 				: "") +
 			`\nLog: ${logPath(id)}` + output,
 		status: st,
@@ -1079,7 +1079,7 @@ const waitFor = (
 		: waitForExit(id, limitMs, signal, expectPattern);
 
 // ---------------------------------------------------------------------------
-// bash background-command blocker (carried over from pi-processes)
+// direct bash policy
 // ---------------------------------------------------------------------------
 
 // Heuristic (no shell AST): catch `... &` backgrounding (not `&&`), nohup,
@@ -1098,20 +1098,21 @@ function boundedLineCount(command: string): number | null {
 	return Math.max(...matches.map((m) => Number(m[1])));
 }
 
-/** Commands allowed to bypass babysit: tiny scalar observations and strictly
- * bounded reads of captured log files. This is deliberately conservative;
- * uncertain shell syntax belongs in babysit_run where output is capped. */
+/** Commands allowed to bypass babysit: Git, tiny scalar observations, and
+ * strictly bounded reads of captured log files. */
 export function isAllowedDirectBash(command: string): boolean {
 	if (process.env.PI_BABYSIT_ALLOW_BASH === "1") return true;
 	const s = command.trim();
-	if (/^(pwd|git status --short|git branch --show-current)$/.test(s)) return true;
+	if (s === "pwd") return true;
 	if (!s || /[;&`\n\r]|\$\(|>|\b(?:bash|sh|zsh)\s+-c\b/.test(s)) return false;
+	// A single Git invocation does not need babysit. Shell composition remains
+	// behind the gate so `git ... && arbitrary-command` cannot bypass it.
+	if (/^git(?:\s|$)/.test(s) && !/[|<]/.test(s)) return true;
 	if (!/(?:output\.log|\/(?:tmp|var\/tmp)\/[^\s'\"]*\.log)\b/.test(s)) return false;
 	if (/^wc\s+-(?:l|c)\s+/.test(s) && !s.includes("|")) return true;
 	if (!/^(?:tail|head|rg)\b/.test(s)) return false;
 	const limit = boundedLineCount(s);
 	if (limit == null || limit > 100) return false;
-	// rg must feed a bounded head/tail; direct head/tail is already bounded.
 	if (/^rg\b/.test(s) && !/\|\s*(?:head|tail)\b/.test(s)) return false;
 	return true;
 }
@@ -1304,9 +1305,6 @@ export default function (pi: ExtensionAPI) {
 		pollTimer = undefined;
 	});
 
-	// Keep unpredictable command output out of model context. Direct bash is
-	// reserved for tiny scalar observations and tightly bounded log inspection;
-	// everything else belongs in babysit_run.
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "bash") return;
 		const command = String((event.input as { command?: unknown }).command ?? "");
@@ -1323,7 +1321,7 @@ export default function (pi: ExtensionAPI) {
 			block: true,
 			reason:
 				"Use babysit_run for this command so potentially large output is captured outside model context. " +
-				"Direct bash is allowed only for pwd, short git status/branch checks, or log-file tail/rg commands explicitly bounded to at most 100 lines. " +
+				"Direct bash is allowed for pwd, single Git commands without shell operators, or log-file tail/rg commands explicitly bounded to at most 100 lines. " +
 				`Retry as babysit_run({ command: ${JSON.stringify(command)} }).`,
 		};
 	});
@@ -1340,7 +1338,7 @@ export default function (pi: ExtensionAPI) {
 			"In non-interactive mode (`pi -p`, no UI), process mode blocks until exit because there is no " +
 			"notification loop. Two modes: (1) `command` — run any shell command, including builds, tests, " +
 			"dev servers, watchers, and interactive TUIs; you can type into it with babysit_send and read " +
-			"its screen with babysit_check. If endpoint security kills a worker at startup, " +
+			"its screen with babysit_check. If a worker disappears during startup without recording an exit, " +
 			"`retryOnWorkerDeath` can retry one idempotent command once. " +
 			"(2) `profile: \"subagent\"` + `task` — spawn a pi subagent that works on the task in the " +
 			"background; poll with babysit_check, steer with babysit_send, block with babysit_wait, " +
