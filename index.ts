@@ -154,27 +154,49 @@ function bs(
 // Every session shells out to `babysit`; without it the extension can do
 // nothing. We don't auto-install (that's the user's job) — we fail loudly with
 // install instructions the moment a tool or command is used.
-const INSTALL_HINT =
-	`The \`babysit\` binary was not found (tried "${BABYSIT_BIN}").\n` +
-	`Install it, then retry:\n` +
+const INSTALL_STEPS =
+	`Install babysit 0.13.0 or newer, then retry:\n` +
 	`  cargo install --git https://github.com/yusukeshib/babysit\n` +
 	`or download a prebuilt binary from https://github.com/yusukeshib/babysit/releases and put it on your PATH.\n` +
 	`(Override the binary path with $PI_BABYSIT_CLI.)`;
+const INSTALL_HINT =
+	`The \`babysit\` binary was not found (tried "${BABYSIT_BIN}").\n` + INSTALL_STEPS;
+const MIN_BABYSIT_VERSION = [0, 13, 0] as const;
+
+export function isSupportedBabysitVersion(output: string): boolean {
+	const match = /\b(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\b/.exec(output);
+	if (!match) return false;
+	const actual = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+	for (let i = 0; i < MIN_BABYSIT_VERSION.length; i++) {
+		if (actual[i] !== MIN_BABYSIT_VERSION[i]) return actual[i] > MIN_BABYSIT_VERSION[i];
+	}
+	return match[4] === undefined;
+}
 
 // Cached preflight — probe `babysit --version` exactly once per process.
-let babysitOk: boolean | undefined;
+// undefined = not probed, null = supported, string = actionable error.
+let babysitPreflightError: string | null | undefined;
 async function babysitAvailable(): Promise<boolean> {
-	if (babysitOk === undefined) {
-		const r = await bs(["--version"]);
-		babysitOk = r.code === 0;
+	// Cache only success. A missing or outdated binary may be installed while pi
+	// stays open, so subsequent tool calls must be able to recover without a restart.
+	if (babysitPreflightError === null) return true;
+	const r = await bs(["--version"]);
+	if (r.code !== 0) {
+		babysitPreflightError = INSTALL_HINT;
+	} else if (!isSupportedBabysitVersion(r.stdout)) {
+		babysitPreflightError =
+			`pi-babysit requires babysit 0.13.0 or newer; found ${r.stdout.trim() || "an unknown version"}.\n` +
+			INSTALL_STEPS;
+	} else {
+		babysitPreflightError = null;
 	}
-	return babysitOk;
+	return babysitPreflightError === null;
 }
 
 // Throwing form for tool `execute` handlers: a thrown error marks the tool
-// result isError and reports the install hint to the model.
+// result isError and reports the preflight error to the model.
 async function requireBabysit(): Promise<void> {
-	if (!(await babysitAvailable())) throw new Error(INSTALL_HINT);
+	if (!(await babysitAvailable())) throw new Error(babysitPreflightError ?? INSTALL_HINT);
 }
 
 // Error-aware: `babysit list` failing is NOT the same as "no sessions" —
@@ -379,6 +401,68 @@ function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 	const head = buf.subarray(0, half).toString("utf8").replace(/\uFFFD+$/, "");
 	const tail = buf.subarray(buf.length - half).toString("utf8").replace(/^\uFFFD+/, "");
 	return `${head}\n… [${buf.length - maxBytes} bytes elided] …\n${tail}`;
+}
+
+async function searchLog(
+	id: string,
+	pattern: string,
+	maxLines: number,
+	signal?: AbortSignal,
+): Promise<{ text: string; error?: string }> {
+	const file = logPath(id);
+	if (!fs.existsSync(file)) return { text: "", error: `Log file is missing: ${file}` };
+	if (signal?.aborted) return { text: "", error: "Log search was interrupted." };
+
+	// Run regex evaluation out of process so catastrophic backtracking or a huge
+	// no-newline log cannot freeze or exhaust pi's main Node process. The helper
+	// clips each retained line; this parent also enforces a hard wall-clock limit.
+	return new Promise((resolve) => {
+		const helper = path.join(EXT_DIR, "search-log.mjs");
+		const nodeOptions = [process.env.NODE_OPTIONS, "--max-old-space-size=32"]
+			.filter(Boolean)
+			.join(" ");
+		const child = spawn(process.execPath, [helper, file, pattern, String(maxLines)], {
+			env: { ...process.env, NODE_OPTIONS: nodeOptions },
+		});
+		let stdout = "";
+		let stderr = "";
+		let finished = false;
+		let timedOut = false;
+		const finish = (result: { text: string; error?: string }) => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(result);
+		};
+		const onAbort = () => {
+			child.kill("SIGTERM");
+			finish({ text: "", error: "Log search was interrupted." });
+		};
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+		}, 3_000);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		child.stdout?.on("data", (data) => {
+			stdout += data.toString();
+		});
+		child.stderr?.on("data", (data) => {
+			stderr = clip(stderr + data.toString());
+		});
+		child.on("error", (error) => {
+			finish({ text: "", error: `Could not start log search: ${String(error)}` });
+		});
+		child.on("close", (code) => {
+			if (timedOut) {
+				finish({ text: "", error: "Log search timed out after 3s; narrow the pattern or log." });
+			} else if (code !== 0) {
+				finish({ text: "", error: stderr.trim() || `Log search failed (exit ${code ?? "?"}).` });
+			} else {
+				finish({ text: clip(stdout.trimEnd()) });
+			}
+		});
+	});
 }
 
 async function inlineOutput(id: string, status: BsSession): Promise<string> {
@@ -1092,29 +1176,9 @@ function backgroundsItself(command: string): boolean {
 	return false;
 }
 
-function boundedLineCount(command: string): number | null {
-	const matches = [...command.matchAll(/(?:^|\|)\s*(?:head|tail)\s+(?:-n\s+|--lines(?:=|\s+)|-)(\d+)\b/g)];
-	if (matches.length === 0) return null;
-	return Math.max(...matches.map((m) => Number(m[1])));
-}
-
-/** Commands allowed to bypass babysit: Git, tiny scalar observations, and
- * strictly bounded reads of captured log files. */
-export function isAllowedDirectBash(command: string): boolean {
-	if (process.env.PI_BABYSIT_ALLOW_BASH === "1") return true;
-	const s = command.trim();
-	if (s === "pwd") return true;
-	if (!s || /[;&`\n\r]|\$\(|>|\b(?:bash|sh|zsh)\s+-c\b/.test(s)) return false;
-	// A single Git invocation does not need babysit. Shell composition remains
-	// behind the gate so `git ... && arbitrary-command` cannot bypass it.
-	if (/^git(?:\s|$)/.test(s) && !/[|<]/.test(s)) return true;
-	if (!/(?:output\.log|\/(?:tmp|var\/tmp)\/[^\s'\"]*\.log)\b/.test(s)) return false;
-	if (/^wc\s+-(?:l|c)\s+/.test(s) && !s.includes("|")) return true;
-	if (!/^(?:tail|head|rg)\b/.test(s)) return false;
-	const limit = boundedLineCount(s);
-	if (limit == null || limit > 100) return false;
-	if (/^rg\b/.test(s) && !/\|\s*(?:head|tail)\b/.test(s)) return false;
-	return true;
+/** Emergency escape hatch only. All ordinary shell commands go through babysit_run. */
+export function isAllowedDirectBash(_command: string): boolean {
+	return process.env.PI_BABYSIT_ALLOW_BASH === "1";
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,7 +1230,7 @@ export default function (pi: ExtensionAPI) {
 					customType: "pi-babysit-process-end",
 					content:
 						`${summary}\nCommand: ${meta.command ?? "?"}\nLog: ${logPath(s.id)}${output}` +
-						`\n\nThis is the automatic process-end notification. Do not call babysit_check just to re-verify. Inspect the log only when needed, using bounded commands such as tail or rg; never read it in full.`,
+						`\n\nThis is the automatic process-end notification. Do not call babysit_check just to re-verify. Inspect the log only when needed with babysit_check { id: ${JSON.stringify(s.id)}, lines, pattern? }; never read it in full.`,
 					display: true,
 					details: {
 						id: s.id,
@@ -1283,7 +1347,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		// Warn early if the binary is missing so the user isn't surprised only when
 		// a tool later fails. Tools/commands still enforce it via requireBabysit.
-		if (ctx.hasUI && !(await babysitAvailable())) ctx.ui.notify(INSTALL_HINT, "warn");
+		if (ctx.hasUI && !(await babysitAvailable())) {
+			ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "warn");
+		}
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = setInterval(() => {
 			// Skip if the previous (async) poll hasn't finished, so slow babysit
@@ -1320,8 +1386,8 @@ export default function (pi: ExtensionAPI) {
 		return {
 			block: true,
 			reason:
-				"Use babysit_run for this command so potentially large output is captured outside model context. " +
-				"Direct bash is allowed for pwd, single Git commands without shell operators, or log-file tail/rg commands explicitly bounded to at most 100 lines. " +
+				"Use babysit_run for shell commands so output is supervised and captured outside model context. " +
+				"Inspect an existing session log with babysit_check { id, lines, pattern? }. " +
 				`Retry as babysit_run({ command: ${JSON.stringify(command)} }).`,
 		};
 	});
@@ -1334,7 +1400,7 @@ export default function (pi: ExtensionAPI) {
 			"Run any shell command in a supervised babysit session. Commands that finish within a short " +
 			"grace period return completion metadata immediately; longer commands continue in the background " +
 			"and trigger an automatic notification on exit. Complete output is returned inline only when it is " +
-			"small; larger output stays in the log path for bounded inspection with tail or rg. " +
+			"small; larger output stays in the log path for bounded inspection with babysit_check. " +
 			"In non-interactive mode (`pi -p`, no UI), process mode blocks until exit because there is no " +
 			"notification loop. Two modes: (1) `command` — run any shell command, including builds, tests, " +
 			"dev servers, watchers, and interactive TUIs; you can type into it with babysit_send and read " +
@@ -1347,7 +1413,7 @@ export default function (pi: ExtensionAPI) {
 			"Run any shell command with context-safe captured output; quick commands return metadata, longer ones continue in background",
 		promptGuidelines: [
 			"Use babysit_run as the default for shell commands, not only long-running work. Small output is returned directly; large stdout/stderr stays out of model context in the returned log path. Give meaningful commands a clear stable `name`.",
-			"Inspect a babysit log only with explicitly bounded commands such as `tail -n N` or focused `rg`; never read or cat a potentially large log in full. Those small inspection commands may use bash directly to avoid recursively creating babysit sessions.",
+			"Inspect a babysit log with babysit_check { id, lines, pattern? }; never read or cat a potentially large log file in full.",
 			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
 			"If a babysit worker is killed externally, babysit_run reports it as worker-dead rather than hanging. Set retryOnWorkerDeath: true only for safe, idempotent commands; it retries at most once and may otherwise duplicate side effects.",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
@@ -1665,10 +1731,10 @@ export default function (pi: ExtensionAPI) {
 		label: "Babysit: check",
 		description:
 			"Inspect babysit session(s). Without an id: lists all sessions (processes + subagents). " +
-			"With an id: a process shows state + recent output (or the rendered screen with " +
-			"`screen: true` — use for TUIs that redraw in place); a subagent shows live progress " +
-			"(turns, recent tool calls, partial answer). Do NOT poll this while merely waiting for " +
-			"a process to end — the exit notification is automatic.",
+			"With an id: a process shows state + recent output, searches its log with `pattern`, " +
+			"or captures the rendered screen with `screen: true`; a subagent shows live progress " +
+			"(or raw log matches with `pattern`). Results are bounded by `lines` and clipped. " +
+			"Do NOT poll this while merely waiting for a process to end — the exit notification is automatic.",
 		promptSnippet: "Check status/progress of babysit sessions (processes and subagents)",
 		parameters: Type.Object({
 			id: Type.Optional(Type.String({ description: "Session id. Omit to list all sessions." })),
@@ -1676,7 +1742,13 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({ description: "Subagent: how many recent tool calls to show (default 8, max 50)." }),
 			),
 			lines: Type.Optional(
-				Type.Number({ description: "Process: how many log lines to show (default 30, max 200)." }),
+				Type.Number({ description: "How many tail lines or latest matches to show (default 30, max 200)." }),
+			),
+			pattern: Type.Optional(
+				Type.String({
+					description:
+						"Search this session's raw log with a regular expression; returns the latest bounded matches.",
+				}),
 			),
 			screen: Type.Optional(
 				Type.Boolean({
@@ -1685,7 +1757,7 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 		}),
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
 			await requireBabysit();
 			if (!params.id) {
 				const { sessions, error } = await listSessions();
@@ -1720,6 +1792,40 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const meta = readMeta(params.id);
+			const nLines = Math.min(Math.max(1, Math.floor(params.lines ?? 30)), 200);
+			if (params.pattern !== undefined) {
+				if (params.screen) {
+					return {
+						content: [{ type: "text", text: "`pattern` and `screen` are mutually exclusive." }],
+						isError: true,
+						details: {},
+					};
+				}
+				if (params.pattern.length === 0) {
+					return {
+						content: [{ type: "text", text: "`pattern` must not be empty." }],
+						isError: true,
+						details: {},
+					};
+				}
+				const result = await searchLog(params.id, params.pattern, nLines, signal);
+				if (result.error) {
+					return {
+						content: [{ type: "text", text: result.error }],
+						isError: true,
+						details: {},
+					};
+				}
+				const kind = meta?.kind ?? "process";
+				const header = `[${kind}] state=${st.state}\nlog: ${logPath(params.id)}`;
+				const body = result.text
+					? `--- latest matches /${params.pattern}/ ---\n${result.text}`
+					: `(no output matching /${params.pattern}/)`;
+				return {
+					content: [{ type: "text", text: `${header}\n${body}` }],
+					details: { status: st, kind, logPath: logPath(params.id), pattern: params.pattern },
+				};
+			}
 
 			// --- process ---
 			if (meta?.kind !== "subagent") {
@@ -1738,7 +1844,6 @@ export default function (pi: ExtensionAPI) {
 					const sc = await bs(["screenshot", "-s", params.id, "--trim"]);
 					parts.push(`--- screen ---\n${clip(sc.stdout.trimEnd()) || "(blank screen)"}`);
 				} else {
-					const nLines = Math.min(Math.max(1, params.lines ?? 30), 200);
 					const tail = clip(
 						(await bs(["log", "-s", params.id, "--tail", String(nLines)])).stdout.trimEnd(),
 					);
@@ -2099,7 +2204,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Pick a babysit session (↑/↓) to snapshot/inspect",
 		handler: async (_args, ctx) => {
 			if (!(await babysitAvailable())) {
-				ctx.ui.notify(INSTALL_HINT, "error");
+				ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "error");
 				return;
 			}
 			const sessions = (await listSessions()).sessions.sort((a, b) =>

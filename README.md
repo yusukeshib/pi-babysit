@@ -13,8 +13,8 @@ It retires both `@mjakl/pi-processes` (the `process` tool) and the old
 pi install npm:@yusukeshib/pi-babysit
 ```
 
-Then install the [`babysit`](https://github.com/yusukeshib/babysit) binary
-(the extension does **not** auto-install it):
+Then install [`babysit`](https://github.com/yusukeshib/babysit) **0.13.0 or
+newer** (the extension does **not** auto-install it):
 
 ```sh
 cargo install --git https://github.com/yusukeshib/babysit
@@ -22,8 +22,8 @@ cargo install --git https://github.com/yusukeshib/babysit
 
 or grab a prebuilt binary from the
 [releases](https://github.com/yusukeshib/babysit/releases) and put it on your
-`PATH`. If it's missing, every tool and the `/babysit` command fail with these
-instructions.
+`PATH`. If it is missing or older than 0.13.0, every tool and the `/babysit`
+command fail with upgrade instructions.
 
 ## The model
 
@@ -50,13 +50,13 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 | Tool | What it does |
 | ---- | ------------ |
 | `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`) or start a subagent (`profile: "subagent"`, `task`, optional `agent`/`model`/`tools`). Quick commands return inline; longer ones continue in the background |
-| `babysit_check` | List all sessions, or inspect one: process → state + log tail (or `screen: true` for TUIs); subagent → live progress (turns, recent tool calls, partial answer) |
+| `babysit_check` | List all sessions, inspect one, tail its bounded recent output, or search its raw log with `pattern`; `screen: true` captures TUIs and subagents otherwise show structured live progress |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when idle (`mode: auto/steer/task`) |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: `ids` + `mode: "any"\|"all"` |
 | `babysit_kill` | Terminate a session (suppresses the exit notification) |
 
 A `tool_call` hook blocks shell backgrounding (`… &`, `nohup`, `setsid`,
-`disown`) and redirects broad direct `bash` commands to `babysit_run`.
+`disown`) and redirects all direct `bash` commands to `babysit_run`.
 
 ## Commands (human)
 
@@ -72,21 +72,20 @@ A minimal widget above the editor shows live counts
 `babysit_run`, `babysit_wait`, and automatic completion notifications always
 return lifecycle metadata and the absolute path to the complete `output.log`.
 When the complete output is at most 8 KB it is returned inline; larger output
-stays out of model context. Inspect large logs on demand with bounded shell
-commands such as:
+stays out of model context. Inspect it through the session id without creating
+another shell session:
 
-```sh
-tail -n 50 /path/to/output.log
-rg -n 'FAIL|ERROR' /path/to/output.log
+```text
+babysit_check { id: "cargo-test", lines: 50 }
+babysit_check { id: "cargo-test", pattern: "FAIL|ERROR", lines: 50 }
 ```
 
-`babysit_check { id, lines }` remains available as a convenient bounded tail.
-Do not read a potentially large log file in full.
+Tail and search results are capped at 200 lines and clipped to 8 KB. Pattern
+search returns the latest matching lines with line numbers. Do not read a
+potentially large log file in full.
 
-Direct `bash` is allowed for `pwd`, single Git commands without shell
-operators, and explicitly bounded log inspection. Other shell commands are
-redirected to `babysit_run`. `babysit_run` supports both quick and long-running
-commands.
+All shell commands, including `pwd` and Git, are redirected to `babysit_run`.
+Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 
 ## Unexpected worker loss
 
@@ -124,12 +123,14 @@ rule, so a subagent waiting on a long build is never false-killed.
 | `PI_BABYSIT_CLI` | `babysit` | babysit binary |
 | `PI_BABYSIT_VIEW_CMD` | bundled `format-stream.mjs` | live-attach pretty printer for subagent JSONL (`""` disables) |
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
+| `PI_BABYSIT_ALLOW_BASH` | unset | set to `1` to bypass direct-Bash redirection (emergency escape hatch) |
 
-Requires `babysit` and `pi` on `PATH`. The extension does **not** auto-install
-`babysit`: if the binary is missing, every tool and the `/babysit` command fail
-with install instructions (`cargo install --git https://github.com/yusukeshib/babysit`
-or a prebuilt release), and a warning is shown at session start. Point
-`$PI_BABYSIT_CLI` at a custom binary path if needed.
+Requires `babysit` 0.13.0 or newer and `pi` on `PATH`. The extension does **not**
+auto-install `babysit`: if the binary is missing or too old, every tool and the
+`/babysit` command fail with install instructions (`cargo install --git
+https://github.com/yusukeshib/babysit` or a prebuilt release), and a warning is
+shown at session start. Point `$PI_BABYSIT_CLI` at a custom binary path if
+needed.
 
 (No tmux dependency — `/babysit` renders inline; take over a live process
 manually with the `babysit attach` command it shows.)
