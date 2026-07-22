@@ -38,7 +38,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -1210,21 +1210,23 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });
 	};
 
-	type DisplayStatus = "running" | "idle" | "success" | "failed" | "terminated";
+	type DisplayStatus = "started" | "running" | "idle" | "success" | "failed" | "terminated";
 	const renderStatus = (status: DisplayStatus, theme: Theme, prefix?: string): string => {
 		const labels: Record<
 			DisplayStatus,
 			{ icon: string; text: string; color: "accent" | "warning" | "success" | "error" }
 		> = {
+			started: { icon: "", text: "STARTED", color: "accent" },
 			running: { icon: "⏳", text: "RUNNING", color: "accent" },
 			idle: { icon: "●", text: "IDLE", color: "warning" },
 			success: { icon: "✓", text: "SUCCESS", color: "success" },
 			failed: { icon: "✗", text: "FAILED", color: "error" },
-			terminated: { icon: "■", text: "TERMINATED", color: "error" },
+			terminated: { icon: "", text: "TERMINATED", color: "error" },
 		};
 		const label = labels[status];
 		const text = prefix ? `${prefix} ${label.text}` : label.text;
-		return theme.fg(label.color, theme.bold(`${label.icon} ${text}`));
+		const decorated = label.icon ? `${label.icon} ${text}` : text;
+		return theme.fg(label.color, theme.bold(decorated));
 	};
 	const outcomeStatus = (outcome: WaitOutcome): DisplayStatus =>
 		outcome.ok
@@ -1552,7 +1554,7 @@ export default function (pi: ExtensionAPI) {
 						command: params.command,
 						logPath: logPath(res.id),
 						retried,
-						status: "running" satisfies DisplayStatus,
+						status: "started" satisfies DisplayStatus,
 					},
 					// Do not return `terminate: true` here. In RPC/subagent hosts that hint
 					// can shut down the hosting pi worker, whose process-tree cleanup then
@@ -1619,9 +1621,14 @@ export default function (pi: ExtensionAPI) {
 					agent: agent?.name,
 					model: res.model,
 					task: params.task,
-					status: "running" satisfies DisplayStatus,
+					status: "started" satisfies DisplayStatus,
 				},
 			};
+		},
+		// The result label already includes "babysit_run"; suppress the default
+		// call header so the tool name is not shown twice in adjacent lines.
+		renderCall() {
+			return new Container();
 		},
 		renderResult(result, { isPartial }, theme, context) {
 			const details = (result.details ?? {}) as {
@@ -1647,7 +1654,7 @@ export default function (pi: ExtensionAPI) {
 						(context.isError
 							? "failed"
 							: details.kind === "subagent" || content.includes(NOTIFY_MARKER)
-								? "running"
+								? "started"
 								: "success");
 			const label = renderStatus(status, theme, "babysit_run");
 			return new Text(content ? `${label}\n${theme.fg("toolOutput", content)}` : label, 0, 0);

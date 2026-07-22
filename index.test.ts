@@ -54,7 +54,7 @@ test("process completion messages render semantic colored labels", () => {
 	expect(render({ status: "success" })).toContain("<bg-toolSuccessBg>");
 	expect(render({ status: "failed" })).toContain("<error>✗ babysit_run FAILED</error>");
 	expect(render({ status: "terminated" })).toContain(
-		"<error>■ babysit_run TERMINATED</error>",
+		"<error>babysit_run TERMINATED</error>",
 	);
 	const lines = renderLines({ status: "success" });
 	expect(lines[0]).not.toContain("babysit_run");
@@ -62,7 +62,8 @@ test("process completion messages render semantic colored labels", () => {
 });
 
 test("babysit_run renders a status label for quick and background results", () => {
-	const renderResult = tools.get("babysit_run").renderResult;
+	const tool = tools.get("babysit_run");
+	const renderResult = tool.renderResult;
 	const theme = {
 		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
 		bold: (text: string) => text,
@@ -75,8 +76,9 @@ test("babysit_run renders a status label for quick and background results", () =
 			{ isError },
 		).render(100).join("\n");
 
+	expect(tool.renderCall().render(100)).toEqual([]);
 	expect(render("success")).toContain("<success>✓ babysit_run SUCCESS</success>");
-	expect(render("running")).toContain("<accent>⏳ babysit_run RUNNING</accent>");
+	expect(render("started")).toContain("<accent>babysit_run STARTED</accent>");
 	expect(render("failed", true)).toContain("<error>✗ babysit_run FAILED</error>");
 	expect(
 		render(
@@ -84,7 +86,7 @@ test("babysit_run renders a status label for quick and background results", () =
 			false,
 			"worker-dead: the babysit supervisor disappeared without an exit status",
 		),
-	).toContain("<error>■ babysit_run TERMINATED</error>");
+	).toContain("<error>babysit_run TERMINATED</error>");
 });
 
 test("direct bash policy allows only tiny observations and bounded log reads", () => {
