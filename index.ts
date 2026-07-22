@@ -283,6 +283,9 @@ interface Meta {
 	name?: string;
 	command?: string;
 	notified?: boolean;
+	// A confirmed kill permanently owns completion delivery. An interrupted
+	// concurrent wait must not re-enable the automatic notification afterward.
+	killNotificationSuppressed?: boolean;
 	// Temporary reservation while kill is in flight. Unlike `notified`, this
 	// must be cleared on failure so a real completion remains deliverable.
 	notificationPaused?: boolean;
@@ -537,10 +540,24 @@ async function inlineOutput(
 }
 
 export function summarizeNotificationCommand(command: string | undefined): string {
-	const compact = (command ?? "?").replace(/\s+/g, " ").trim() || "?";
-	const bytes = Buffer.from(compact, "utf8");
-	if (bytes.length <= NOTIFY_COMMAND_MAX_BYTES) return compact;
-	return `${bytes.subarray(0, NOTIFY_COMMAND_MAX_BYTES).toString("utf8").replace(/\uFFFD+$/, "")}…`;
+	const preview =
+		(command ?? "?")
+			.trim()
+			.replace(/\r/g, "\\r")
+			.replace(/\n/g, "\\n")
+			.replace(/\t/g, "\\t") || "?";
+	const bytes = Buffer.from(preview, "utf8");
+	if (bytes.length <= NOTIFY_COMMAND_MAX_BYTES) return preview;
+	if (NOTIFY_COMMAND_MAX_BYTES === 0) return "";
+	const ellipsis = Buffer.from("…", "utf8");
+	if (NOTIFY_COMMAND_MAX_BYTES <= ellipsis.length) {
+		return ".".repeat(NOTIFY_COMMAND_MAX_BYTES);
+	}
+	const prefix = bytes
+		.subarray(0, NOTIFY_COMMAND_MAX_BYTES - ellipsis.length)
+		.toString("utf8")
+		.replace(/\uFFFD+$/, "");
+	return `${prefix}…`;
 }
 
 
@@ -1108,18 +1125,26 @@ async function waitForTask(
 
 // Mark a process session as already-reported so the exit-notification poller
 // doesn't send a duplicate message for something the agent just observed.
-function suppressNotify(id: string): void {
+function suppressNotify(id: string, reason: "observed" | "kill" = "observed"): void {
 	const meta = readMeta(id);
 	if (meta && meta.kind === "process") {
 		meta.notified = true;
+		if (reason === "kill") meta.killNotificationSuppressed = true;
 		delete meta.notificationPaused;
 		writeMeta(id, meta);
 	}
 }
 
+export function canRestoreNotificationAfterWait(meta: {
+	notified?: boolean;
+	killNotificationSuppressed?: boolean;
+}): boolean {
+	return meta.notified === true && meta.killNotificationSuppressed !== true;
+}
+
 function enableNotify(id: string): void {
 	const meta = readMeta(id);
-	if (meta && meta.kind === "process" && meta.notified) {
+	if (meta && meta.kind === "process" && canRestoreNotificationAfterWait(meta)) {
 		meta.notified = false;
 		writeMeta(id, meta);
 	}
@@ -1127,7 +1152,7 @@ function enableNotify(id: string): void {
 
 function pauseNotify(id: string): void {
 	const meta = readMeta(id);
-	if (meta && meta.kind === "process" && !meta.notified && !meta.notificationPaused) {
+	if (meta && meta.kind === "process" && !meta.notificationPaused) {
 		meta.notificationPaused = true;
 		writeMeta(id, meta);
 	}
@@ -2302,7 +2327,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			suppressNotify(params.id);
+			suppressNotify(params.id, "kill");
 			await refreshWidget(ctx);
 			return {
 				content: [{ type: "text", text: `Killed ${params.id} (confirmed ${status.state}).` }],

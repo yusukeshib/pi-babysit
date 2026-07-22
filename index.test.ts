@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import extension, {
+	canRestoreNotificationAfterWait,
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
 	isSupportedBabysitVersion,
@@ -124,12 +125,12 @@ test("kill confirmation validates both backend acknowledgement and terminal stat
 });
 
 test("completion notification payload policies are UTF-8 safe and bounded", () => {
-	expect(summarizeNotificationCommand("printf 'a'\n\n  &&   printf 'b'")).toBe(
-		"printf 'a' && printf 'b'",
+	expect(summarizeNotificationCommand("printf 'a  b'\n\t&& printf 'c'")).toBe(
+		"printf 'a  b'\\n\\t&& printf 'c'",
 	);
 	for (const command of ["x".repeat(2_000), `a${"界".repeat(2_000)}`]) {
 		const preview = summarizeNotificationCommand(command);
-		expect(Buffer.byteLength(preview)).toBeLessThanOrEqual(243);
+		expect(Buffer.byteLength(preview)).toBeLessThanOrEqual(240);
 		expect(preview).toEndWith("…");
 		expect(preview).not.toContain("�");
 	}
@@ -137,6 +138,13 @@ test("completion notification payload policies are UTF-8 safe and bounded", () =
 	expect(shouldInlineCompleteOutput(1_999, 2_000)).toBe(true);
 	expect(shouldInlineCompleteOutput(2_000, 2_000)).toBe(true);
 	expect(shouldInlineCompleteOutput(2_001, 2_000)).toBe(false);
+	expect(canRestoreNotificationAfterWait({ notified: true })).toBe(true);
+	expect(
+		canRestoreNotificationAfterWait({
+			notified: true,
+			killNotificationSuppressed: true,
+		}),
+	).toBe(false);
 });
 
 test("babysit_kill returns success only after terminal state is persisted", async () => {
