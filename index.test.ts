@@ -1,6 +1,17 @@
 import { expect, test } from "bun:test";
-import { readFileSync, unlinkSync } from "node:fs";
-import extension, { isAllowedDirectBash, isSupportedBabysitVersion } from "./index.ts";
+import { readFileSync, rmSync, unlinkSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import extension, {
+	canRestoreNotificationAfterWait,
+	isAllowedDirectBash,
+	isConfirmedTerminalState,
+	isSupportedBabysitVersion,
+	shouldInlineCompleteOutput,
+	summarizeNotificationCommand,
+	validateKillResponse,
+} from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -99,6 +110,81 @@ test("babysit version policy requires 0.13.0 or newer", () => {
 	expect(isSupportedBabysitVersion("babysit 0.14.0-beta.1")).toBe(true);
 	expect(isSupportedBabysitVersion("babysit 1.0.0")).toBe(true);
 	expect(isSupportedBabysitVersion("unknown")).toBe(false);
+});
+
+test("kill confirmation validates both backend acknowledgement and terminal state", () => {
+	expect(validateKillResponse('{"killed":true}')).toBeNull();
+	expect(validateKillResponse('{"killed":true,"confirmed":true}')).toBeNull();
+	expect(validateKillResponse('{"killed":false}')).toContain("not confirmed");
+	expect(validateKillResponse('{"killed":true,"confirmed":false}')).toContain("not confirmed");
+	expect(validateKillResponse("not-json")).toContain("Invalid kill response");
+	expect(isConfirmedTerminalState("killed")).toBe(true);
+	expect(isConfirmedTerminalState("exited")).toBe(true);
+	expect(isConfirmedTerminalState("running")).toBe(false);
+	expect(isConfirmedTerminalState("dead")).toBe(false);
+});
+
+test("completion notification payload policies are UTF-8 safe and bounded", () => {
+	expect(summarizeNotificationCommand("printf 'a  b'\n\t&& printf 'c'")).toBe(
+		"printf 'a  b'\\n\\t&& printf 'c'",
+	);
+	for (const command of ["x".repeat(2_000), `a${"界".repeat(2_000)}`]) {
+		const preview = summarizeNotificationCommand(command);
+		expect(Buffer.byteLength(preview)).toBeLessThanOrEqual(240);
+		expect(preview).toEndWith("…");
+		expect(preview).not.toContain("�");
+	}
+	expect(shouldInlineCompleteOutput(0, 0)).toBe(false);
+	expect(shouldInlineCompleteOutput(1_999, 2_000)).toBe(true);
+	expect(shouldInlineCompleteOutput(2_000, 2_000)).toBe(true);
+	expect(shouldInlineCompleteOutput(2_001, 2_000)).toBe(false);
+	expect(canRestoreNotificationAfterWait({ notified: true })).toBe(true);
+	expect(
+		canRestoreNotificationAfterWait({
+			notified: true,
+			killNotificationSuppressed: true,
+		}),
+	).toBe(false);
+});
+
+test("babysit_kill returns success only after terminal state is persisted", async () => {
+	const binary = process.env.PI_BABYSIT_CLI ?? "babysit";
+	const root = process.env.PI_BABYSIT_DIR ?? path.join(os.homedir(), ".pi-babysit");
+	const started = spawnSync(
+		binary,
+		["run", "-d", "--json", "--no-tty", "--", "sh", "-c", "sleep 60"],
+		{ encoding: "utf8", env: { ...process.env, BABYSIT_DIR: root } },
+	);
+	expect(started.status).toBe(0);
+	const id = JSON.parse(started.stdout).id as string;
+	try {
+		const result = await tools.get("babysit_kill").execute(
+			"test",
+			{ id },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(result.isError).not.toBe(true);
+		expect(result.content[0]?.text).toContain("confirmed");
+		expect(["killed", "exited"]).toContain(result.details.status);
+
+		const checked = spawnSync(binary, ["status", "-s", id, "--json"], {
+			encoding: "utf8",
+			env: { ...process.env, BABYSIT_DIR: root },
+		});
+		expect(checked.status).toBe(0);
+		const status = JSON.parse(checked.stdout).status;
+		expect(["killed", "exited"]).toContain(status.state);
+		expect(status.child_pid).toBeNull();
+	} finally {
+		spawnSync(binary, ["kill", "-s", id, "--json"], {
+			stdio: "ignore",
+			env: { ...process.env, BABYSIT_DIR: root },
+		});
+		rmSync(path.join(root, "sessions", id), { recursive: true, force: true });
+		rmSync(path.join(root, "meta", `${id}.json`), { force: true });
+	}
 });
 
 test("direct bash policy only supports the explicit escape hatch", () => {

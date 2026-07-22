@@ -53,7 +53,7 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 | `babysit_check` | List all sessions, inspect one, tail its bounded recent output, or search its raw log with `pattern`; `screen: true` captures TUIs and subagents otherwise show structured live progress |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when idle (`mode: auto/steer/task`) |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: `ids` + `mode: "any"\|"all"` |
-| `babysit_kill` | Terminate a session (suppresses the exit notification) |
+| `babysit_kill` | Terminate a session, verify terminal state, then suppress the exit notification |
 
 A `tool_call` hook blocks shell backgrounding (`… &`, `nohup`, `setsid`,
 `disown`) and redirects all direct `bash` commands to `babysit_run`.
@@ -71,9 +71,10 @@ A minimal widget above the editor shows live counts
 
 `babysit_run`, `babysit_wait`, and automatic completion notifications always
 return lifecycle metadata and the absolute path to the complete `output.log`.
-When the complete output is at most 8 KB it is returned inline; larger output
-stays out of model context. Inspect it through the session id without creating
-another shell session:
+Explicit run/wait results inline complete output up to 8 KB; unsolicited
+completion notifications use a stricter 2 KB cap. Larger output stays out of
+model context. Inspect it through the session id without creating another shell
+session:
 
 ```text
 babysit_check { id: "cargo-test", lines: 50 }
@@ -123,6 +124,10 @@ rule, so a subagent waiting on a long build is never false-killed.
 | `PI_BABYSIT_CLI` | `babysit` | babysit binary |
 | `PI_BABYSIT_VIEW_CMD` | bundled `format-stream.mjs` | live-attach pretty printer for subagent JSONL (`""` disables) |
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
+| `PI_BABYSIT_TAIL_MAX_BYTES` | `8000` | cap for explicit log tails/screens returned by `babysit_check` |
+| `PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES` | `8000` | cap for complete output in explicitly requested run/wait results |
+| `PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES` | `2000` | smaller cap for unsolicited process-completion notifications (`0` omits all output) |
+| `PI_BABYSIT_NOTIFY_COMMAND_MAX_BYTES` | `240` | cap for the command preview in completion notifications |
 | `PI_BABYSIT_ALLOW_BASH` | unset | set to `1` to bypass direct-Bash redirection (emergency escape hatch) |
 
 Requires `babysit` 0.13.0 or newer and `pi` on `PATH`. The extension does **not**
