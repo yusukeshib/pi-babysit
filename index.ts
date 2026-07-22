@@ -36,7 +36,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -1146,6 +1146,11 @@ export default function (pi: ExtensionAPI) {
 			meta.notified = true;
 			writeMeta(s.id, meta);
 			const ok = s.exit_code === 0;
+			const status: DisplayStatus = ok
+				? "success"
+				: s.state === "dead" || s.exit_code == null
+					? "terminated"
+					: "failed";
 			const output = await inlineOutput(s.id, s);
 			const runtime = meta.startedAt
 				? `${Math.round((Date.now() - meta.startedAt) / 1000)}s`
@@ -1162,7 +1167,14 @@ export default function (pi: ExtensionAPI) {
 						`${summary}\nCommand: ${meta.command ?? "?"}\nLog: ${logPath(s.id)}${output}` +
 						`\n\nThis is the automatic process-end notification. Do not call babysit_check just to re-verify. Inspect the log only when needed, using bounded commands such as tail or rg; never read it in full.`,
 					display: true,
-					details: { id: s.id, exitCode: s.exit_code, success: ok, runtime, logPath: logPath(s.id) },
+					details: {
+						id: s.id,
+						exitCode: s.exit_code,
+						success: ok,
+						status,
+						runtime,
+						logPath: logPath(s.id),
+					},
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
@@ -1198,22 +1210,60 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });
 	};
 
-	// Render a subagent's final answer INLINE in the transcript as formatted
-	// markdown (agent output is markdown). Fed via pi.sendMessage below.
+	type DisplayStatus = "running" | "idle" | "success" | "failed" | "terminated";
+	const renderStatus = (status: DisplayStatus, theme: Theme, prefix?: string): string => {
+		const labels: Record<
+			DisplayStatus,
+			{ icon: string; text: string; color: "accent" | "warning" | "success" | "error" }
+		> = {
+			running: { icon: "⏳", text: "RUNNING", color: "accent" },
+			idle: { icon: "●", text: "IDLE", color: "warning" },
+			success: { icon: "✓", text: "SUCCESS", color: "success" },
+			failed: { icon: "✗", text: "FAILED", color: "error" },
+			terminated: { icon: "■", text: "TERMINATED", color: "error" },
+		};
+		const label = labels[status];
+		const text = prefix ? `${prefix} ${label.text}` : label.text;
+		return theme.fg(label.color, theme.bold(`${label.icon} ${text}`));
+	};
+	const outcomeStatus = (outcome: WaitOutcome): DisplayStatus =>
+		outcome.ok
+			? "success"
+			: outcome.status &&
+					(outcome.status.state === "dead" || outcome.status.exit_code == null)
+				? "terminated"
+				: "failed";
+
+	// Render snapshots and subagent answers INLINE in the transcript as formatted
+	// markdown, with a semantic status label that remains readable on any theme.
 	pi.registerMessageRenderer("pi-babysit-result", (message, _opts, theme) => {
-		const d = (message.details ?? {}) as { title?: string; body?: string };
+		const d = (message.details ?? {}) as {
+			title?: string;
+			body?: string;
+			status?: DisplayStatus;
+		};
 		const body =
 			d.body ?? (typeof message.content === "string" ? message.content : "");
-		const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
+		const box = new Box(1, 0, (t) => theme.bg("toolSuccessBg", t));
+		if (d.status) box.addChild(new Text(renderStatus(d.status, theme), 0, 0));
 		if (d.title) box.addChild(new Text(theme.fg("accent", d.title), 0, 0));
 		box.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
 		return box;
 	});
 
-	// Process-end notification rendering (plain text in a subtle box).
+	// Process-end notification rendering with a colored lifecycle label. Keep the
+	// box background subtle: coloring a potentially large log excerpt is noisy.
 	pi.registerMessageRenderer("pi-babysit-process-end", (message, _opts, theme) => {
 		const content = typeof message.content === "string" ? message.content : "";
-		const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
+		const d = (message.details ?? {}) as {
+			status?: DisplayStatus;
+			success?: boolean;
+			exitCode?: number | null;
+		};
+		const status =
+			d.status ?? (d.success ? "success" : d.exitCode == null ? "terminated" : "failed");
+		const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
+		box.addChild(new Text(renderStatus(status, theme, "babysit_run"), 0, 0));
 		box.addChild(new Text(content, 0, 0));
 		return box;
 	});
@@ -1433,7 +1483,14 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text: `${retried ? "Retried once after external worker death.\n" : ""}${outcome.text}` }],
 						isError: !outcome.ok,
-						details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id), retried },
+						details: {
+							id: res.id,
+							kind: "process",
+							command: params.command,
+							logPath: logPath(res.id),
+							retried,
+							status: outcomeStatus(outcome),
+						},
 					};
 				}
 
@@ -1462,7 +1519,14 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text: `${retried ? "Retried once after external worker death.\n" : ""}${outcome.text}` }],
 						isError: !outcome.ok,
-						details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id), retried },
+						details: {
+							id: res.id,
+							kind: "process",
+							command: params.command,
+							logPath: logPath(res.id),
+							retried,
+							status: outcomeStatus(outcome),
+						},
 					};
 				}
 
@@ -1482,7 +1546,14 @@ export default function (pi: ExtensionAPI) {
 								`Human can watch/take over: /babysit`,
 						},
 					],
-					details: { id: res.id, kind: "process", command: params.command, logPath: logPath(res.id), retried },
+					details: {
+						id: res.id,
+						kind: "process",
+						command: params.command,
+						logPath: logPath(res.id),
+						retried,
+						status: "running" satisfies DisplayStatus,
+					},
 					// Do not return `terminate: true` here. In RPC/subagent hosts that hint
 					// can shut down the hosting pi worker, whose process-tree cleanup then
 					// kills the otherwise detached babysit supervisor and closes its PTY
@@ -1542,8 +1613,44 @@ export default function (pi: ExtensionAPI) {
 							`Human can watch/steer: /babysit (pick ${res.id})`,
 					},
 				],
-				details: { id: res.id, kind: "subagent", agent: agent?.name, model: res.model, task: params.task },
+				details: {
+					id: res.id,
+					kind: "subagent",
+					agent: agent?.name,
+					model: res.model,
+					task: params.task,
+					status: "running" satisfies DisplayStatus,
+				},
 			};
+		},
+		renderResult(result, { isPartial }, theme, context) {
+			const details = (result.details ?? {}) as {
+				kind?: "process" | "subagent";
+				status?: DisplayStatus;
+			};
+			const content = result.content
+				.filter((item): item is { type: "text"; text: string } => item.type === "text")
+				.map((item) => item.text)
+				.join("\n");
+			// A vanished supervisor must never be presented as success, even if an
+			// older/stale result omitted status details or the host did not preserve
+			// the custom isError field. The textual diagnosis is part of our stable
+			// tool contract, so give it precedence over all fallback classification.
+			const workerDead =
+				content.includes("worker-dead") ||
+				content.includes("babysit supervisor disappeared");
+			const status: DisplayStatus = isPartial
+				? "running"
+				: workerDead
+					? "terminated"
+					: details.status ??
+						(context.isError
+							? "failed"
+							: details.kind === "subagent" || content.includes(NOTIFY_MARKER)
+								? "running"
+								: "success");
+			const label = renderStatus(status, theme, "babysit_run");
+			return new Text(content ? `${label}\n${theme.fg("toolOutput", content)}` : label, 0, 0);
 		},
 	});
 
@@ -2044,12 +2151,21 @@ export default function (pi: ExtensionAPI) {
 					`${picked.id} ${picked.state}${elapsedSuffix}` +
 					(picked.exit_code != null ? ` (exit=${picked.exit_code})` : "") +
 					`  ${stats}`;
+				const status: DisplayStatus = prog.errorMsg
+					? "failed"
+					: prog.running || prog.waitingOnProcess
+						? "running"
+						: prog.done
+							? "idle"
+							: picked.exit_code === 0
+								? "success"
+								: "terminated";
 				if (ctx.hasUI) {
 					pi.sendMessage({
 						customType: "pi-babysit-result",
 						content: title,
 						display: true,
-						details: { title, body },
+						details: { title, body, status },
 					});
 				} else {
 					ctx.ui.notify(`${title}\n\n${body}`, "info");
@@ -2078,12 +2194,19 @@ export default function (pi: ExtensionAPI) {
 					(running
 						? `\n\n_Take over in your own terminal:_ \`${attachCmd(picked.id)}\` _(detach: Ctrl-\\ Ctrl-\\)._ Re-run \`/babysit\` to refresh this snapshot.`
 						: "");
+				const status: DisplayStatus = running
+					? "running"
+					: picked.exit_code === 0
+						? "success"
+						: picked.state === "dead" || picked.exit_code == null
+							? "terminated"
+							: "failed";
 				if (ctx.hasUI) {
 					pi.sendMessage({
 						customType: "pi-babysit-result",
 						content: title,
 						display: true,
-						details: { title, body },
+						details: { title, body, status },
 					});
 				} else {
 					ctx.ui.notify(`${title}\n\n${body}`, "info");

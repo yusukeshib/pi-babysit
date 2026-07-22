@@ -4,6 +4,7 @@ import extension, { isAllowedDirectBash } from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
+const renderers = new Map<string, any>();
 
 extension({
 	registerTool(tool: { name: string }) {
@@ -12,7 +13,9 @@ extension({
 	on(name: string, handler: unknown) {
 		hooks.set(name, handler);
 	},
-	registerMessageRenderer() {},
+	registerMessageRenderer(name: string, renderer: unknown) {
+		renderers.set(name, renderer);
+	},
 	registerCommand() {},
 	sendMessage() {},
 } as any);
@@ -33,6 +36,56 @@ async function run(command: string, extras: Record<string, unknown> = {}) {
 		isError?: boolean;
 	}>;
 }
+
+test("process completion messages render semantic colored labels", () => {
+	const renderer = renderers.get("pi-babysit-process-end");
+	const theme = {
+		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+		bg: (color: string, text: string) => `<bg-${color}>${text}</bg-${color}>`,
+		bold: (text: string) => text,
+	};
+	const renderLines = (details: Record<string, unknown>) =>
+		renderer({ content: "process details", details }, {}, theme).render(100) as string[];
+	const render = (details: Record<string, unknown>) => renderLines(details).join("\n");
+
+	expect(render({ status: "success" })).toContain(
+		"<success>✓ babysit_run SUCCESS</success>",
+	);
+	expect(render({ status: "success" })).toContain("<bg-toolSuccessBg>");
+	expect(render({ status: "failed" })).toContain("<error>✗ babysit_run FAILED</error>");
+	expect(render({ status: "terminated" })).toContain(
+		"<error>■ babysit_run TERMINATED</error>",
+	);
+	const lines = renderLines({ status: "success" });
+	expect(lines[0]).not.toContain("babysit_run");
+	expect(lines.at(-1)).not.toContain("process details");
+});
+
+test("babysit_run renders a status label for quick and background results", () => {
+	const renderResult = tools.get("babysit_run").renderResult;
+	const theme = {
+		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+		bold: (text: string) => text,
+	};
+	const render = (status: string, isError = false, content = "result details") =>
+		renderResult(
+			{ content: [{ type: "text", text: content }], details: { status } },
+			{ isPartial: false },
+			theme,
+			{ isError },
+		).render(100).join("\n");
+
+	expect(render("success")).toContain("<success>✓ babysit_run SUCCESS</success>");
+	expect(render("running")).toContain("<accent>⏳ babysit_run RUNNING</accent>");
+	expect(render("failed", true)).toContain("<error>✗ babysit_run FAILED</error>");
+	expect(
+		render(
+			"success",
+			false,
+			"worker-dead: the babysit supervisor disappeared without an exit status",
+		),
+	).toContain("<error>■ babysit_run TERMINATED</error>");
+});
 
 test("direct bash policy allows only tiny observations and bounded log reads", () => {
 	expect(isAllowedDirectBash("pwd")).toBe(true);
