@@ -1,6 +1,6 @@
 {
   "name": "@yusukeshib/pi-babysit",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Run any shell command and pi subagents under babysit, with context-safe captured output.",
   "keywords": [
     "pi-package",

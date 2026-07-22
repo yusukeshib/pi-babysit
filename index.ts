@@ -1445,6 +1445,9 @@ export default function (pi: ExtensionAPI) {
 				let quickStatus = await statusOf(res.id);
 				let retried = false;
 				if (params.retryOnWorkerDeath && quickStatus?.state === "dead" && quickStatus.exit_code == null) {
+					// This attempt is already represented by the retrying tool result; do
+					// not let the exit poller emit a second, stale completion message.
+					suppressNotify(res.id);
 					const retry = await spawnProcess(spawnOpts);
 					if (!("error" in retry)) {
 						res = retry;
