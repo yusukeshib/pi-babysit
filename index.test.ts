@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import extension, { isAllowedDirectBash } from "./index.ts";
+import { readFileSync, unlinkSync } from "node:fs";
+import extension, { isAllowedDirectBash, isSupportedBabysitVersion } from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -92,33 +92,40 @@ test("babysit_run renders a status label for quick and background results", () =
 	).toContain("<error>babysit_run TERMINATED</error>");
 });
 
-test("direct bash policy allows Git, tiny observations, and bounded log reads", () => {
-	expect(isAllowedDirectBash("pwd")).toBe(true);
-	expect(isAllowedDirectBash("git status --short")).toBe(true);
-	expect(isAllowedDirectBash("git diff")).toBe(true);
-	expect(isAllowedDirectBash("git commit -m 'test: direct git'")).toBe(true);
-	expect(isAllowedDirectBash("tail -n 50 /tmp/build.log")).toBe(true);
-	expect(isAllowedDirectBash("rg -n 'error' /tmp/build.log | head -n 80")).toBe(true);
-	expect(isAllowedDirectBash("tail -n 101 /tmp/build.log")).toBe(false);
-	expect(isAllowedDirectBash("rg -n 'error' /tmp/build.log")).toBe(false);
-	expect(isAllowedDirectBash("git diff --stat && git diff")).toBe(false);
-	expect(isAllowedDirectBash("git diff | cat")).toBe(false);
-	expect(isAllowedDirectBash("gh api repos/x/y/actions/jobs/1/logs > /tmp/ci.log")).toBe(false);
-	expect(isAllowedDirectBash("bash -c 'tail -n 10 /tmp/build.log'")).toBe(false);
-	expect(isAllowedDirectBash("tail -n 10 /tmp/build.log; cat /etc/hosts")).toBe(false);
+test("babysit version policy requires 0.13.0 or newer", () => {
+	expect(isSupportedBabysitVersion("babysit 0.12.9")).toBe(false);
+	expect(isSupportedBabysitVersion("babysit 0.13.0-beta.1")).toBe(false);
+	expect(isSupportedBabysitVersion("babysit 0.13.0")).toBe(true);
+	expect(isSupportedBabysitVersion("babysit 0.14.0-beta.1")).toBe(true);
+	expect(isSupportedBabysitVersion("babysit 1.0.0")).toBe(true);
+	expect(isSupportedBabysitVersion("unknown")).toBe(false);
 });
 
-test("tool hook allows Git and redirects other broad bash to babysit_run", async () => {
-	const hook = hooks.get("tool_call");
-	const blocked = await hook({ toolName: "bash", input: { command: "ls -la" } });
-	const git = await hook({ toolName: "bash", input: { command: "git diff" } });
-	const log = await hook({ toolName: "bash", input: { command: "tail -n 40 /tmp/build.log" } });
+test("direct bash policy only supports the explicit escape hatch", () => {
+	for (const command of [
+		"pwd",
+		"git status --short",
+		"tail -n 50 /tmp/build.log",
+		"rg -n 'error' /tmp/build.log | head -n 80",
+		"wc -l /tmp/build.log",
+	]) {
+		expect(isAllowedDirectBash(command)).toBe(false);
+	}
+	const previous = process.env.PI_BABYSIT_ALLOW_BASH;
+	process.env.PI_BABYSIT_ALLOW_BASH = "1";
+	expect(isAllowedDirectBash("anything")).toBe(true);
+	if (previous === undefined) delete process.env.PI_BABYSIT_ALLOW_BASH;
+	else process.env.PI_BABYSIT_ALLOW_BASH = previous;
+});
 
-	expect(blocked.block).toBe(true);
-	expect(blocked.reason).toContain("babysit_run");
-	expect(blocked.reason).toContain("ls -la");
-	expect(git).toBeUndefined();
-	expect(log).toBeUndefined();
+test("tool hook redirects every shell command to babysit_run", async () => {
+	const hook = hooks.get("tool_call");
+	for (const command of ["ls -la", "git diff", "pwd", "tail -n 40 /tmp/build.log"]) {
+		const blocked = await hook({ toolName: "bash", input: { command } });
+		expect(blocked.block).toBe(true);
+		expect(blocked.reason).toContain("babysit_run");
+		expect(blocked.reason).toContain(command);
+	}
 });
 
 test("small process output is returned with metadata and a log path", async () => {
@@ -131,6 +138,53 @@ test("small process output is returned with metadata and a log path", async () =
 	expect(text).toContain("private-output-line");
 	expect(readFileSync(result.details.logPath, "utf8")).toContain("private-output-line");
 });
+
+test("babysit_check searches a session log with bounded latest matches", async () => {
+	const result = await run(
+		"python3 -c \"print('\\\\n'.join(f'ERROR {i}' for i in range(205))); print('INFO ignored')\"",
+	);
+	const before = await tools.get("babysit_check").execute("test", {});
+	const checked = await tools.get("babysit_check").execute("test", {
+		id: result.details.id,
+		pattern: "ERROR",
+		lines: 500,
+	});
+	const after = await tools.get("babysit_check").execute("test", {});
+	const text = checked.content[0]?.text ?? "";
+	const matches = text.split("\n").filter((line: string) => /^\d+:ERROR /.test(line));
+
+	expect(checked.isError).not.toBe(true);
+	expect(after.details.sessions.map((session: { id: string }) => session.id)).toEqual(
+		before.details.sessions.map((session: { id: string }) => session.id),
+	);
+	expect(matches).toHaveLength(200);
+	expect(matches[0]).toEndWith("ERROR 5");
+	expect(matches.at(-1)).toEndWith("ERROR 204");
+	expect(text).not.toContain("INFO ignored");
+
+	const invalid = await tools.get("babysit_check").execute("test", {
+		id: result.details.id,
+		pattern: "[",
+	});
+	expect(invalid.isError).toBe(true);
+	expect(invalid.content[0]?.text).toContain("Invalid pattern");
+
+	const missing = await tools.get("babysit_check").execute("test", {
+		id: "definitely-not-a-session",
+		pattern: "ERROR",
+	});
+	expect(missing.isError).toBe(true);
+	expect(missing.content[0]?.text).toContain("No such session");
+
+	unlinkSync(result.details.logPath);
+	const missingLog = await tools.get("babysit_check").execute("test", {
+		id: result.details.id,
+		pattern: "ERROR",
+	});
+	expect(missingLog.isError).toBe(true);
+	expect(missingLog.content[0]?.text).toContain("Log file is missing");
+});
+
 
 test("failed commands return small stderr, exit status, and a usable log path", async () => {
 	const result = await run("printf '\\146\\141\\151\\154\\055\\144\\145\\164\\141\\151\\154\\012' >&2; exit 7");
