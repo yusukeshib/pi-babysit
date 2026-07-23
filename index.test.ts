@@ -10,6 +10,7 @@ import extension, {
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
 	isSupportedBabysitVersion,
+	planSubagentSpawn,
 	type ProcessCompletionNotice,
 	shouldDeliverProcessCompletion,
 	shouldInlineCompleteOutput,
@@ -114,6 +115,79 @@ test("babysit version policy requires 0.13.0 or newer", () => {
 	expect(isSupportedBabysitVersion("babysit 0.14.0-beta.1")).toBe(true);
 	expect(isSupportedBabysitVersion("babysit 1.0.0")).toBe(true);
 	expect(isSupportedBabysitVersion("unknown")).toBe(false);
+});
+
+test("subagent nesting defaults to one level and requires top-level opt-in", () => {
+	expect(planSubagentSpawn(0, {}).allowed).toBe(false);
+	expect(
+		planSubagentSpawn(undefined, {
+			PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH: "invalid",
+		}).allowed,
+	).toBe(false);
+	expect(planSubagentSpawn(undefined, {})).toEqual({
+		allowed: true,
+		childDepth: 1,
+		maxDepth: 1,
+	});
+
+	const denied = planSubagentSpawn(undefined, {
+		PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH: "1",
+		PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH: "1",
+	});
+	expect(denied.allowed).toBe(false);
+	if (!denied.allowed) expect(denied.error).toContain("disabled at depth 1");
+
+	const optedIn = planSubagentSpawn(2, {});
+	expect(optedIn).toEqual({ allowed: true, childDepth: 1, maxDepth: 2 });
+	const inherited = planSubagentSpawn(undefined, {
+		PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH: "1",
+		PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH: "2",
+	});
+	expect(inherited).toEqual({ allowed: true, childDepth: 2, maxDepth: 2 });
+	const inheritedCeiling = planSubagentSpawn(undefined, {
+		PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH: "2",
+		PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH: "2",
+	});
+	expect(inheritedCeiling.allowed).toBe(false);
+	if (!inheritedCeiling.allowed) {
+		expect(inheritedCeiling.error).toContain("disabled at depth 2");
+	}
+
+	const selfGranted = planSubagentSpawn(3, {
+		PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH: "1",
+		PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH: "2",
+	});
+	expect(selfGranted.allowed).toBe(false);
+	if (!selfGranted.allowed) expect(selfGranted.error).toContain("cannot override");
+});
+
+test("subagent depth limit blocks profile mode but leaves process mode available", async () => {
+	const depthKey = "PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH";
+	const maxDepthKey = "PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH";
+	const previousDepth = process.env[depthKey];
+	const previousMaxDepth = process.env[maxDepthKey];
+	process.env[depthKey] = "1";
+	process.env[maxDepthKey] = "1";
+	try {
+		const denied = await tools.get("babysit_run").execute(
+			"test",
+			{ profile: "subagent", task: "must not start" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(denied.isError).toBe(true);
+		expect(denied.content[0]?.text).toContain("disabled at depth 1");
+
+		const processResult = await run("printf 'process-at-depth-limit\\n'");
+		expect(processResult.isError).toBe(false);
+		expect(processResult.content[0]?.text).toContain("process-at-depth-limit");
+	} finally {
+		if (previousDepth === undefined) delete process.env[depthKey];
+		else process.env[depthKey] = previousDepth;
+		if (previousMaxDepth === undefined) delete process.env[maxDepthKey];
+		else process.env[maxDepthKey] = previousMaxDepth;
+	}
 });
 
 test("kill confirmation validates both backend acknowledgement and terminal state", () => {

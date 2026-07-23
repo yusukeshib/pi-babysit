@@ -52,6 +52,78 @@ let ROOT = ROOT_BASE;
 const PI_BIN = process.env.PI_BABYSIT_BIN ?? "pi";
 const BABYSIT_BIN = process.env.PI_BABYSIT_CLI ?? "babysit";
 const SHELL = process.env.SHELL ?? "sh";
+const SUBAGENT_DEPTH_ENV = "PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH";
+const SUBAGENT_MAX_DEPTH_ENV = "PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH";
+const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
+
+export type SubagentSpawnPlan =
+	| { allowed: true; childDepth: number; maxDepth: number }
+	| { allowed: false; error: string };
+
+/**
+ * Plan a subagent spawn without letting an already-spawned worker raise its
+ * inherited recursion allowance. Depth 0 is the user-facing pi process; the
+ * first worker is depth 1 and is allowed by default, but that worker cannot
+ * create depth 2 unless its top-level parent explicitly opted in.
+ */
+export function planSubagentSpawn(
+	requestedMaxDepth?: number,
+	env: Record<string, string | undefined> = process.env,
+): SubagentSpawnPlan {
+	if (
+		requestedMaxDepth !== undefined &&
+		(!Number.isInteger(requestedMaxDepth) || requestedMaxDepth < 1)
+	) {
+		return { allowed: false, error: "`maxDepth` must be a positive integer." };
+	}
+
+	const rawDepth = env[SUBAGENT_DEPTH_ENV];
+	let currentDepth = 0;
+	if (rawDepth !== undefined) {
+		currentDepth = Number(rawDepth);
+		if (!Number.isInteger(currentDepth) || currentDepth < 0) {
+			return {
+				allowed: false,
+				error: `Invalid inherited subagent depth ${JSON.stringify(rawDepth)}; refusing to spawn recursively.`,
+			};
+		}
+	}
+
+	const nested = currentDepth > 0;
+	if (nested && requestedMaxDepth !== undefined) {
+		return {
+			allowed: false,
+			error:
+				`Nested subagents cannot override \`maxDepth\` (current depth ${currentDepth}). ` +
+				"Only the top-level parent may opt in when it creates the first subagent.",
+		};
+	}
+
+	let maxDepth = requestedMaxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH;
+	if (nested) {
+		const rawMaxDepth = env[SUBAGENT_MAX_DEPTH_ENV];
+		// Missing/corrupt inherited state fails closed at the current depth.
+		maxDepth = rawMaxDepth === undefined ? currentDepth : Number(rawMaxDepth);
+		if (!Number.isInteger(maxDepth) || maxDepth < currentDepth) {
+			return {
+				allowed: false,
+				error: `Invalid inherited max subagent depth ${JSON.stringify(rawMaxDepth)}; refusing to spawn recursively.`,
+			};
+		}
+	}
+
+	const childDepth = currentDepth + 1;
+	if (childDepth > maxDepth) {
+		return {
+			allowed: false,
+			error:
+				`Nested subagent creation is disabled at depth ${currentDepth}: spawning would reach depth ${childDepth}, ` +
+				`but the inherited maxDepth is ${maxDepth}. Have the top-level parent explicitly opt in with ` +
+				`babysit_run { profile: "subagent", task, maxDepth: ${childDepth} } when creating the first worker.`,
+		};
+	}
+	return { allowed: true, childDepth, maxDepth };
+}
 
 // Marker embedded in babysit_run's tool RESULT text for kind=process runs.
 // It is how "the turn parked awaiting a process-exit notification" is told
@@ -116,7 +188,11 @@ function normalizeSession(s: BsSession): BsSession {
 // long wait be interrupted (Ctrl-C) by killing the child.
 function bs(
 	args: string[],
-	opts: { cwd?: string; signal?: AbortSignal } = {},
+	opts: {
+		cwd?: string;
+		signal?: AbortSignal;
+		env?: Record<string, string | undefined>;
+	} = {},
 ): Promise<{ stdout: string; stderr: string; code: number }> {
 	return new Promise((resolve) => {
 		if (opts.signal?.aborted) {
@@ -125,7 +201,7 @@ function bs(
 		}
 		const child = spawn(BABYSIT_BIN, args, {
 			cwd: opts.cwd,
-			env: { ...process.env, BABYSIT_DIR: ROOT },
+			env: { ...process.env, ...opts.env, BABYSIT_DIR: ROOT },
 		});
 		let stdout = "";
 		let stderr = "";
@@ -295,6 +371,8 @@ interface Meta {
 	task?: string;
 	promptOffset?: number;
 	model?: string;
+	depth?: number;
+	maxDepth?: number;
 }
 
 const metaDir = () => path.join(ROOT, "meta");
@@ -1003,6 +1081,8 @@ interface SubagentOpts {
 	model?: string;
 	tools?: string[];
 	cwd: string;
+	depth: number;
+	maxDepth: number;
 	// Idle-timeout is OFF by default: an RPC-mode pi is silent while it works,
 	// so idle detection would false-kill a busy subagent. The absolute timeout
 	// is the safety valve instead.
@@ -1050,7 +1130,13 @@ async function spawnSubagent(
 	}
 	bsArgs.push("--", PI_BIN, ...piArgs);
 
-	const r = await bs(bsArgs, { cwd: opts.cwd });
+	const r = await bs(bsArgs, {
+		cwd: opts.cwd,
+		env: {
+			[SUBAGENT_DEPTH_ENV]: String(opts.depth),
+			[SUBAGENT_MAX_DEPTH_ENV]: String(opts.maxDepth),
+		},
+	});
 	if (r.code !== 0) {
 		return { error: r.stderr || r.stdout || `babysit run failed (exit ${r.code}, no output) — check that \`${BABYSIT_BIN}\` works and ${ROOT} is writable` };
 	}
@@ -1065,7 +1151,13 @@ async function spawnSubagent(
 	// below fails and we kill the session, the exit poller does NOT mistake it
 	// for an un-notified process and fire a spurious process-end notification.
 	// The success path overwrites this with the full task meta.
-	writeMeta(id, { kind: "subagent", task: opts.task, notified: true });
+	writeMeta(id, {
+		kind: "subagent",
+		task: opts.task,
+		notified: true,
+		depth: opts.depth,
+		maxDepth: opts.maxDepth,
+	});
 
 	// Wait for pi to boot (first JSON event in the log), then inject the task.
 	await bs(["expect", "-s", id, "--timeout", "30s", '\\{"type"']);
@@ -1107,6 +1199,8 @@ async function spawnSubagent(
 		task: opts.task,
 		promptOffset: sent.offset,
 		model: resolvedModel,
+		depth: opts.depth,
+		maxDepth: opts.maxDepth,
 		startedAt: Date.now(),
 	});
 	return { id, model: resolvedModel };
@@ -1726,7 +1820,8 @@ export default function (pi: ExtensionAPI) {
 			"`retryOnWorkerDeath` can retry one idempotent command once. " +
 			"(2) `profile: \"subagent\"` + `task` — spawn a pi subagent that works on the task in the " +
 			"background; poll with babysit_check, steer with babysit_send, block with babysit_wait, " +
-			"stop with babysit_kill.",
+			"stop with babysit_kill. Subagents cannot recursively spawn more subagents by default; " +
+			"the top-level caller must explicitly raise `maxDepth` when creating the first worker.",
 		promptSnippet:
 			"Run any shell command with context-safe captured output; quick commands return metadata, longer ones continue in background",
 		promptGuidelines: [
@@ -1736,6 +1831,7 @@ export default function (pi: ExtensionAPI) {
 			"If a babysit worker is killed externally, babysit_run reports it as worker-dead rather than hanging. Set retryOnWorkerDeath: true only for safe, idempotent commands; it retries at most once and may otherwise duplicate side effects.",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
 			"Delegate self-contained tasks (codebase recon, a parallelizable subtask, work that would pollute your context) with babysit_run { profile: \"subagent\", task }. Launch several for independent subtasks; they run concurrently.",
+			"Subagents cannot create further subagents by default (maximum depth 1). Only the top-level caller can explicitly opt in by setting maxDepth when it creates the first worker; nested workers inherit that limit and cannot raise it.",
 			"After spawning subagents, do not idle-wait and do not end your turn to wait for them: keep making progress, then call babysit_wait (ids + mode any/all) when you need their results. Steer or send follow-up tasks with babysit_send; kill runaways with babysit_kill.",
 		],
 		parameters: Type.Object({
@@ -1763,6 +1859,13 @@ export default function (pi: ExtensionAPI) {
 			model: Type.Optional(Type.String({ description: "Model override for the subagent, e.g. 'sonnet'." })),
 			tools: Type.Optional(
 				Type.Array(Type.String(), { description: "Tool allowlist for the subagent." }),
+			),
+			maxDepth: Type.Optional(
+				Type.Integer({
+					minimum: 1,
+					description:
+						"Maximum subagent nesting depth. Top-level subagent mode only; default 1 prevents workers from spawning workers. Nested workers inherit this limit and cannot override it.",
+				}),
 			),
 			agentScope: Type.Optional(
 				StringEnum(["user", "project", "both"] as const, {
@@ -1821,6 +1924,19 @@ export default function (pi: ExtensionAPI) {
 			if (params.command && isSubagent) {
 				return {
 					content: [{ type: "text", text: "`command` and profile 'subagent' are mutually exclusive." }],
+					isError: true,
+					details: {},
+				};
+			}
+
+			// Compute nesting only for subagent mode. Ordinary command processes remain
+			// available even when the hosting agent is at its subagent depth limit.
+			const nesting = isSubagent
+				? planSubagentSpawn(params.maxDepth)
+				: undefined;
+			if (nesting && !nesting.allowed) {
+				return {
+					content: [{ type: "text", text: nesting.error }],
 					isError: true,
 					details: {},
 				};
@@ -1966,12 +2082,16 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// The branch above guarantees a successful plan in subagent mode.
+			const subagentNesting = nesting as Extract<SubagentSpawnPlan, { allowed: true }>;
 			const res = await spawnSubagent({
 				agent,
 				task: params.task as string,
 				model: params.model,
 				tools: params.tools,
 				cwd: ctx.cwd,
+				depth: subagentNesting.childDepth,
+				maxDepth: subagentNesting.maxDepth,
 				timeout: params.timeout ?? "15m",
 				idleTimeout: params.idleTimeout,
 			});
@@ -1990,7 +2110,7 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text:
-							`Subagent started (id: ${res.id})${agent ? ` [agent: ${agent.name}]` : ""}${res.model ? ` [model: ${res.model}]` : ""}.\n` +
+							`Subagent started (id: ${res.id})${agent ? ` [agent: ${agent.name}]` : ""}${res.model ? ` [model: ${res.model}]` : ""} [depth: ${subagentNesting.childDepth}/${subagentNesting.maxDepth}].\n` +
 							`Task accepted — running in the background; keep working (do NOT end your turn just to wait for it).\n` +
 							`Poll:  babysit_check { id: "${res.id}" }\n` +
 							`Wait:  babysit_wait  { id: "${res.id}" }\n` +
@@ -2003,6 +2123,8 @@ export default function (pi: ExtensionAPI) {
 					agent: agent?.name,
 					model: res.model,
 					task: params.task,
+					depth: subagentNesting.childDepth,
+					maxDepth: subagentNesting.maxDepth,
 					status: "started" satisfies DisplayStatus,
 				},
 			};
@@ -2094,9 +2216,13 @@ export default function (pi: ExtensionAPI) {
 					const kind = meta?.kind ?? "process";
 					const flag = s.note ? ` ⚑ ${s.note}` : "";
 					const ec = s.exit_code != null ? ` exit=${s.exit_code}` : "";
+					const depth =
+						kind === "subagent" && meta?.depth != null
+							? ` depth=${meta.depth}/${meta.maxDepth ?? "?"}`
+							: "";
 					const what = (kind === "subagent" ? meta?.task : meta?.command) ?? "";
 					const preview = what.length > 60 ? `${what.slice(0, 57)}…` : what;
-					return `${s.id}  [${kind}] ${s.state}${ec}${flag}${preview ? `  — ${preview}` : ""}`;
+					return `${s.id}  [${kind}] ${s.state}${ec}${depth}${flag}${preview ? `  — ${preview}` : ""}`;
 				});
 				return { content: [{ type: "text", text: lines.join("\n") }], details: { sessions } };
 			}
@@ -2182,6 +2308,7 @@ export default function (pi: ExtensionAPI) {
 
 			const parts: string[] = [];
 			let header = `[subagent] state=${st.state}`;
+			if (meta.depth != null) header += ` depth=${meta.depth}/${meta.maxDepth ?? "?"}`;
 			if (st.state === "running") {
 				const el = elapsedOf(params.id);
 				if (el) header += ` elapsed=${el}`;
@@ -2362,6 +2489,8 @@ export default function (pi: ExtensionAPI) {
 					task: params.text,
 					promptOffset: sent.offset,
 					model: meta?.model,
+					depth: meta?.depth,
+					maxDepth: meta?.maxDepth,
 				});
 			}
 			return {
