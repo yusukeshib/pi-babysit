@@ -95,6 +95,14 @@ Tail and search results are capped at 200 lines and clipped to 8 KB. Pattern
 search returns the latest matching lines with line numbers. Do not read a
 potentially large log file in full.
 
+Subagent logs also compact Pi's streaming `message_update` events before they
+are recorded. Pi repeats the complete growing assistant message and partial
+snapshot on every token; pi-babysit retains only the incremental delta while
+leaving authoritative `message_end`, tool, lifecycle, response, and error
+events untouched. This keeps long RPC sessions approximately linear in emitted
+content without changing final answers, completion detection, or follow-up
+behavior. Live `/babysit` and attach views render the retained deltas.
+
 All shell commands, including `pwd` and Git, are redirected to `babysit_run`.
 Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 

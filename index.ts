@@ -130,10 +130,10 @@ export function planSubagentSpawn(
 // apart from any other turn end (see isParkedToolResult / self-reap.ts).
 export const NOTIFY_MARKER = "[notify-on-exit]";
 
-// Human-readable view for the subagent JSONL stream when a human attaches.
-// babysit records the raw JSON to its log (parsers unaffected) and pipes only
-// the live attach view through this formatter. Set PI_BABYSIT_VIEW_CMD="" to
-// disable (raw JSON), or to a custom command to override.
+// Human-readable view for the compact subagent JSONL stream when a human
+// attaches. The RPC proxy removes cumulative streaming snapshots before both
+// recording and display; authoritative events remain intact for parsers. Set
+// PI_BABYSIT_VIEW_CMD="" to disable formatting, or provide a custom command.
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const VIEW_CMD =
@@ -871,7 +871,7 @@ interface ToolCall {
 	name: string;
 	summary: string;
 }
-interface Progress {
+export interface Progress {
 	turns: number;
 	toolCalls: ToolCall[];
 	finalText: string;
@@ -914,7 +914,7 @@ function summarizeToolCall(name: string, args: Record<string, unknown>): string 
 	}
 }
 
-function parseEvents(logText: string): Progress {
+export function parseEvents(logText: string): Progress {
 	const p: Progress = {
 		turns: 0,
 		toolCalls: [],
@@ -1122,13 +1122,21 @@ async function spawnSubagent(
 		"--timeout",
 		opts.timeout,
 	];
-	// Pretty-print the JSONL stream for humans who `attach`; the recorded log
-	// stays raw so parseEvents/`babysit log` are unaffected.
+	// Pretty-print the compact JSONL stream for humans who `attach`. The RPC
+	// proxy removes only cumulative streaming snapshots; authoritative final,
+	// tool, lifecycle, response, and error events remain intact for parseEvents.
 	if (VIEW_CMD.trim()) bsArgs.push("--view-cmd", VIEW_CMD);
 	if (opts.idleTimeout && opts.idleTimeout !== "none") {
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
 	}
-	bsArgs.push("--", PI_BIN, ...piArgs);
+	bsArgs.push(
+		"--",
+		process.execPath,
+		path.join(EXT_DIR, "rpc-stream-proxy.mjs"),
+		"--",
+		PI_BIN,
+		...piArgs,
+	);
 
 	const r = await bs(bsArgs, {
 		cwd: opts.cwd,
