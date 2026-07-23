@@ -32,7 +32,7 @@ reachable from anywhere (`~/.pi-babysit/<pi-session-id>/`). Two kinds:
 
 | kind | started by | completion | on completion |
 | ---- | ---------- | ---------- | ------------- |
-| **process** | `babysit_run { command }` | process **exit** | automatic notification message (`triggerTurn`) — the agent may end its turn after starting and is resumed on exit, same contract as the old `process` tool |
+| **process** | `babysit_run { command }` | process **exit** | automatic notification message (`triggerTurn`), batched for all exits observed in the same poll — the agent may end its turn after starting and is resumed on exit, same contract as the old `process` tool |
 | **subagent** | `babysit_run { profile: "subagent", task }` | `agent_end` in the RPC event stream (process stays alive) | none — the agent polls `babysit_check` or blocks on `babysit_wait`; the idle session accepts follow-up tasks |
 
 The **profile is a tool parameter, not a separate tool set**: domain knowledge
@@ -72,9 +72,12 @@ A minimal widget above the editor shows live counts
 `babysit_run`, `babysit_wait`, and automatic completion notifications always
 return lifecycle metadata and the absolute path to the complete `output.log`.
 Explicit run/wait results inline complete output up to 8 KB; unsolicited
-completion notifications use a stricter 2 KB cap. Larger output stays out of
-model context. Inspect it through the session id without creating another shell
-session:
+completion notifications use a stricter 2 KB per-process output cap and an 8 KB
+aggregate message cap. Process exits observed in one poll share one message and
+trigger one agent turn. If even the compact summaries and log paths exceed the
+aggregate cap, the largest fitting prefix is delivered and the remainder stays
+pending for the next poll. Larger output stays out of model context. Inspect it
+through the session id without creating another shell session:
 
 ```text
 babysit_check { id: "cargo-test", lines: 50 }
@@ -100,9 +103,10 @@ because blindly rerunning an arbitrary command can duplicate side effects.
 ## How completion detection works
 
 - **Process**: a 2.5s poller watches for running→exited transitions and injects
-  one `pi.sendMessage(…, { triggerTurn: true, deliverAs: "steer" })` per ended
-  session (deduped via `meta/<id>.json`). `babysit_kill` and an exit already
-  reported by `babysit_wait` suppress the notification.
+  one `pi.sendMessage(…, { triggerTurn: true, deliverAs: "steer" })` containing
+  every deliverable exit observed in that poll (deduped via `meta/<id>.json`).
+  `babysit_kill` and an exit already reported by `babysit_wait` suppress the
+  notification.
 - **Subagent**: `babysit_wait` blocks on `babysit expect '"type":"agent_end"'`.
   An `agent_end` whose last message is a **parked** toolResult — a
   `babysit_run { command }` result carrying the `[notify-on-exit]` marker (or
@@ -126,8 +130,9 @@ rule, so a subagent waiting on a long build is never false-killed.
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
 | `PI_BABYSIT_TAIL_MAX_BYTES` | `8000` | cap for explicit log tails/screens returned by `babysit_check` |
 | `PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES` | `8000` | cap for complete output in explicitly requested run/wait results |
-| `PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES` | `2000` | smaller cap for unsolicited process-completion notifications (`0` omits all output) |
-| `PI_BABYSIT_NOTIFY_COMMAND_MAX_BYTES` | `240` | cap for the command preview in completion notifications |
+| `PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES` | `2000` | per-process output cap for unsolicited completion notifications (`0` omits all output) |
+| `PI_BABYSIT_NOTIFY_COMMAND_MAX_BYTES` | `240` | cap for each command preview in completion notifications |
+| `PI_BABYSIT_NOTIFY_BATCH_MAX_BYTES` | `8000` | hard cap for one aggregated completion notification |
 | `PI_BABYSIT_ALLOW_BASH` | unset | set to `1` to bypass direct-Bash redirection (emergency escape hatch) |
 
 Requires `babysit` 0.13.0 or newer and `pi` on `PATH`. The extension does **not**
