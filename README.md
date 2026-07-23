@@ -40,6 +40,13 @@ The **profile is a tool parameter, not a separate tool set**: domain knowledge
 message delivery, spawn validation) lives in code, while the LLM sees one small
 generic surface.
 
+Subagent recursion is **disabled by default**: a top-level pi may create workers
+(depth 1), but those workers cannot create more workers. A top-level caller can
+explicitly opt in for a specific tree with `maxDepth: 2` (or higher) when it
+creates the first worker. Descendants inherit that ceiling and cannot raise it.
+Normal `babysit_run { command }` process execution remains available at every
+depth.
+
 Because sessions are real PTYs, the agent can also **drive interactive
 programs** (installers, wizards, REPLs): type with `babysit_send`
 (text or named keys) and read the rendered screen with
@@ -49,7 +56,7 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`) or start a subagent (`profile: "subagent"`, `task`, optional `agent`/`model`/`tools`). Quick commands return inline; longer ones continue in the background |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`) or start a subagent (`profile: "subagent"`, `task`, optional `agent`/`model`/`tools`/`maxDepth`). `maxDepth` defaults to 1 and can only be set by the top-level caller. Quick commands return inline; longer ones continue in the background |
 | `babysit_check` | List all sessions, inspect one, tail its bounded recent output, or search its raw log with `pattern`; `screen: true` captures TUIs and subagents otherwise show structured live progress |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when idle (`mode: auto/steer/task`) |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: `ids` + `mode: "any"\|"all"` |
