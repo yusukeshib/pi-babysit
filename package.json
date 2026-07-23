@@ -23,6 +23,7 @@
     "agents.ts",
     "self-reap.ts",
     "format-stream.mjs",
+    "rpc-stream-proxy.mjs",
     "search-log.mjs",
     "README.md",
     "LICENSE"

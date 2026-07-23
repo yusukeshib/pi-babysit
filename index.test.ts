@@ -3,6 +3,7 @@ import { readFileSync, rmSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { compactRpcLine } from "./rpc-stream-proxy.mjs";
 import extension, {
 	buildProcessCompletionMessage,
 	canRestoreNotificationAfterWait,
@@ -10,6 +11,7 @@ import extension, {
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
 	isSupportedBabysitVersion,
+	parseEvents,
 	planSubagentSpawn,
 	type ProcessCompletionNotice,
 	shouldDeliverProcessCompletion,
@@ -115,6 +117,197 @@ test("babysit version policy requires 0.13.0 or newer", () => {
 	expect(isSupportedBabysitVersion("babysit 0.14.0-beta.1")).toBe(true);
 	expect(isSupportedBabysitVersion("babysit 1.0.0")).toBe(true);
 	expect(isSupportedBabysitVersion("unknown")).toBe(false);
+});
+
+test("RPC stream compaction removes only cumulative message_update snapshots", () => {
+	const update = {
+		type: "message_update",
+		message: { role: "assistant", content: [{ type: "text", text: "growing answer" }] },
+		assistantMessageEvent: {
+			type: "text_delta",
+			contentIndex: 0,
+			delta: "answer",
+			partial: { type: "text", text: "growing answer" },
+		},
+		futureField: "preserved",
+	};
+	const compact = JSON.parse(compactRpcLine(JSON.stringify(update)));
+	expect(compact).toEqual({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "answer" },
+		futureField: "preserved",
+	});
+
+	const finalLine = '{"type":"message_end","message":{"role":"assistant"}}';
+	expect(compactRpcLine(finalLine)).toBe(finalLine);
+	expect(compactRpcLine("non-json diagnostic")).toBe("non-json diagnostic");
+});
+
+test("RPC stream compaction preserves parseEvents final state", () => {
+	const assistant = {
+		role: "assistant",
+		content: [{ type: "text", text: "final answer" }],
+		usage: { totalTokens: 1234, cost: { total: 0.25 } },
+	};
+	const events = [
+		{ type: "agent_start" },
+		{ type: "turn_start" },
+		{ type: "message_start", message: { role: "assistant", content: [] } },
+		{
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "final " }] },
+			assistantMessageEvent: { type: "text_delta", delta: "final ", partial: { text: "final " } },
+		},
+		{
+			type: "message_update",
+			message: assistant,
+			assistantMessageEvent: { type: "text_delta", delta: "answer", partial: assistant },
+		},
+		{ type: "tool_execution_start", toolName: "read", args: { path: "README.md" } },
+		{ type: "tool_execution_end", toolName: "read", isError: false, result: { content: [] } },
+		{ type: "message_end", message: assistant },
+		{ type: "agent_end", messages: [assistant] },
+	];
+	const raw = events.map((event) => JSON.stringify(event)).join("\n");
+	const compact = raw.split("\n").map(compactRpcLine).join("\n");
+	expect(parseEvents(compact)).toEqual(parseEvents(raw));
+	expect(parseEvents(compact)).toMatchObject({
+		done: true,
+		finalText: "final answer",
+		turns: 1,
+		tokens: 1234,
+		cost: 0.25,
+	});
+});
+
+test("RPC stream compaction preserves parked, resumed, and failed RPC state", () => {
+	const parkedEnd = {
+		type: "agent_end",
+		messages: [
+			{
+				role: "toolResult",
+				toolName: "babysit_run",
+				content: [{ type: "text", text: `Process started ${"[notify-on-exit]"}` }],
+			},
+		],
+	};
+	const parkedEvents = [
+		{ type: "agent_start" },
+		{
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "waiting" }] },
+			assistantMessageEvent: { type: "text_delta", delta: "waiting", partial: { text: "waiting" } },
+		},
+		parkedEnd,
+	];
+	const compare = (events: unknown[]) => {
+		const raw = events.map((event) => JSON.stringify(event)).join("\n");
+		const compact = raw.split("\n").map(compactRpcLine).join("\n");
+		expect(parseEvents(compact)).toEqual(parseEvents(raw));
+		return parseEvents(compact);
+	};
+
+	expect(compare(parkedEvents)).toMatchObject({ done: false, waitingOnProcess: true });
+	expect(
+		compare([
+			...parkedEvents,
+			{ type: "agent_start" },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "finished" }] } },
+			{ type: "agent_end", messages: [{ role: "assistant" }] },
+		]),
+	).toMatchObject({ done: true, waitingOnProcess: false, finalText: "finished", agentStarts: 2, agentEnds: 2 });
+	expect(compare([{ type: "response", command: "prompt", success: false, error: "rejected" }])).toMatchObject({
+		done: false,
+		errorMsg: "rejected",
+	});
+});
+
+test("RPC stream compaction makes cumulative updates approximately linear", () => {
+	const lines = Array.from({ length: 200 }, (_, index) =>
+		JSON.stringify({
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "x".repeat((index + 1) * 100) }] },
+			assistantMessageEvent: {
+				type: "text_delta",
+				delta: "x".repeat(100),
+				partial: { type: "text", text: "x".repeat((index + 1) * 100) },
+			},
+		}),
+	);
+	const rawBytes = Buffer.byteLength(lines.join("\n"));
+	const compactBytes = Buffer.byteLength(lines.map(compactRpcLine).join("\n"));
+	expect(compactBytes).toBeLessThan(rawBytes / 20);
+});
+
+test("RPC stream proxy forwards multiple and unterminated records", () => {
+	const update = JSON.stringify({
+		type: "message_update",
+		message: { role: "assistant", content: [{ type: "text", text: "héllo" }] },
+		assistantMessageEvent: { type: "text_delta", delta: "héllo", partial: { text: "héllo" } },
+	});
+	const final = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [] } });
+	const result = spawnSync(
+		process.execPath,
+		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", "process.stdin.pipe(process.stdout)"],
+		{ input: `${update}\n${final}`, encoding: "utf8" },
+	);
+	expect(result.status).toBe(0);
+	const lines = result.stdout.trim().split("\n");
+	expect(JSON.parse(lines[0]!)).toEqual({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: "héllo" },
+	});
+	expect(lines[1]).toBe(final);
+});
+
+test("RPC stream proxy preserves an early child's exit status during EPIPE", () => {
+	const result = spawnSync(
+		process.execPath,
+		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", "process.exit(7)"],
+		{ input: "x".repeat(2_000_000), encoding: "utf8" },
+	);
+	expect(result.status).toBe(7);
+	expect(result.stderr).not.toContain("EPIPE");
+});
+
+test("RPC stream proxy flushes final output before mirroring a child signal", () => {
+	const payload = JSON.stringify({ type: "message_end", data: "x".repeat(200_000) });
+	const childScript = [
+		`const payload = ${JSON.stringify(payload)};`,
+		"process.stdout.write(payload, () => process.kill(process.pid, 'SIGTERM'));",
+	].join("\n");
+	const result = spawnSync(
+		process.execPath,
+		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", childScript],
+		{ encoding: "utf8", maxBuffer: 1_000_000 },
+	);
+	expect(result.signal).toBe("SIGTERM");
+	expect(result.stdout).toBe(payload);
+});
+
+test("compact RPC deltas remain visible without duplicate final text", () => {
+	const events = [
+		{ type: "turn_start" },
+		{ type: "message_start", message: { role: "assistant", content: [] } },
+		{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hello " } },
+		{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "world" } },
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "hello world" }],
+				usage: { totalTokens: 42, cost: { total: 0.01 } },
+			},
+		},
+	];
+	const result = spawnSync(process.execPath, [path.join(process.cwd(), "format-stream.mjs")], {
+		input: `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+		encoding: "utf8",
+	});
+	const plain = result.stdout.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
+	expect(result.status).toBe(0);
+	expect(plain.match(/hello world/g)).toHaveLength(1);
+	expect(plain).toContain("[usage] 42 tok · $0.0100");
 });
 
 test("subagent nesting defaults to one level and requires top-level opt-in", () => {

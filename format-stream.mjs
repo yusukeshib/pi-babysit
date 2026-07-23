@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 /**
- * format-stream.mjs — human-readable view for a `pi --mode json` event stream.
+ * format-stream.mjs — human-readable view for a `pi --mode rpc` event stream.
  *
- * babysit records the raw JSONL to its log (machine scrapers + `babysit log`
- * stay untouched); this filter only sits on the interactive attach path via
- * `babysit run --view-cmd`. It reads the JSONL on stdin and prints a colored,
- * incrementally-streamed transcript on stdout so a human attaching the tmux
- * pane sees turns, thinking, tool calls and answers instead of a JSON firehose.
+ * This filter sits on the interactive attach path via `babysit run --view-cmd`.
+ * It accepts both Pi's raw cumulative updates and pi-babysit's compact deltas,
+ * then prints a colored, incrementally streamed transcript so a human sees
+ * turns, thinking, tool calls and answers instead of a JSON firehose.
  */
 import * as readline from "node:readline";
 
@@ -52,8 +51,8 @@ function summarizeTool(name, a = {}) {
 }
 
 // Join the text of a given block kind ("text" or "thinking") in a message's
-// content array. message_update re-emits the whole (growing) message, so we
-// compare lengths against what we've already printed to append only the delta.
+// content array. Unfiltered RPC streams repeat the whole growing message;
+// pi-babysit's compact stream instead retains only assistantMessageEvent.delta.
 function blockText(content, kind) {
 	if (!Array.isArray(content)) return "";
 	let s = "";
@@ -75,15 +74,20 @@ const openBlock = () => {
 	out("\n");
 };
 
-function streamMessage(msg, fresh = false) {
-	if (!msg || msg.role !== "assistant") return;
-	const id = msg.id ?? `t${turn}`;
+function messageState(id = `t${turn}`, fresh = false) {
 	if (fresh) emitted.delete(id);
 	let st = emitted.get(id);
 	if (!st) {
 		st = { think: 0, text: 0, hThink: false, hText: false };
 		emitted.set(id, st);
 	}
+	return st;
+}
+
+function streamMessage(msg, fresh = false) {
+	if (!msg || msg.role !== "assistant") return;
+	const id = msg.id ?? `t${turn}`;
+	const st = messageState(id, fresh);
 	const think = blockText(msg.content, "thinking");
 	if (think.length > st.think) {
 		if (!st.hThink) {
@@ -103,6 +107,28 @@ function streamMessage(msg, fresh = false) {
 		}
 		out(text.slice(st.text));
 		st.text = text.length;
+	}
+}
+
+function streamDelta(event) {
+	if (!event || typeof event.delta !== "string" || !event.delta) return;
+	const st = messageState();
+	if (event.type === "thinking_delta") {
+		if (!st.hThink) {
+			openBlock();
+			out(`${C.gray}[think] `);
+			st.hThink = true;
+		}
+		out(C.gray + event.delta + C.reset);
+		st.think += event.delta.length;
+	} else if (event.type === "text_delta") {
+		if (!st.hText) {
+			openBlock();
+			out(`${C.green}[text]${C.reset} `);
+			st.hText = true;
+		}
+		out(event.delta);
+		st.text += event.delta.length;
 	}
 }
 
@@ -138,7 +164,8 @@ rl.on("line", (line) => {
 			streamMessage(ev.message, true);
 			break;
 		case "message_update":
-			streamMessage(ev.message);
+			if (ev.message) streamMessage(ev.message);
+			else streamDelta(ev.assistantMessageEvent);
 			break;
 		case "message_end":
 			streamMessage(ev.message);
