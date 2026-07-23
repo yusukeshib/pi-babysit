@@ -317,6 +317,16 @@ function readMeta(id: string): Meta | null {
 	}
 }
 
+export function shouldDeliverProcessCompletion(
+	meta: {
+		kind: "process" | "subagent";
+		notified?: boolean;
+		notificationPaused?: boolean;
+	} | null,
+): meta is { kind: "process"; notified?: boolean; notificationPaused?: boolean } {
+	return meta?.kind === "process" && !meta.notified && !meta.notificationPaused;
+}
+
 const kindOf = (id: string): "process" | "subagent" => readMeta(id)?.kind ?? "process";
 
 // Compact elapsed formatting: "42s", "3m12s", "1h04m".
@@ -437,6 +447,7 @@ const TAIL_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_TAIL_MAX_BYTES", 8_000);
 const INLINE_OUTPUT_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES", 8_000);
 const NOTIFY_OUTPUT_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES", 2_000);
 const NOTIFY_COMMAND_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_COMMAND_MAX_BYTES", 240);
+const NOTIFY_BATCH_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_BATCH_MAX_BYTES", 8_000);
 const ANSWER_MAX_BYTES = 24_000; // subagent answers / error messages
 
 function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
@@ -560,6 +571,193 @@ export function summarizeNotificationCommand(command: string | undefined): strin
 	return `${prefix}…`;
 }
 
+type CompletionStatus = "success" | "failed" | "terminated";
+
+export interface ProcessCompletionNotice {
+	id: string;
+	exitCode: number | null | undefined;
+	success: boolean;
+	status: CompletionStatus;
+	runtime: string;
+	summary: string;
+	command: string | undefined;
+	logPath: string;
+	output: string;
+}
+
+interface ProcessCompletionMessage {
+	customType: "pi-babysit-process-end";
+	content: string;
+	display: true;
+	details: {
+		id?: string;
+		exitCode?: number | null;
+		success: boolean;
+		status: CompletionStatus;
+		runtime?: string;
+		logPath?: string;
+		count: number;
+		totalCount: number;
+		remainingCount: number;
+		processes: Array<{
+			id: string;
+			exitCode: number | null | undefined;
+			success: boolean;
+			status: CompletionStatus;
+			runtime: string;
+			logPath: string;
+		}>;
+	};
+}
+
+const COMPLETION_FOOTER =
+	"Automatic completion notification. Inspect the bounded log with babysit_check only if needed.";
+const AGGREGATE_OUTPUT_OMISSION = "\nOutput omitted from aggregate notification; inspect log.";
+
+function truncateUtf8End(value: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	const bytes = Buffer.from(value, "utf8");
+	if (bytes.length <= maxBytes) return value;
+	const suffix = Buffer.from("…", "utf8");
+	if (maxBytes <= suffix.length) return ".".repeat(maxBytes);
+	const prefix = bytes
+		.subarray(0, maxBytes - suffix.length)
+		.toString("utf8")
+		.replace(/\uFFFD+$/, "");
+	return `${prefix}…`;
+}
+
+/** Build one bounded message for as many deliverable completions as fit. */
+export function buildProcessCompletionMessage(
+	notices: ProcessCompletionNotice[],
+	maxBytes = NOTIFY_BATCH_MAX_BYTES,
+): ProcessCompletionMessage {
+	if (notices.length === 0) throw new Error("At least one completion notice is required.");
+
+	const totalCount = notices.length;
+	const footer = `\n\n${COMPLETION_FOOTER}`;
+	const header = (count: number) =>
+		totalCount === 1
+			? ""
+			: count === totalCount
+				? `${count} processes completed:\n\n`
+				: `${count} of ${totalCount} processes completed:\n\n`;
+	const deferred = (count: number) =>
+		count < totalCount
+			? `\n\n${totalCount - count} completion${totalCount - count === 1 ? "" : "s"} deferred to the next poll.`
+			: "";
+	const renderCompact = (batch: ProcessCompletionNotice[]) =>
+		header(batch.length) +
+		batch.map((notice) => `${notice.summary}\nLog: ${notice.logPath}`).join("\n\n") +
+		deferred(batch.length) +
+		footer;
+
+	// If every summary and log path cannot fit, notify the largest fitting prefix
+	// and leave the rest unacknowledged for a later poll. Always make progress for
+	// pathological single ids/paths by delivering one UTF-8-truncated entry.
+	let batch = notices;
+	if (Buffer.byteLength(renderCompact(batch), "utf8") > maxBytes) {
+		let low = 1;
+		let high = notices.length - 1;
+		let fittedCount = 0;
+		while (low <= high) {
+			const mid = Math.floor((low + high) / 2);
+			if (Buffer.byteLength(renderCompact(notices.slice(0, mid)), "utf8") <= maxBytes) {
+				fittedCount = mid;
+				low = mid + 1;
+			} else {
+				high = mid - 1;
+			}
+		}
+		batch = fittedCount > 0 ? notices.slice(0, fittedCount) : [notices[0]];
+	}
+
+	const blockBase = (notice: ProcessCompletionNotice) =>
+		`${notice.summary}\nCommand: ${summarizeNotificationCommand(notice.command)}\nLog: ${notice.logPath}`;
+	const outputs = batch.map((notice) =>
+		notice.output.startsWith("\n\nOutput:") ? AGGREGATE_OUTPUT_OMISSION : notice.output,
+	);
+	const renderDetailed = () =>
+		header(batch.length) +
+		batch.map((notice, i) => blockBase(notice) + outputs[i]).join("\n\n") +
+		deferred(batch.length) +
+		footer;
+
+	let content = renderDetailed();
+	let contentBytes = Buffer.byteLength(content, "utf8");
+	if (contentBytes <= maxBytes) {
+		// Spend the remaining aggregate budget on complete inline outputs without
+		// repeatedly rebuilding the entire batch for every candidate.
+		for (let i = 0; i < batch.length; i++) {
+			if (!batch[i].output.startsWith("\n\nOutput:")) continue;
+			const delta =
+				Buffer.byteLength(batch[i].output, "utf8") - Buffer.byteLength(outputs[i], "utf8");
+			if (contentBytes + delta > maxBytes) continue;
+			outputs[i] = batch[i].output;
+			contentBytes += delta;
+		}
+		content = renderDetailed();
+	} else {
+		content = truncateUtf8End(renderCompact(batch), maxBytes);
+	}
+
+	const statuses = new Set(batch.map((notice) => notice.status));
+	const status: CompletionStatus = statuses.has("failed")
+		? "failed"
+		: statuses.has("terminated")
+			? "terminated"
+			: "success";
+	const processes = batch.map((notice) => ({
+		id: notice.id,
+		exitCode: notice.exitCode,
+		success: notice.success,
+		status: notice.status,
+		runtime: notice.runtime,
+		logPath: notice.logPath,
+	}));
+	const single = totalCount === 1 ? batch[0] : undefined;
+	return {
+		customType: "pi-babysit-process-end",
+		content,
+		display: true,
+		details: {
+			id: single?.id,
+			exitCode: single?.exitCode,
+			success: batch.every((notice) => notice.success),
+			status,
+			runtime: single?.runtime,
+			logPath: single?.logPath,
+			count: batch.length,
+			totalCount,
+			remainingCount: totalCount - batch.length,
+			processes,
+		},
+	};
+}
+
+/** Send once and only acknowledge notices represented in the accepted batch. */
+export function deliverProcessCompletionMessage(
+	notices: ProcessCompletionNotice[],
+	send: (
+		message: ProcessCompletionMessage,
+		options: { triggerTurn: true; deliverAs: "steer" },
+	) => void,
+	onSent: (notice: ProcessCompletionNotice) => void,
+): boolean {
+	if (notices.length === 0) return false;
+	let message: ProcessCompletionMessage;
+	try {
+		message = buildProcessCompletionMessage(notices);
+		send(message, { triggerTurn: true, deliverAs: "steer" });
+	} catch {
+		return false;
+	}
+	const deliveredIds = new Set(message.details.processes.map(({ id }) => id));
+	for (const notice of notices) {
+		if (deliveredIds.has(notice.id)) onSent(notice);
+	}
+	return true;
+}
 
 // ---------------------------------------------------------------------------
 // parked-turn detection (shared rule with self-reap.ts)
@@ -1289,78 +1487,81 @@ export default function (pi: ExtensionAPI) {
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 	// Exit notifications for kind=process sessions: the poller detects
-	// running→exited transitions and injects ONE message (triggerTurn) so an
-	// agent that ended its turn after babysit_run is resumed automatically —
-	// the old `process` tool contract. Kills via babysit_kill and exits already
-	// reported by babysit_wait are suppressed via meta.notified.
+	// running→exited transitions and injects ONE message (triggerTurn) for all
+	// processes that became deliverable in the same poll. This resumes an agent
+	// that ended its turn after babysit_run without spending one turn per exit.
+	// Kills via babysit_kill and exits already reported by babysit_wait are
+	// suppressed via meta.notified.
 	async function notifyEndedProcesses(): Promise<void> {
 		const { sessions } = await listSessions();
-		for (const s of sessions) {
-			if (s.state === "running") continue;
-			const meta = readMeta(s.id);
-			if (!meta || meta.kind !== "process" || meta.notified || meta.notificationPaused) continue;
+		const ready: Array<{ session: BsSession; meta: Meta }> = [];
+		for (const session of sessions) {
+			if (session.state === "running") continue;
+			const meta = readMeta(session.id);
+			if (!shouldDeliverProcessCompletion(meta)) continue;
 			// Delay delivery by one poll interval. This gives an agent that chose
 			// babysit_wait immediately after babysit_run enough time to claim the
 			// completion and suppress the otherwise duplicate automatic message.
 			if (!meta.completionObservedAt) {
 				meta.completionObservedAt = Date.now();
-				writeMeta(s.id, meta);
+				writeMeta(session.id, meta);
 				continue;
 			}
 			if (Date.now() - meta.completionObservedAt < POLL_MS) continue;
-			const ok = s.exit_code === 0;
-			const status: DisplayStatus = ok
+			ready.push({ session, meta });
+		}
+
+		const prepared: ProcessCompletionNotice[] = [];
+		for (const { session, meta } of ready) {
+			const ok = session.exit_code === 0;
+			const status: CompletionStatus = ok
 				? "success"
-				: s.state === "dead" || s.exit_code == null
+				: session.state === "dead" || session.exit_code == null
 					? "terminated"
 					: "failed";
-			const output = await inlineOutput(s.id, s, NOTIFY_OUTPUT_MAX_BYTES);
+			const output = await inlineOutput(session.id, session, NOTIFY_OUTPUT_MAX_BYTES);
 			const runtime = meta.startedAt
 				? `${Math.round((Date.now() - meta.startedAt) / 1000)}s`
 				: "?";
 			const summary = ok
-				? `Process "${s.id}" completed successfully after ${runtime}.`
-				: s.state === "dead" || s.exit_code == null
-					? `Process "${s.id}" was terminated after ${runtime}.`
-					: `Process "${s.id}" exited with code ${s.exit_code} after ${runtime}.`;
-			// Output loading is asynchronous. A kill/wait can claim completion in
-			// that window, so re-read metadata immediately before delivery.
-			const current = readMeta(s.id);
-			if (
-				!current ||
-				current.kind !== "process" ||
-				current.notified ||
-				current.notificationPaused
-			) {
-				continue;
-			}
-			try {
-				pi.sendMessage(
-					{
-						customType: "pi-babysit-process-end",
-						content:
-							`${summary}\nCommand: ${summarizeNotificationCommand(current.command)}\nLog: ${logPath(s.id)}${output}` +
-							"\n\nAutomatic completion notification. Inspect the bounded log with babysit_check only if needed.",
-						display: true,
-						details: {
-							id: s.id,
-							exitCode: s.exit_code,
-							success: ok,
-							status,
-							runtime,
-							logPath: logPath(s.id),
-						},
-					},
-					{ triggerTurn: true, deliverAs: "steer" },
-				);
-			} catch {
-				// Leave it pending so the next poll can retry delivery.
-				continue;
-			}
-			current.notified = true;
-			delete current.notificationPaused;
-			writeMeta(s.id, current);
+				? `Process "${session.id}" completed successfully after ${runtime}.`
+				: session.state === "dead" || session.exit_code == null
+					? `Process "${session.id}" was terminated after ${runtime}.`
+					: `Process "${session.id}" exited with code ${session.exit_code} after ${runtime}.`;
+			prepared.push({
+				id: session.id,
+				exitCode: session.exit_code,
+				success: ok,
+				status,
+				runtime,
+				summary,
+				command: meta.command,
+				logPath: logPath(session.id),
+				output,
+			});
 		}
+
+		// Output loading above is asynchronous. Re-read every candidate together
+		// immediately before the single send so a concurrent kill/wait cannot claim
+		// an early candidate while a later candidate's output is being loaded.
+		const metadataById = new Map<string, Meta>();
+		const notices = prepared.flatMap((notice) => {
+			const current = readMeta(notice.id);
+			if (!shouldDeliverProcessCompletion(current)) return [];
+			metadataById.set(notice.id, current);
+			return [{ ...notice, command: current.command }];
+		});
+		deliverProcessCompletionMessage(
+			notices,
+			(message, options) => pi.sendMessage(message, options),
+			(notice) => {
+				const meta = metadataById.get(notice.id);
+				if (!meta) return;
+				meta.notified = true;
+				delete meta.notificationPaused;
+				writeMeta(notice.id, meta);
+			},
+		);
 	}
 
 	const refreshWidget = async (ctx: ExtensionContext) => {

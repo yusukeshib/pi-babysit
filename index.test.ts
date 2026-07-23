@@ -4,10 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import extension, {
+	buildProcessCompletionMessage,
 	canRestoreNotificationAfterWait,
+	deliverProcessCompletionMessage,
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
 	isSupportedBabysitVersion,
+	type ProcessCompletionNotice,
+	shouldDeliverProcessCompletion,
 	shouldInlineCompleteOutput,
 	summarizeNotificationCommand,
 	validateKillResponse,
@@ -145,6 +149,132 @@ test("completion notification payload policies are UTF-8 safe and bounded", () =
 			killNotificationSuppressed: true,
 		}),
 	).toBe(false);
+});
+
+const completionNotice = (
+	id: string,
+	overrides: Partial<ProcessCompletionNotice> = {},
+): ProcessCompletionNotice => ({
+	id,
+	exitCode: 0,
+	success: true,
+	status: "success",
+	runtime: "3s",
+	summary: `Process "${id}" completed successfully after 3s.`,
+	command: `echo ${id}`,
+	logPath: `/tmp/${id}/output.log`,
+	output: `\n\nOutput:\n${id}-output`,
+	...overrides,
+});
+
+test("completion notification eligibility excludes wait, kill, and subagent sessions", () => {
+	expect(shouldDeliverProcessCompletion({ kind: "process" })).toBe(true);
+	expect(shouldDeliverProcessCompletion({ kind: "process", notified: true })).toBe(false);
+	expect(shouldDeliverProcessCompletion({ kind: "process", notificationPaused: true })).toBe(
+		false,
+	);
+	expect(shouldDeliverProcessCompletion({ kind: "subagent" })).toBe(false);
+	expect(shouldDeliverProcessCompletion(null)).toBe(false);
+});
+
+test("a single completion preserves the existing notification shape", () => {
+	const message = buildProcessCompletionMessage([completionNotice("build")]);
+
+	expect(message.content).not.toContain("processes completed:");
+	expect(message.content).toContain("build-output");
+	expect(message.details.id).toBe("build");
+	expect(message.details.runtime).toBe("3s");
+	expect(message.details.logPath).toBe("/tmp/build/output.log");
+});
+
+test("completion notifications aggregate all exits from one poll", () => {
+	const message = buildProcessCompletionMessage([
+		completionNotice("build"),
+		completionNotice("test"),
+	]);
+
+	expect(message.content).toContain("2 processes completed:");
+	expect(message.content).toContain('Process "build" completed successfully');
+	expect(message.content).toContain('Process "test" completed successfully');
+	expect(message.details.count).toBe(2);
+	expect(message.details.processes.map(({ id }) => id)).toEqual(["build", "test"]);
+	expect(message.details.status).toBe("success");
+	expect(message.details.success).toBe(true);
+});
+
+test("completion batches report mixed outcomes and keep every log path when output is omitted", () => {
+	const notices = [
+		completionNotice("build", { output: `\n\nOutput:\n${"界".repeat(500)}` }),
+		completionNotice("test", {
+			exitCode: 1,
+			success: false,
+			status: "failed",
+			summary: 'Process "test" exited with code 1 after 3s.',
+			output: `\n\nOutput:\n${"x".repeat(500)}`,
+		}),
+	];
+	const message = buildProcessCompletionMessage(notices, 700);
+
+	expect(Buffer.byteLength(message.content)).toBeLessThanOrEqual(700);
+	expect(message.content).not.toContain("�");
+	expect(message.content).toContain("/tmp/build/output.log");
+	expect(message.content).toContain("/tmp/test/output.log");
+	expect(message.content).toContain("Output omitted from aggregate notification");
+	expect(message.details.status).toBe("failed");
+	expect(message.details.success).toBe(false);
+});
+
+test("oversized batches defer and leave later completions unacknowledged", () => {
+	const notices = Array.from({ length: 100 }, (_, i) =>
+		completionNotice(`process-${String(i).padStart(3, "0")}`),
+	);
+	const message = buildProcessCompletionMessage(notices);
+
+	expect(Buffer.byteLength(message.content)).toBeLessThanOrEqual(8_000);
+	expect(message.details.count).toBeGreaterThan(0);
+	expect(message.details.count).toBeLessThan(notices.length);
+	expect(message.details.totalCount).toBe(notices.length);
+	expect(message.details.remainingCount).toBe(notices.length - message.details.count);
+	expect(message.content).toContain("deferred to the next poll");
+
+	const acknowledged: string[] = [];
+	const sent = deliverProcessCompletionMessage(
+		notices,
+		() => {},
+		(notice) => acknowledged.push(notice.id),
+	);
+	expect(sent).toBe(true);
+	expect(acknowledged).toEqual(message.details.processes.map(({ id }) => id));
+});
+
+test("completion batch acknowledgement happens only after one successful send", () => {
+	const notices = [completionNotice("build"), completionNotice("test")];
+	const acknowledged: string[] = [];
+	let sends = 0;
+	const failed = deliverProcessCompletionMessage(
+		notices,
+		() => {
+			sends++;
+			throw new Error("pi is temporarily unavailable");
+		},
+		(notice) => acknowledged.push(notice.id),
+	);
+	expect(failed).toBe(false);
+	expect(sends).toBe(1);
+	expect(acknowledged).toEqual([]);
+
+	const retried = deliverProcessCompletionMessage(
+		notices,
+		(message, options) => {
+			sends++;
+			expect(message.details.count).toBe(2);
+			expect(options).toEqual({ triggerTurn: true, deliverAs: "steer" });
+		},
+		(notice) => acknowledged.push(notice.id),
+	);
+	expect(retried).toBe(true);
+	expect(sends).toBe(2);
+	expect(acknowledged).toEqual(["build", "test"]);
 });
 
 test("babysit_kill returns success only after terminal state is persisted", async () => {
