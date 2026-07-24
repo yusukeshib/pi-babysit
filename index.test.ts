@@ -5,8 +5,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { compactRpcLine } from "./rpc-stream-proxy.mjs";
 import extension, {
+	activeToolsWithoutDirectBash,
 	buildProcessCompletionMessage,
 	canRestoreNotificationAfterWait,
+	clip,
 	deliverProcessCompletionMessage,
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
@@ -14,6 +16,7 @@ import extension, {
 	parseEvents,
 	planSubagentSpawn,
 	type ProcessCompletionNotice,
+	shouldDeferCompletionNotification,
 	shouldDeliverProcessCompletion,
 	shouldInlineCompleteOutput,
 	summarizeNotificationCommand,
@@ -23,6 +26,7 @@ import extension, {
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
 const renderers = new Map<string, any>();
+let activeToolNames = ["read", "bash", "babysit_run", "write"];
 
 extension({
 	registerTool(tool: { name: string }) {
@@ -36,15 +40,22 @@ extension({
 	},
 	registerCommand() {},
 	sendMessage() {},
+	getActiveTools() {
+		return [...activeToolNames];
+	},
+	setActiveTools(names: string[]) {
+		activeToolNames = [...names];
+	},
 } as any);
 
 const ctx = { hasUI: false, cwd: process.cwd() };
 let sequence = 0;
 
 async function run(command: string, extras: Record<string, unknown> = {}) {
+	const name = `log-test-${Date.now()}-${sequence++}`;
 	return tools.get("babysit_run").execute(
-		"test",
-		{ name: `log-test-${Date.now()}-${sequence++}`, command, pty: false, ...extras },
+		name,
+		{ name, command, pty: false, ...extras },
 		undefined,
 		undefined,
 		ctx,
@@ -418,6 +429,17 @@ test("kill confirmation validates both backend acknowledgement and terminal stat
 	expect(isConfirmedTerminalState("dead")).toBe(false);
 });
 
+test("clip enforces the complete byte limit at zero, exact, and overflow boundaries", () => {
+	expect(clip("abc", 0)).toBe("");
+	expect(clip("abc", 3)).toBe("abc");
+	expect(Buffer.byteLength(clip("abcd", 3))).toBeLessThanOrEqual(3);
+	expect(clip("x".repeat(8_000), 8_000)).toHaveLength(8_000);
+	const overflow = clip(`始${"x".repeat(8_000)}終`, 8_000);
+	expect(Buffer.byteLength(overflow)).toBeLessThanOrEqual(8_000);
+	expect(overflow).toContain("bytes elided");
+	expect(overflow).not.toContain("�");
+});
+
 test("completion notification payload policies are UTF-8 safe and bounded", () => {
 	expect(summarizeNotificationCommand("printf 'a  b'\n\t&& printf 'c'")).toBe(
 		"printf 'a  b'\\n\\t&& printf 'c'",
@@ -458,6 +480,11 @@ const completionNotice = (
 	logPath: `/tmp/${id}/output.log`,
 	output: `\n\nOutput:\n${id}-output`,
 	...overrides,
+});
+
+test("completion notifications wait until the agent is idle", () => {
+	expect(shouldDeferCompletionNotification(false)).toBe(true);
+	expect(shouldDeferCompletionNotification(true)).toBe(false);
 });
 
 test("completion notification eligibility excludes wait, kill, and subagent sessions", () => {
@@ -627,7 +654,30 @@ test("direct bash policy only supports the explicit escape hatch", () => {
 	else process.env.PI_BABYSIT_ALLOW_BASH = previous;
 });
 
-test("tool hook redirects every shell command to babysit_run", async () => {
+test("built-in bash is removed from the active tool set unless explicitly allowed", async () => {
+	const active = ["read", "bash", "babysit_run", "write"];
+	expect(activeToolsWithoutDirectBash(active, false)).toEqual([
+		"read",
+		"babysit_run",
+		"write",
+	]);
+	expect(activeToolsWithoutDirectBash(active, true)).toEqual(active);
+
+	activeToolNames = [...active];
+	await hooks.get("session_start")(
+		{},
+		{
+			hasUI: false,
+			cwd: process.cwd(),
+			isIdle: () => true,
+			sessionManager: { getSessionId: () => "active-tools-test" },
+		},
+	);
+	expect(activeToolNames).toEqual(["read", "babysit_run", "write"]);
+	await hooks.get("session_shutdown")();
+});
+
+test("tool hook redirects every shell command to babysit_run if bash is re-enabled", async () => {
 	const hook = hooks.get("tool_call");
 	for (const command of ["ls -la", "git diff", "pwd", "tail -n 40 /tmp/build.log"]) {
 		const blocked = await hook({ toolName: "bash", input: { command } });
@@ -695,11 +745,19 @@ test("babysit_check searches a session log with bounded latest matches", async (
 });
 
 
-test("failed commands return small stderr, exit status, and a usable log path", async () => {
+test("failed commands persist their error bit through Pi's tool_result hook", async () => {
 	const result = await run("printf '\\146\\141\\151\\154\\055\\144\\145\\164\\141\\151\\154\\012' >&2; exit 7");
 	const text = result.content[0]?.text ?? "";
+	const patch = await hooks.get("tool_result")({
+		toolCallId: result.details.id,
+		toolName: "babysit_run",
+		content: result.content,
+		details: result.details,
+		isError: false,
+	});
 
 	expect(result.isError).toBe(true);
+	expect(patch).toEqual({ isError: true });
 	expect(text).toContain("exited with code 7");
 	expect(text).toContain("fail-detail");
 	expect(readFileSync(result.details.logPath, "utf8")).toContain("fail-detail");
@@ -750,5 +808,5 @@ test("large output stays out of the run result and remains available through bou
 	const checkedText = checked.content[0]?.text ?? "";
 	expect(checkedText).toContain("LAST-MARKER");
 	expect(checkedText).toContain("bytes elided");
-	expect(Buffer.byteLength(checkedText)).toBeLessThan(10_000);
+	expect(Buffer.byteLength(checkedText)).toBeLessThanOrEqual(8_000);
 });
