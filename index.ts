@@ -1588,7 +1588,11 @@ async function waitForExit(
 
 	const st = await statusOf(id);
 	if (!st) {
-		if (!expectPattern) updateWaitReservation(id, "abandon");
+		// A non-pattern backend wait returned before this lookup, so preserve its
+		// completion claim when status persistence is transiently unavailable.
+		// Abandoning here can re-enable the poller and duplicate a completion the
+		// explicit wait already consumed. This matches the old suppress-first rule.
+		if (!expectPattern) updateWaitReservation(id, "claim");
 		return { id, kind: "exited", ok: false, text: `No such session: ${id}` };
 	}
 	if (expectPattern) suppressNotify(id);
