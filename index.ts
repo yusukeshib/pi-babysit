@@ -38,7 +38,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -634,7 +634,10 @@ export function summarizeNotificationCommand(command: string | undefined): strin
 			.trim()
 			.replace(/\r/g, "\\r")
 			.replace(/\n/g, "\\n")
-			.replace(/\t/g, "\\t") || "?";
+			.replace(/\t/g, "\\t")
+			.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, (char) =>
+				`\\x${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+			) || "?";
 	const bytes = Buffer.from(preview, "utf8");
 	if (bytes.length <= NOTIFY_COMMAND_MAX_BYTES) return preview;
 	if (NOTIFY_COMMAND_MAX_BYTES === 0) return "";
@@ -674,6 +677,7 @@ interface ProcessCompletionMessage {
 		status: CompletionStatus;
 		runtime?: string;
 		logPath?: string;
+		command?: string;
 		count: number;
 		totalCount: number;
 		remainingCount: number;
@@ -683,6 +687,7 @@ interface ProcessCompletionMessage {
 			success: boolean;
 			status: CompletionStatus;
 			runtime: string;
+			command: string | undefined;
 			logPath: string;
 		}>;
 	};
@@ -791,6 +796,7 @@ export function buildProcessCompletionMessage(
 		success: notice.success,
 		status: notice.status,
 		runtime: notice.runtime,
+		command: notice.command,
 		logPath: notice.logPath,
 	}));
 	const single = totalCount === 1 ? batch[0] : undefined;
@@ -805,6 +811,7 @@ export function buildProcessCompletionMessage(
 			status,
 			runtime: single?.runtime,
 			logPath: single?.logPath,
+			command: single?.command,
 			count: batch.length,
 			totalCount,
 			remainingCount: totalCount - batch.length,
@@ -1746,11 +1753,20 @@ export default function (pi: ExtensionAPI) {
 			status?: DisplayStatus;
 			success?: boolean;
 			exitCode?: number | null;
+			command?: string;
+			count?: number;
 		};
 		const status =
 			d.status ?? (d.success ? "success" : d.exitCode == null ? "terminated" : "failed");
+		const payload = d.command
+			? `  ${summarizeNotificationCommand(d.command)}`
+			: d.count && d.count > 1
+				? `  ×${d.count}`
+				: "";
+		const header = theme.fg("warning", theme.bold(`babysit_run COMMAND${payload}`));
 		const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
-		box.addChild(new Text(renderStatus(status, theme, "babysit_run"), 0, 0));
+		box.addChild(new Text(header, 0, 0));
+		box.addChild(new Text(renderStatus(status, theme), 0, 0));
 		box.addChild(new Text(theme.fg("toolOutput", content), 0, 0));
 		return box;
 	});
@@ -2137,10 +2153,19 @@ export default function (pi: ExtensionAPI) {
 				},
 			};
 		},
-		// The result label already includes "babysit_run"; suppress the default
-		// call header so the tool name is not shown twice in adjacent lines.
-		renderCall() {
-			return new Container();
+		// Make the execution kind and payload identifiable before the result arrives.
+		// Use semantic theme colors rather than the fallback gray tool-call text.
+		renderCall(args, theme) {
+			const isSubagent = args.profile === "subagent";
+			const kind = isSubagent ? "AGENT" : "COMMAND";
+			const payload = isSubagent ? args.task : args.command;
+			const agent = isSubagent && args.agent ? ` [${args.agent}]` : "";
+			const title = theme.bold(`babysit_run ${kind}`);
+			const detail =
+				typeof payload === "string" && payload.length > 0
+					? `  ${summarizeNotificationCommand(payload)}`
+					: "";
+			return new Text(theme.fg("warning", `${title}${agent}${detail}`), 0, 0);
 		},
 		renderResult(result, { isPartial }, theme, context) {
 			const details = (result.details ?? {}) as {
@@ -2168,7 +2193,7 @@ export default function (pi: ExtensionAPI) {
 							: details.kind === "subagent" || content.includes(NOTIFY_MARKER)
 								? "started"
 								: "success");
-			const label = renderStatus(status, theme, "babysit_run");
+			const label = renderStatus(status, theme);
 			return new Text(content ? `${label}\n${theme.fg("toolOutput", content)}` : label, 0, 0);
 		},
 	});

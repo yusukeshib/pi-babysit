@@ -66,16 +66,18 @@ test("process completion messages render semantic colored labels", () => {
 		renderer({ content: "process details", details }, {}, theme).render(100) as string[];
 	const render = (details: Record<string, unknown>) => renderLines(details).join("\n");
 
-	expect(render({ status: "success" })).toContain(
-		"<success>babysit_run SUCCESS</success>",
+	expect(render({ status: "success", command: "npm test" })).toContain(
+		"<warning>babysit_run COMMAND  npm test</warning>",
 	);
+	expect(render({ status: "success" })).toContain("<success>SUCCESS</success>");
 	expect(render({ status: "success" })).toContain("<bg-toolSuccessBg>");
 	expect(render({ status: "success" })).toContain(
 		"<toolOutput>process details</toolOutput>",
 	);
-	expect(render({ status: "failed" })).toContain("<error>babysit_run FAILED</error>");
-	expect(render({ status: "terminated" })).toContain(
-		"<error>babysit_run TERMINATED</error>",
+	expect(render({ status: "failed" })).toContain("<error>FAILED</error>");
+	expect(render({ status: "terminated" })).toContain("<error>TERMINATED</error>");
+	expect(render({ status: "success", count: 3 })).toContain(
+		"<warning>babysit_run COMMAND  ×3</warning>",
 	);
 	const lines = renderLines({ status: "success" });
 	expect(lines[0]).not.toContain("babysit_run");
@@ -97,17 +99,38 @@ test("babysit_run renders a status label for quick and background results", () =
 			{ isError },
 		).render(100).join("\n");
 
-	expect(tool.renderCall().render(100)).toEqual([]);
-	expect(render("success")).toContain("<success>babysit_run SUCCESS</success>");
-	expect(render("started")).toContain("<accent>babysit_run STARTED</accent>");
-	expect(render("failed", true)).toContain("<error>babysit_run FAILED</error>");
+	const commandCall = tool.renderCall(
+		{ command: "bun test" },
+		theme,
+	).render(100).join("\n");
+	const agentCall = tool.renderCall(
+		{ profile: "subagent", agent: "reviewer", task: "Review the diff" },
+		theme,
+	).render(100).join("\n");
+	const incompleteCall = tool.renderCall({}, theme).render(100).join("\n");
+	const unsafeCall = tool.renderCall(
+		{ command: `printf 'first\n\x1b[31msecond'${"x".repeat(300)}` },
+		theme,
+	).render(500).join("\n");
+	expect(commandCall).toContain("<warning>babysit_run COMMAND  bun test</warning>");
+	expect(agentCall).toContain(
+		"<warning>babysit_run AGENT [reviewer]  Review the diff</warning>",
+	);
+	expect(incompleteCall).toContain("<warning>babysit_run COMMAND</warning>");
+	expect(unsafeCall).toContain("first\\n\\x1B[31msecond");
+	expect(unsafeCall).not.toContain("\x1b");
+	expect(unsafeCall).toContain("…");
+	expect(render("success")).toContain("<success>SUCCESS</success>");
+	expect(render("success")).not.toContain("babysit_run SUCCESS");
+	expect(render("started")).toContain("<accent>STARTED</accent>");
+	expect(render("failed", true)).toContain("<error>FAILED</error>");
 	expect(
 		render(
 			"success",
 			false,
 			"worker-dead: the babysit supervisor disappeared without an exit status",
 		),
-	).toContain("<error>babysit_run TERMINATED</error>");
+	).toContain("<error>TERMINATED</error>");
 });
 
 test("babysit version policy requires 0.13.0 or newer", () => {
@@ -398,6 +421,9 @@ test("kill confirmation validates both backend acknowledgement and terminal stat
 test("completion notification payload policies are UTF-8 safe and bounded", () => {
 	expect(summarizeNotificationCommand("printf 'a  b'\n\t&& printf 'c'")).toBe(
 		"printf 'a  b'\\n\\t&& printf 'c'",
+	);
+	expect(summarizeNotificationCommand("before\x1b[31m\x00after")).toBe(
+		"before\\x1B[31m\\x00after",
 	);
 	for (const command of ["x".repeat(2_000), `a${"界".repeat(2_000)}`]) {
 		const preview = summarizeNotificationCommand(command);
