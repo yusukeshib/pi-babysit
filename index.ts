@@ -370,6 +370,10 @@ interface Meta {
 	// Temporary reservation while kill is in flight. Unlike `notified`, this
 	// must be cleared on failure so a real completion remains deliverable.
 	notificationPaused?: boolean;
+	// Concurrent explicit waits share a reference-counted notification claim.
+	// A timeout must not re-enable the poller while another wait still owns it.
+	waitReservations?: number;
+	waitCompletionClaimed?: boolean;
 	completionObservedAt?: number;
 	startedAt?: number;
 	// subagent
@@ -1463,19 +1467,47 @@ function suppressNotify(id: string, reason: "observed" | "kill" = "observed"): v
 	}
 }
 
-export function canRestoreNotificationAfterWait(meta: {
+export interface WaitReservationState {
 	notified?: boolean;
 	killNotificationSuppressed?: boolean;
-}): boolean {
-	return meta.notified === true && meta.killNotificationSuppressed !== true;
+	waitReservations?: number;
+	waitCompletionClaimed?: boolean;
 }
 
-function enableNotify(id: string): void {
-	const meta = readMeta(id);
-	if (meta && meta.kind === "process" && canRestoreNotificationAfterWait(meta)) {
-		meta.notified = false;
-		writeMeta(id, meta);
+export function canRestoreNotificationAfterWait(meta: WaitReservationState): boolean {
+	return (
+		meta.notified === true &&
+		meta.killNotificationSuppressed !== true &&
+		meta.waitCompletionClaimed !== true &&
+		(meta.waitReservations ?? 0) === 0
+	);
+}
+
+export function transitionWaitReservation(
+	state: WaitReservationState,
+	action: "reserve" | "abandon" | "claim",
+): WaitReservationState {
+	const next = { ...state };
+	if (action === "reserve") {
+		next.waitReservations = (next.waitReservations ?? 0) + 1;
+		next.notified = true;
+		return next;
 	}
+
+	next.waitReservations = Math.max(0, (next.waitReservations ?? 0) - 1);
+	if (action === "claim") next.waitCompletionClaimed = true;
+	if (action === "claim" || next.waitCompletionClaimed) {
+		next.notified = true;
+	} else if (canRestoreNotificationAfterWait(next)) {
+		next.notified = false;
+	}
+	return next;
+}
+
+function updateWaitReservation(id: string, action: "reserve" | "abandon" | "claim"): void {
+	const meta = readMeta(id);
+	if (!meta || meta.kind !== "process") return;
+	writeMeta(id, { ...meta, ...transitionWaitReservation(meta, action) });
 }
 
 function pauseNotify(id: string): void {
@@ -1529,19 +1561,20 @@ async function waitForExit(
 		}
 		// fall through: session exited before the pattern appeared
 	} else {
-		// An explicit wait owns completion delivery. Mark it before blocking so
-		// the exit poller cannot race us and inject a duplicate notification.
-		suppressNotify(id);
+		// An explicit wait owns completion delivery. Reference-count the claim so
+		// one concurrent wait timing out cannot re-enable notifications underneath
+		// another wait that is still pending.
+		updateWaitReservation(id, "reserve");
 		const w = await bs(["wait", "-s", id, "--timeout", t], { signal });
 		if (signal?.aborted || w.code === 130) {
-			enableNotify(id);
+			updateWaitReservation(id, "abandon");
 			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
 		}
 		if (w.code === 124) {
 			// 124 is ambiguous (timeout vs child exiting 124) — disambiguate.
 			const st0 = await statusOf(id);
 			if (st0?.state === "running") {
-				enableNotify(id);
+				updateWaitReservation(id, "abandon");
 				return {
 					id,
 					kind: "timeout",
@@ -1555,9 +1588,11 @@ async function waitForExit(
 
 	const st = await statusOf(id);
 	if (!st) {
+		if (!expectPattern) updateWaitReservation(id, "abandon");
 		return { id, kind: "exited", ok: false, text: `No such session: ${id}` };
 	}
-	suppressNotify(id); // the agent sees the exit here; don't notify again
+	if (expectPattern) suppressNotify(id);
+	else updateWaitReservation(id, "claim"); // the agent sees the exit here; don't notify again
 	const meta = readMeta(id);
 	const workerDead = st.state === "dead" && st.exit_code == null;
 	const ok = st.exit_code === 0;

@@ -20,6 +20,7 @@ import extension, {
 	shouldDeliverProcessCompletion,
 	shouldInlineCompleteOutput,
 	summarizeNotificationCommand,
+	transitionWaitReservation,
 	validateKillResponse,
 } from "./index.ts";
 
@@ -464,6 +465,27 @@ test("completion notification payload policies are UTF-8 safe and bounded", () =
 			killNotificationSuppressed: true,
 		}),
 	).toBe(false);
+});
+
+test("concurrent waits keep automatic notification reserved until every owner exits", () => {
+	let state = transitionWaitReservation({}, "reserve");
+	state = transitionWaitReservation(state, "reserve");
+	expect(state).toMatchObject({ notified: true, waitReservations: 2 });
+
+	state = transitionWaitReservation(state, "abandon");
+	expect(state).toMatchObject({ notified: true, waitReservations: 1 });
+	state = transitionWaitReservation(state, "claim");
+	expect(state).toMatchObject({
+		notified: true,
+		waitReservations: 0,
+		waitCompletionClaimed: true,
+	});
+
+	let timedOut = transitionWaitReservation({}, "reserve");
+	timedOut = transitionWaitReservation(timedOut, "reserve");
+	timedOut = transitionWaitReservation(timedOut, "abandon");
+	timedOut = transitionWaitReservation(timedOut, "abandon");
+	expect(timedOut).toMatchObject({ notified: false, waitReservations: 0 });
 });
 
 const completionNotice = (
