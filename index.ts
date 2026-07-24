@@ -36,10 +36,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
 
@@ -365,6 +370,10 @@ interface Meta {
 	// Temporary reservation while kill is in flight. Unlike `notified`, this
 	// must be cleared on failure so a real completion remains deliverable.
 	notificationPaused?: boolean;
+	// Concurrent explicit waits share a reference-counted notification claim.
+	// A timeout must not re-enable the poller while another wait still owns it.
+	waitReservations?: number;
+	waitCompletionClaimed?: boolean;
 	completionObservedAt?: number;
 	startedAt?: number;
 	// subagent
@@ -403,6 +412,10 @@ export function shouldDeliverProcessCompletion(
 	} | null,
 ): meta is { kind: "process"; notified?: boolean; notificationPaused?: boolean } {
 	return meta?.kind === "process" && !meta.notified && !meta.notificationPaused;
+}
+
+export function shouldDeferCompletionNotification(agentIsIdle: boolean): boolean {
+	return !agentIsIdle;
 }
 
 const kindOf = (id: string): "process" | "subagent" => readMeta(id)?.kind ?? "process";
@@ -528,14 +541,26 @@ const NOTIFY_COMMAND_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_COMMAND_MAX
 const NOTIFY_BATCH_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_BATCH_MAX_BYTES", 8_000);
 const ANSWER_MAX_BYTES = 24_000; // subagent answers / error messages
 
-function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
+export function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
+	if (maxBytes <= 0) return "";
 	const buf = Buffer.from(s, "utf8");
 	if (buf.length <= maxBytes) return s;
-	const half = Math.floor(maxBytes / 2);
-	// Strip replacement chars from a mid-codepoint cut at the boundary.
-	const head = buf.subarray(0, half).toString("utf8").replace(/\uFFFD+$/, "");
-	const tail = buf.subarray(buf.length - half).toString("utf8").replace(/^\uFFFD+/, "");
-	return `${head}\n… [${buf.length - maxBytes} bytes elided] …\n${tail}`;
+
+	// The marker counts toward the limit. Recompute a few times because the
+	// omitted-byte count can change the marker's digit width.
+	let available = maxBytes;
+	let marker = "";
+	for (let i = 0; i < 3; i++) {
+		marker = `\n… [${buf.length - available} bytes elided] …\n`;
+		available = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
+	}
+	if (Buffer.byteLength(marker, "utf8") > maxBytes) return truncateUtf8End(marker, maxBytes);
+	const headBytes = Math.floor(available / 2);
+	const tailBytes = available - headBytes;
+	// Strip replacement chars from a mid-codepoint cut at either boundary.
+	const head = buf.subarray(0, headBytes).toString("utf8").replace(/\uFFFD+$/, "");
+	const tail = buf.subarray(buf.length - tailBytes).toString("utf8").replace(/^\uFFFD+/, "");
+	return `${head}${marker}${tail}`;
 }
 
 async function searchLog(
@@ -1442,19 +1467,47 @@ function suppressNotify(id: string, reason: "observed" | "kill" = "observed"): v
 	}
 }
 
-export function canRestoreNotificationAfterWait(meta: {
+export interface WaitReservationState {
 	notified?: boolean;
 	killNotificationSuppressed?: boolean;
-}): boolean {
-	return meta.notified === true && meta.killNotificationSuppressed !== true;
+	waitReservations?: number;
+	waitCompletionClaimed?: boolean;
 }
 
-function enableNotify(id: string): void {
-	const meta = readMeta(id);
-	if (meta && meta.kind === "process" && canRestoreNotificationAfterWait(meta)) {
-		meta.notified = false;
-		writeMeta(id, meta);
+export function canRestoreNotificationAfterWait(meta: WaitReservationState): boolean {
+	return (
+		meta.notified === true &&
+		meta.killNotificationSuppressed !== true &&
+		meta.waitCompletionClaimed !== true &&
+		(meta.waitReservations ?? 0) === 0
+	);
+}
+
+export function transitionWaitReservation(
+	state: WaitReservationState,
+	action: "reserve" | "abandon" | "claim",
+): WaitReservationState {
+	const next = { ...state };
+	if (action === "reserve") {
+		next.waitReservations = (next.waitReservations ?? 0) + 1;
+		next.notified = true;
+		return next;
 	}
+
+	next.waitReservations = Math.max(0, (next.waitReservations ?? 0) - 1);
+	if (action === "claim") next.waitCompletionClaimed = true;
+	if (action === "claim" || next.waitCompletionClaimed) {
+		next.notified = true;
+	} else if (canRestoreNotificationAfterWait(next)) {
+		next.notified = false;
+	}
+	return next;
+}
+
+function updateWaitReservation(id: string, action: "reserve" | "abandon" | "claim"): void {
+	const meta = readMeta(id);
+	if (!meta || meta.kind !== "process") return;
+	writeMeta(id, { ...meta, ...transitionWaitReservation(meta, action) });
 }
 
 function pauseNotify(id: string): void {
@@ -1508,19 +1561,20 @@ async function waitForExit(
 		}
 		// fall through: session exited before the pattern appeared
 	} else {
-		// An explicit wait owns completion delivery. Mark it before blocking so
-		// the exit poller cannot race us and inject a duplicate notification.
-		suppressNotify(id);
+		// An explicit wait owns completion delivery. Reference-count the claim so
+		// one concurrent wait timing out cannot re-enable notifications underneath
+		// another wait that is still pending.
+		updateWaitReservation(id, "reserve");
 		const w = await bs(["wait", "-s", id, "--timeout", t], { signal });
 		if (signal?.aborted || w.code === 130) {
-			enableNotify(id);
+			updateWaitReservation(id, "abandon");
 			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
 		}
 		if (w.code === 124) {
 			// 124 is ambiguous (timeout vs child exiting 124) — disambiguate.
 			const st0 = await statusOf(id);
 			if (st0?.state === "running") {
-				enableNotify(id);
+				updateWaitReservation(id, "abandon");
 				return {
 					id,
 					kind: "timeout",
@@ -1534,9 +1588,15 @@ async function waitForExit(
 
 	const st = await statusOf(id);
 	if (!st) {
+		// A non-pattern backend wait returned before this lookup, so preserve its
+		// completion claim when status persistence is transiently unavailable.
+		// Abandoning here can re-enable the poller and duplicate a completion the
+		// explicit wait already consumed. This matches the old suppress-first rule.
+		if (!expectPattern) updateWaitReservation(id, "claim");
 		return { id, kind: "exited", ok: false, text: `No such session: ${id}` };
 	}
-	suppressNotify(id); // the agent sees the exit here; don't notify again
+	if (expectPattern) suppressNotify(id);
+	else updateWaitReservation(id, "claim"); // the agent sees the exit here; don't notify again
 	const meta = readMeta(id);
 	const workerDead = st.state === "dead" && st.exit_code == null;
 	const ok = st.exit_code === 0;
@@ -1588,12 +1648,41 @@ export function isAllowedDirectBash(_command: string): boolean {
 	return process.env.PI_BABYSIT_ALLOW_BASH === "1";
 }
 
+export function activeToolsWithoutDirectBash(activeTools: string[], allowDirectBash: boolean): string[] {
+	return allowDirectBash ? activeTools : activeTools.filter((name) => name !== "bash");
+}
+
 // ---------------------------------------------------------------------------
 // extension
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	const declaredToolErrors = new Set<string>();
+
+	// Pi only persists custom-tool failures when they are thrown or patched by a
+	// tool_result hook; an `isError` property returned from execute() is ignored.
+	// Keep the structured result (status, log path, diagnostics) while promoting
+	// its declared error bit at the supported hook boundary.
+	const registerTool = <TParams extends TSchema, TDetails, TState>(
+		tool: ToolDefinition<TParams, TDetails, TState>,
+	): void => {
+		const execute = tool.execute;
+		pi.registerTool({
+			...tool,
+			async execute(toolCallId, params, signal, onUpdate, ctx) {
+				const result = await execute(toolCallId, params, signal, onUpdate, ctx);
+				if ((result as typeof result & { isError?: boolean }).isError === true) {
+					declaredToolErrors.add(toolCallId);
+				}
+				return result;
+			},
+		});
+	};
+
+	pi.on("tool_result", (event) => {
+		if (declaredToolErrors.delete(event.toolCallId)) return { isError: true };
+	});
 
 	// Exit notifications for kind=process sessions: the poller detects
 	// running→exited transitions and injects ONE message (triggerTurn) for all
@@ -1601,7 +1690,11 @@ export default function (pi: ExtensionAPI) {
 	// that ended its turn after babysit_run without spending one turn per exit.
 	// Kills via babysit_kill and exits already reported by babysit_wait are
 	// suppressed via meta.notified.
-	async function notifyEndedProcesses(): Promise<void> {
+	async function notifyEndedProcesses(ctx: ExtensionContext): Promise<void> {
+		// Never steer a completion into an active agent turn. In particular, this
+		// lets an immediately-following babysit_wait reserve the completion first,
+		// instead of racing the poller and receiving both wait + auto notification.
+		if (shouldDeferCompletionNotification(ctx.isIdle())) return;
 		const { sessions } = await listSessions();
 		const ready: Array<{ session: BsSession; meta: Meta }> = [];
 		for (const session of sessions) {
@@ -1660,6 +1753,9 @@ export default function (pi: ExtensionAPI) {
 			metadataById.set(notice.id, current);
 			return [{ ...notice, command: current.command }];
 		});
+		// Output collection above yields to the event loop. Re-check idleness so a
+		// newly-started agent turn cannot receive a duplicate completion mid-turn.
+		if (shouldDeferCompletionNotification(ctx.isIdle())) return;
 		deliverProcessCompletionMessage(
 			notices,
 			(message, options) => pi.sendMessage(message, options),
@@ -1773,6 +1869,16 @@ export default function (pi: ExtensionAPI) {
 
 	let polling = false;
 	pi.on("session_start", async (_event, ctx) => {
+		// Do not expose the built-in bash tool only to reject it after the model has
+		// already paid for a failed tool turn. The tool_call hook remains a fallback
+		// if another extension/preset re-enables bash later in the session.
+		const activeTools = pi.getActiveTools();
+		const supervisedTools = activeToolsWithoutDirectBash(
+			activeTools,
+			isAllowedDirectBash(""),
+		);
+		if (supervisedTools.length !== activeTools.length) pi.setActiveTools(supervisedTools);
+
 		// Session-local registry: scope the babysit root to this pi session so
 		// other sessions' processes/subagents are invisible here. Resuming a
 		// session keeps the same id, so its sessions come back with it.
@@ -1792,7 +1898,7 @@ export default function (pi: ExtensionAPI) {
 			// calls never stack up.
 			if (polling) return;
 			polling = true;
-			Promise.all([notifyEndedProcesses(), refreshWidget(ctx)])
+			Promise.all([notifyEndedProcesses(ctx), refreshWidget(ctx)])
 				.catch(() => {
 					/* ignore poll errors */
 				})
@@ -1829,7 +1935,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ----- babysit_run --------------------------------------------------------
-	pi.registerTool({
+	registerTool({
 		name: "babysit_run",
 		label: "Babysit: run",
 		description:
@@ -1850,7 +1956,8 @@ export default function (pi: ExtensionAPI) {
 			"Run any shell command with context-safe captured output; quick commands return metadata, longer ones continue in background",
 		promptGuidelines: [
 			"Use babysit_run as the default for shell commands, not only long-running work. Small output is returned directly; large stdout/stderr stays out of model context in the returned log path. Give meaningful commands a clear stable `name`.",
-			"Inspect a babysit log with babysit_check { id, lines, pattern? }; never read or cat a potentially large log file in full.",
+			"Bundle closely related tiny observations into one babysit_run command when that reduces tool turns without obscuring lifecycle or failure handling.",
+			"Inspect a babysit log with babysit_check { id, lines, pattern? }; never read or cat a potentially large log file in full. Prefer a targeted `pattern` search over returning a broad tail.",
 			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
 			"If a babysit worker is killed externally, babysit_run reports it as worker-dead rather than hanging. Set retryOnWorkerDeath: true only for safe, idempotent commands; it retries at most once and may otherwise duplicate side effects.",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
@@ -2199,7 +2306,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ----- babysit_check ------------------------------------------------------
-	pi.registerTool({
+	registerTool({
 		name: "babysit_check",
 		label: "Babysit: check",
 		description:
@@ -2257,7 +2364,7 @@ export default function (pi: ExtensionAPI) {
 					const preview = what.length > 60 ? `${what.slice(0, 57)}…` : what;
 					return `${s.id}  [${kind}] ${s.state}${ec}${depth}${flag}${preview ? `  — ${preview}` : ""}`;
 				});
-				return { content: [{ type: "text", text: lines.join("\n") }], details: { sessions } };
+				return { content: [{ type: "text", text: clip(lines.join("\n")) }], details: { sessions } };
 			}
 
 			const st = await statusOf(params.id);
@@ -2299,7 +2406,7 @@ export default function (pi: ExtensionAPI) {
 					? `--- latest matches /${params.pattern}/ ---\n${result.text}`
 					: `(no output matching /${params.pattern}/)`;
 				return {
-					content: [{ type: "text", text: `${header}\n${body}` }],
+					content: [{ type: "text", text: clip(`${header}\n${body}`) }],
 					details: { status: st, kind, logPath: logPath(params.id), pattern: params.pattern },
 				};
 			}
@@ -2327,7 +2434,7 @@ export default function (pi: ExtensionAPI) {
 					parts.push(tail ? `--- recent output ---\n${tail}` : "(no output yet)");
 				}
 				return {
-					content: [{ type: "text", text: parts.join("\n") }],
+					content: [{ type: "text", text: clip(parts.join("\n")) }],
 					details: { status: st, kind: "process", logPath: logPath(params.id) },
 				};
 			}
@@ -2389,7 +2496,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ----- babysit_send -------------------------------------------------------
-	pi.registerTool({
+	registerTool({
 		name: "babysit_send",
 		label: "Babysit: send",
 		description:
@@ -2542,7 +2649,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ----- babysit_wait -------------------------------------------------------
-	pi.registerTool({
+	registerTool({
 		name: "babysit_wait",
 		label: "Babysit: wait",
 		description:
@@ -2653,7 +2760,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ----- babysit_kill -------------------------------------------------------
-	pi.registerTool({
+	registerTool({
 		name: "babysit_kill",
 		label: "Babysit: kill",
 		description: "Terminate a babysit session (process or subagent).",

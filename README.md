@@ -62,8 +62,11 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: `ids` + `mode: "any"\|"all"` |
 | `babysit_kill` | Terminate a session, verify terminal state, then suppress the exit notification |
 
-A `tool_call` hook blocks shell backgrounding (`… &`, `nohup`, `setsid`,
-`disown`) and redirects all direct `bash` commands to `babysit_run`.
+The built-in `bash` tool is removed from the active tool set so the model does
+not waste a failed tool turn before choosing `babysit_run`. A fallback
+`tool_call` hook still blocks direct shell calls if another extension or preset
+re-enables `bash`, including shell backgrounding (`… &`, `nohup`, `setsid`,
+`disown`). Set `PI_BABYSIT_ALLOW_BASH=1` to retain direct `bash` explicitly.
 
 ## Commands (human)
 
@@ -91,9 +94,10 @@ babysit_check { id: "cargo-test", lines: 50 }
 babysit_check { id: "cargo-test", pattern: "FAIL|ERROR", lines: 50 }
 ```
 
-Tail and search results are capped at 200 lines and clipped to 8 KB. Pattern
-search returns the latest matching lines with line numbers. Do not read a
-potentially large log file in full.
+Tail and search results are capped at 200 lines, and the complete returned tool
+result (including lifecycle headers) is clipped to 8 KB. Pattern search returns
+the latest matching lines with line numbers. Prefer a targeted pattern over a
+broad tail, and do not read a potentially large log file in full.
 
 Subagent logs also compact Pi's streaming `message_update` events before they
 are recorded. Pi repeats the complete growing assistant message and partial
@@ -103,7 +107,8 @@ events untouched. This keeps long RPC sessions approximately linear in emitted
 content without changing final answers, completion detection, or follow-up
 behavior. Live `/babysit` and attach views render the retained deltas.
 
-All shell commands, including `pwd` and Git, are redirected to `babysit_run`.
+All shell commands, including `pwd` and Git, go through `babysit_run`. Bundle
+closely related tiny observations when doing so safely reduces tool turns.
 Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 
 ## Unexpected worker loss
@@ -117,9 +122,12 @@ because blindly rerunning an arbitrary command can duplicate side effects.
 
 ## How completion detection works
 
-- **Process**: a 2.5s poller watches for running→exited transitions and injects
-  one `pi.sendMessage(…, { triggerTurn: true, deliverAs: "steer" })` containing
-  every deliverable exit observed in that poll (deduped via `meta/<id>.json`).
+- **Process**: a 2.5s poller watches for running→exited transitions and, once the
+  parent agent is idle, injects one
+  `pi.sendMessage(…, { triggerTurn: true, deliverAs: "steer" })` containing every
+  deliverable exit observed in that poll (deduped via `meta/<id>.json`). Waiting
+  for idleness prevents an immediately-following `babysit_wait` from racing the
+  poller and receiving a duplicate completion.
   `babysit_kill` and an exit already reported by `babysit_wait` suppress the
   notification.
 - **Subagent**: `babysit_wait` blocks on `babysit expect '"type":"agent_end"'`.
