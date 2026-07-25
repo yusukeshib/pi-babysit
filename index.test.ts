@@ -1,9 +1,17 @@
 import { expect, test } from "bun:test";
-import { readFileSync, rmSync, unlinkSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { compactRpcLine } from "./rpc-stream-proxy.mjs";
+import { discoverAgents } from "./agents.ts";
 import extension, {
 	activeToolsWithoutDirectBash,
 	buildProcessCompletionMessage,
@@ -14,11 +22,14 @@ import extension, {
 	isConfirmedTerminalState,
 	isSupportedBabysitVersion,
 	parseEvents,
+	parseRpcResponseBytes,
 	planSubagentSpawn,
 	type ProcessCompletionNotice,
 	shouldDeferCompletionNotification,
 	shouldDeliverProcessCompletion,
 	shouldInlineCompleteOutput,
+	shouldKeepPolling,
+	shouldKeepPollingAfterList,
 	summarizeNotificationCommand,
 	transitionWaitReservation,
 	validateKillResponse,
@@ -178,6 +189,20 @@ test("RPC stream compaction removes only cumulative message_update snapshots", (
 	expect(compactRpcLine("non-json diagnostic")).toBe("non-json diagnostic");
 });
 
+test("RPC response offsets exclude lifecycle events from the preceding run", () => {
+	const previousEnd = `${JSON.stringify({ type: "agent_end", messages: [] })}\r\n`;
+	const response = `${JSON.stringify({ type: "response", command: "prompt", success: true })}\r\n`;
+	const nextRun = `${JSON.stringify({ type: "agent_start" })}\r\n`;
+	const bytes = Buffer.from(previousEnd + response + nextRun);
+	const since = 100;
+	const parsed = parseRpcResponseBytes(bytes, since, "prompt");
+
+	expect(parsed.ok).toBe(true);
+	if (!parsed.ok) throw new Error(parsed.error);
+	expect(parsed.offset).toBe(since + Buffer.byteLength(previousEnd + response));
+	expect(parseEvents(nextRun)).toMatchObject({ agentStarts: 1, agentEnds: 0 });
+});
+
 test("RPC stream compaction preserves parseEvents final state", () => {
 	const assistant = {
 		role: "assistant",
@@ -202,6 +227,7 @@ test("RPC stream compaction preserves parseEvents final state", () => {
 		{ type: "tool_execution_end", toolName: "read", isError: false, result: { content: [] } },
 		{ type: "message_end", message: assistant },
 		{ type: "agent_end", messages: [assistant] },
+		{ type: "agent_settled" },
 	];
 	const raw = events.map((event) => JSON.stringify(event)).join("\n");
 	const compact = raw.split("\n").map(compactRpcLine).join("\n");
@@ -234,6 +260,7 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 			assistantMessageEvent: { type: "text_delta", delta: "waiting", partial: { text: "waiting" } },
 		},
 		parkedEnd,
+		{ type: "agent_settled" },
 	];
 	const compare = (events: unknown[]) => {
 		const raw = events.map((event) => JSON.stringify(event)).join("\n");
@@ -249,12 +276,34 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 			{ type: "agent_start" },
 			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "finished" }] } },
 			{ type: "agent_end", messages: [{ role: "assistant" }] },
+			{ type: "agent_settled" },
 		]),
 	).toMatchObject({ done: true, waitingOnProcess: false, finalText: "finished", agentStarts: 2, agentEnds: 2 });
 	expect(compare([{ type: "response", command: "prompt", success: false, error: "rejected" }])).toMatchObject({
 		done: false,
 		errorMsg: "rejected",
 	});
+
+	// agent_end is only a low-level run boundary; retries and continuations may follow.
+	expect(compare([{ type: "agent_start" }, { type: "agent_end", messages: [] }])).toMatchObject({
+		done: false,
+		agentSettled: 0,
+	});
+
+	// A model note after the process-start result must not defeat parked detection.
+	expect(
+		compare([
+			{ type: "agent_start" },
+			{
+				type: "agent_end",
+				messages: [
+					...parkedEnd.messages,
+					{ role: "assistant", content: [{ type: "text", text: "Started; awaiting completion." }] },
+				],
+			},
+			{ type: "agent_settled" },
+		]),
+	).toMatchObject({ done: false, waitingOnProcess: true });
 });
 
 test("RPC stream compaction makes cumulative updates approximately linear", () => {
@@ -345,6 +394,33 @@ test("compact RPC deltas remain visible without duplicate final text", () => {
 	expect(plain).toContain("[usage] 42 tok · $0.0100");
 });
 
+test("agent discovery accepts YAML tool arrays and skips invalid definitions", () => {
+	const root = mkdtempSync(path.join(os.tmpdir(), "pi-babysit-agents-"));
+	const dir = path.join(root, ".pi", "agents");
+	mkdirSync(dir, { recursive: true });
+	try {
+		writeFileSync(
+			path.join(dir, "array.md"),
+			"---\nname: array-agent\ndescription: array tools\ntools: [read, grep]\nmodel: test-model\n---\nArray prompt\n",
+		);
+		writeFileSync(
+			path.join(dir, "csv.md"),
+			"---\nname: csv-agent\ndescription: csv tools\ntools: read, write\n---\nCSV prompt\n",
+		);
+		writeFileSync(
+			path.join(dir, "invalid.md"),
+			"---\nname: [not, a, string]\ndescription: ignored\n---\nInvalid\n",
+		);
+
+		const { agents } = discoverAgents(root, "project");
+		expect(agents.map((agent) => agent.name).sort()).toEqual(["array-agent", "csv-agent"]);
+		expect(agents.find((agent) => agent.name === "array-agent")?.tools).toEqual(["read", "grep"]);
+		expect(agents.find((agent) => agent.name === "csv-agent")?.tools).toEqual(["read", "write"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("subagent nesting defaults to one level and requires top-level opt-in", () => {
 	expect(planSubagentSpawn(0, {}).allowed).toBe(false);
 	expect(
@@ -416,6 +492,31 @@ test("subagent depth limit blocks profile mode but leaves process mode available
 		if (previousMaxDepth === undefined) delete process.env[maxDepthKey];
 		else process.env[maxDepthKey] = previousMaxDepth;
 	}
+});
+
+test("long subagent messages fail before spawn when the read tool is unavailable", async () => {
+	const result = await tools.get("babysit_run").execute(
+		"long-task-no-read",
+		{ profile: "subagent", task: "x".repeat(601), tools: ["grep"] },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const text = result.content[0]?.text ?? "";
+	expect(result.isError).toBe(true);
+	expect(text).toContain("allowlist excludes `read`");
+});
+
+test("invalid wait durations fail instead of becoming infinite waits", async () => {
+	await expect(
+		tools.get("babysit_wait").execute(
+			"invalid-wait-timeout",
+			{ id: "does-not-matter", timeout: "5minutes" },
+			undefined,
+			undefined,
+			ctx,
+		),
+	).rejects.toThrow("Invalid timeout");
 });
 
 test("kill confirmation validates both backend acknowledgement and terminal state", () => {
@@ -507,6 +608,22 @@ const completionNotice = (
 test("completion notifications wait until the agent is idle", () => {
 	expect(shouldDeferCompletionNotification(false)).toBe(true);
 	expect(shouldDeferCompletionNotification(true)).toBe(false);
+});
+
+test("idle polling stops unless a worker or completion still needs attention", () => {
+	const metadata = new Map([
+		["pending", { kind: "process" as const, notified: false }],
+		["done", { kind: "process" as const, notified: true }],
+	]);
+	const metaFor = (id: string) => metadata.get(id) ?? null;
+
+	expect(shouldKeepPolling([], metaFor)).toBe(false);
+	expect(shouldKeepPolling([{ id: "worker", state: "running" }], metaFor)).toBe(true);
+	expect(shouldKeepPolling([{ id: "pending", state: "exited" }], metaFor)).toBe(true);
+	expect(shouldKeepPolling([{ id: "done", state: "exited" }], metaFor)).toBe(false);
+	expect(shouldKeepPollingAfterList({ sessions: [], error: "temporary failure" }, metaFor)).toBe(
+		true,
+	);
 });
 
 test("completion notification eligibility excludes wait, kill, and subagent sessions", () => {

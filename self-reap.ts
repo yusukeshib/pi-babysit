@@ -13,8 +13,8 @@
  *      keep talking to never dies; only a genuinely-abandoned one does.
  *   2. Process parks — a turn that ends only to await a background-process
  *      exit notification (babysit_run inside the subagent, or the legacy
- *      `process` tool) also emits `agent_end`, but pi resumes on its own. We
- *      detect that (last message is a parked toolResult, same rule the parent
+ *      `process` tool) also settles the agent, but pi resumes on its own. We
+ *      detect a parked toolResult anywhere in that run (same rule the parent
  *      uses) and DON'T schedule a reap, so a subagent waiting on a long
  *      build/test is never false-killed.
  *
@@ -36,22 +36,25 @@ function parseDurMs(s: string | undefined): number | null {
 	return n * (u === "ms" ? 1 : u === "s" ? 1000 : u === "m" ? 60_000 : 3_600_000);
 }
 
-// Same parked-turn rule as the parent (see index.ts isParkedToolResult):
-// a babysit_run process start stamps NOTIFY_MARKER into its tool result; that
-// as the LAST message means "parked awaiting the exit notification".
+// Same parked-turn rule as the parent: scan the run because models sometimes
+// add an assistant note after the marker-bearing tool result.
 function isParked(
-	last: { role?: string; toolName?: string; content?: unknown } | undefined,
+	messages: { role?: string; toolName?: string; content?: unknown }[] | undefined,
 ): boolean {
-	if (!last || last.role !== "toolResult") return false;
-	if (last.toolName === "process") return true; // legacy pi-processes
-	if (last.toolName !== "babysit_run") return false;
-	try {
-		const s = JSON.stringify(last.content ?? null);
-		if (s === "null") return true; // unsure — never reap a possible build wait
-		return s.includes(NOTIFY_MARKER);
-	} catch {
-		return true;
+	if (!messages) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "toolResult") continue;
+		if (message.toolName === "process") return true; // legacy pi-processes
+		if (message.toolName !== "babysit_run") continue;
+		try {
+			const serialized = JSON.stringify(message.content ?? null);
+			if (serialized === "null" || serialized.includes(NOTIFY_MARKER)) return true;
+		} catch {
+			return true;
+		}
 	}
+	return false;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -61,6 +64,7 @@ export default function (pi: ExtensionAPI) {
 	if (graceMs == null) return; // reaping disabled
 
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let lastEndWasParked = false;
 	const cancel = () => {
 		if (timer) {
 			clearTimeout(timer);
@@ -71,22 +75,25 @@ export default function (pi: ExtensionAPI) {
 	// A new task/turn is starting — the subagent is wanted again. Stand down.
 	pi.on("before_agent_start", () => {
 		cancel();
+		lastEndWasParked = false;
 	});
 
 	pi.on("agent_end", (event) => {
-		cancel(); // supersede any earlier schedule with this end's decision
-
-		const msgs = (
+		const messages = (
 			event as { messages?: { role?: string; toolName?: string; content?: unknown }[] }
 		).messages;
-		if (isParked(msgs?.[msgs.length - 1])) return;
+		lastEndWasParked = isParked(messages);
+	});
 
+	// agent_end can precede automatic retries, compaction retries, and queued
+	// continuations. Start the grace timer only once Pi is truly settled.
+	pi.on("agent_settled", (_event, ctx) => {
+		cancel();
+		if (lastEndWasParked) return;
 		timer = setTimeout(() => {
-			// Clean exit: babysit sees the child exit and marks the session done,
-			// so it drops out of the session list/widget instead of idling.
-			process.exit(0);
+			// Graceful shutdown emits session_shutdown for every loaded extension.
+			ctx.shutdown();
 		}, graceMs);
-		// Don't let this timer keep the event loop alive on its own.
 		timer.unref?.();
 	});
 }

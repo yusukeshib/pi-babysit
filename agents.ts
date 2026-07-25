@@ -56,20 +56,34 @@ function loadAgentsFromDir(
 			continue;
 		}
 
-		const { frontmatter, body } =
-			parseFrontmatter<Record<string, string>>(content);
-		if (!frontmatter.name || !frontmatter.description) continue;
+		let parsed: ReturnType<typeof parseFrontmatter<Record<string, unknown>>>;
+		try {
+			parsed = parseFrontmatter<Record<string, unknown>>(content);
+		} catch {
+			// One malformed definition must not prevent every other named agent
+			// from being discovered.
+			continue;
+		}
+		const { frontmatter, body } = parsed;
+		if (
+			typeof frontmatter.name !== "string" ||
+			typeof frontmatter.description !== "string"
+		) {
+			continue;
+		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t) => t.trim())
-			.filter(Boolean);
+		const tools = Array.isArray(frontmatter.tools)
+			? frontmatter.tools.filter((tool): tool is string => typeof tool === "string")
+			: typeof frontmatter.tools === "string"
+				? frontmatter.tools.split(",")
+				: [];
+		const normalizedTools = tools.map((tool) => tool.trim()).filter(Boolean);
 
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			tools: normalizedTools.length > 0 ? normalizedTools : undefined,
+			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			systemPrompt: body,
 			source,
 			filePath,
