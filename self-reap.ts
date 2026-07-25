@@ -23,10 +23,8 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Keep in sync with NOTIFY_MARKER in index.ts (not imported: this file is
-// loaded standalone into the subagent process via --extension).
-const NOTIFY_MARKER = "[notify-on-exit]";
-
+// Loaded standalone into the subagent process via --extension, so the parked
+// result-shape check below intentionally mirrors index.ts without importing it.
 function parseDurMs(s: string | undefined): number | null {
 	if (!s || s === "none" || s === "off" || s === "0") return null;
 	const m = /^(\d+)(ms|s|m|h)?$/.exec(s.trim());
@@ -38,8 +36,15 @@ function parseDurMs(s: string | undefined): number | null {
 
 // Same parked-turn rule as the parent: scan the run because models sometimes
 // add an assistant note after the marker-bearing tool result.
-function isParked(
-	messages: { role?: string; toolName?: string; content?: unknown }[] | undefined,
+export function isParked(
+	messages:
+		| {
+				role?: string;
+				toolName?: string;
+				content?: unknown;
+				details?: { kind?: string; status?: string };
+			}[]
+		| undefined,
 ): boolean {
 	if (!messages) return false;
 	for (let index = messages.length - 1; index >= 0; index--) {
@@ -47,12 +52,20 @@ function isParked(
 		if (message?.role !== "toolResult") continue;
 		if (message.toolName === "process") return true; // legacy pi-processes
 		if (message.toolName !== "babysit_run") continue;
-		try {
-			const serialized = JSON.stringify(message.content ?? null);
-			if (serialized === "null" || serialized.includes(NOTIFY_MARKER)) return true;
-		} catch {
+		if (message.details?.kind === "process" && message.details.status === "started") {
 			return true;
 		}
+		const text = Array.isArray(message.content)
+			? message.content
+					.filter((part): part is { type: "text"; text: string } =>
+						Boolean(part && typeof part === "object" && part.type === "text" && typeof part.text === "string"),
+					)
+					.map((part) => part.text)
+					.join("")
+			: typeof message.content === "string"
+				? message.content
+				: "";
+		if (/^Process started \(id: [^)]+\)\. \[notify-on-exit\]\nLog: /.test(text)) return true;
 	}
 	return false;
 }

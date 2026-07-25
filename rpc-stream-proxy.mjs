@@ -7,15 +7,45 @@
  * are useful only while streaming; `message_end` is the authoritative final
  * message. Persisting every snapshot makes babysit logs grow quadratically.
  *
- * This proxy forwards stdin byte-for-byte and compacts only `message_update`
- * lines on stdout. All final, tool, lifecycle, response, and error events pass
- * through byte-for-byte.
+ * This proxy forwards stdin byte-for-byte. `message_update` snapshots are
+ * always compacted. In opt-in `compact` log mode, redundant payloads on
+ * lifecycle/tool events are also removed while authoritative `message_end`,
+ * response, and error events remain intact. Set PI_BABYSIT_RPC_LOG_MODE=standard
+ * to retain the legacy lifecycle payloads.
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL } from "node:url";
 
-export function compactRpcLine(line) {
+function isParkedMessages(messages) {
+	if (!Array.isArray(messages)) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "toolResult") continue;
+		if (message.toolName === "process") return true;
+		if (message.toolName !== "babysit_run") continue;
+		if (message.details?.kind === "process" && message.details.status === "started") {
+			return true;
+		}
+		const text = Array.isArray(message.content)
+			? message.content
+					.filter((part) => part?.type === "text" && typeof part.text === "string")
+					.map((part) => part.text)
+					.join("")
+			: typeof message.content === "string"
+				? message.content
+				: "";
+		if (/^Process started \(id: [^)]+\)\. \[notify-on-exit\]\nLog: /.test(text)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+export function compactRpcLine(
+	line,
+	mode = process.env.PI_BABYSIT_RPC_LOG_MODE ?? "standard",
+) {
 	if (!line.trimStart().startsWith("{")) return line;
 
 	let event;
@@ -24,14 +54,44 @@ export function compactRpcLine(line) {
 	} catch {
 		return line;
 	}
-	if (event?.type !== "message_update") return line;
 
-	const { message: _cumulativeMessage, assistantMessageEvent, ...rest } = event;
-	if (!assistantMessageEvent || typeof assistantMessageEvent !== "object") {
-		return JSON.stringify(rest);
+	if (event?.type === "message_update") {
+		const { message: _cumulativeMessage, assistantMessageEvent, ...rest } = event;
+		if (!assistantMessageEvent || typeof assistantMessageEvent !== "object") {
+			return JSON.stringify(rest);
+		}
+		const { partial: _cumulativePartial, ...deltaEvent } = assistantMessageEvent;
+		return JSON.stringify({ ...rest, assistantMessageEvent: deltaEvent });
 	}
-	const { partial: _cumulativePartial, ...deltaEvent } = assistantMessageEvent;
-	return JSON.stringify({ ...rest, assistantMessageEvent: deltaEvent });
+	if (mode !== "compact") return line;
+
+	switch (event?.type) {
+		case "message_start": {
+			const { message, ...rest } = event;
+			return JSON.stringify({
+				...rest,
+				message:
+					message && typeof message === "object"
+						? { role: message.role, toolName: message.toolName, toolCallId: message.toolCallId }
+						: message,
+			});
+		}
+		case "turn_end": {
+			const { message: _message, toolResults: _toolResults, ...rest } = event;
+			return JSON.stringify(rest);
+		}
+		case "agent_end": {
+			const { messages, ...rest } = event;
+			return JSON.stringify({ ...rest, piBabysitParked: isParkedMessages(messages) });
+		}
+		case "tool_execution_end": {
+			if (event.isError) return line;
+			const { result: _result, ...rest } = event;
+			return JSON.stringify(rest);
+		}
+		default:
+			return line;
+	}
 }
 
 function transformRpcOutput(input, output) {
