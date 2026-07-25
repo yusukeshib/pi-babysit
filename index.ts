@@ -148,16 +148,32 @@ const VIEW_CMD =
 // Appended to every subagent's system prompt. The subagent is a long-lived
 // headless `pi --mode rpc` worker: turns can end and resume, so babysit_run
 // (process kind) works normally inside it. It just cannot talk to a human.
-const SUBAGENT_GUIDANCE = [
-	"You are a headless background worker driven over pi's RPC protocol.",
-	"Work autonomously: you cannot ask the user questions, so state assumptions",
-	"in your final answer instead. Long commands may be run synchronously via",
-	"bash (blocking is fine) or via babysit_run (it works here). When your",
-	"task is complete, produce a final answer message summarizing the outcome —",
-	"your controller reads it from the event stream.",
-].join(" ");
+export function subagentGuidance(
+	depth: number,
+	maxDepth: number,
+	directBashAvailable: boolean,
+	babysitRunAvailable = true,
+): string {
+	const shellGuidance = directBashAvailable
+		? "Direct bash is available, and babysit_run can supervise longer commands."
+		: babysitRunAvailable
+			? "Direct bash is unavailable; run shell commands with babysit_run { command }."
+			: "No shell execution tool is available in this task's tool allowlist; do not attempt shell commands.";
+	const nestingGuidance = depth >= maxDepth
+		? `You are at the inherited subagent depth limit (${depth}/${maxDepth}); do not attempt to spawn another subagent.`
+		: `Your inherited subagent depth is ${depth}/${maxDepth}; child subagents may not exceed maxDepth ${maxDepth}.`;
+	return [
+		"You are a headless background worker driven over pi's RPC protocol.",
+		"Work autonomously: you cannot ask the user questions, so state assumptions",
+		"in your final answer instead.",
+		shellGuidance,
+		nestingGuidance,
+		"When your task is complete, produce a final answer message summarizing the outcome —",
+		"your controller reads it from the event stream.",
+	].join(" ");
+}
 const POLL_MS = 2500;
-const QUICK_COMMAND_GRACE = process.env.PI_BABYSIT_QUICK_GRACE ?? "1s";
+const QUICK_COMMAND_GRACE = process.env.PI_BABYSIT_QUICK_GRACE ?? "2s";
 const KILL_CONFIRM_TIMEOUT = "4s";
 
 interface BsSession {
@@ -1587,13 +1603,16 @@ function taskProgressOf(id: string): { progress: Progress; offset: number } {
 // ---------------------------------------------------------------------------
 
 // Friendly name → unique babysit session id (babysit ids allow [\w.-]).
-async function uniqueSessionId(name: string): Promise<string> {
+const reservedSessionIds = new Set<string>();
+
+async function reserveUniqueSessionId(name: string): Promise<string> {
 	const base = name.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "proc";
 	const taken = new Set((await listSessions()).sessions.map((s) => s.id));
-	if (!taken.has(base)) return base;
-	for (let i = 2; ; i++) {
-		if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
-	}
+	for (const id of reservedSessionIds) taken.add(id);
+	let id = base;
+	for (let i = 2; taken.has(id); i++) id = `${base}-${i}`;
+	reservedSessionIds.add(id);
+	return id;
 }
 
 interface ProcOpts {
@@ -1612,10 +1631,16 @@ async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: s
 	if (opts.timeout && opts.timeout !== "none") bsArgs.push("--timeout", opts.timeout);
 	if (opts.idleTimeout && opts.idleTimeout !== "none")
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
-	if (opts.name) bsArgs.push("--id", await uniqueSessionId(opts.name));
+	const reservedId = opts.name ? await reserveUniqueSessionId(opts.name) : undefined;
+	if (reservedId) bsArgs.push("--id", reservedId);
 	bsArgs.push("--", SHELL, "-c", opts.command);
 
-	const r = await bs(bsArgs, { cwd: opts.cwd });
+	let r: Awaited<ReturnType<typeof bs>>;
+	try {
+		r = await bs(bsArgs, { cwd: opts.cwd });
+	} finally {
+		if (reservedId) reservedSessionIds.delete(reservedId);
+	}
 	if (r.code !== 0) {
 		return {
 			error:
@@ -1687,6 +1712,7 @@ function discardDelivery(delivery: DeliverableMessage): void {
 }
 
 interface SubagentOpts {
+	name?: string;
 	agent?: AgentConfig;
 	task: string;
 	model?: string;
@@ -1720,7 +1746,15 @@ async function spawnSubagent(
 		};
 	}
 	if (tools && tools.length > 0) piArgs.push("--tools", tools.join(","));
-	piArgs.push("--append-system-prompt", SUBAGENT_GUIDANCE);
+	piArgs.push(
+		"--append-system-prompt",
+		subagentGuidance(
+			opts.depth,
+			opts.maxDepth,
+			isAllowedDirectBash("") && (!tools || tools.includes("bash")),
+			!tools || tools.includes("babysit_run"),
+		),
+	);
 	let promptTempFile: string | undefined;
 	if (opts.agent?.systemPrompt?.trim()) {
 		promptTempFile = writePromptTempFile(opts.agent.name, opts.agent.systemPrompt);
@@ -1758,6 +1792,8 @@ async function spawnSubagent(
 	if (opts.idleTimeout && opts.idleTimeout !== "none") {
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
 	}
+	const reservedId = opts.name ? await reserveUniqueSessionId(opts.name) : undefined;
+	if (reservedId) bsArgs.push("--id", reservedId);
 	bsArgs.push(
 		"--",
 		process.execPath,
@@ -1767,13 +1803,18 @@ async function spawnSubagent(
 		...piArgs,
 	);
 
-	const r = await bs(bsArgs, {
-		cwd: opts.cwd,
-		env: {
-			[SUBAGENT_DEPTH_ENV]: String(opts.depth),
-			[SUBAGENT_MAX_DEPTH_ENV]: String(opts.maxDepth),
-		},
-	});
+	let r: Awaited<ReturnType<typeof bs>>;
+	try {
+		r = await bs(bsArgs, {
+			cwd: opts.cwd,
+			env: {
+				[SUBAGENT_DEPTH_ENV]: String(opts.depth),
+				[SUBAGENT_MAX_DEPTH_ENV]: String(opts.maxDepth),
+			},
+		});
+	} finally {
+		if (reservedId) reservedSessionIds.delete(reservedId);
+	}
 	if (r.code !== 0) {
 		cleanupPromptTemp();
 		return { error: r.stderr || r.stdout || `babysit run failed (exit ${r.code}, no output) — check that \`${BABYSIT_BIN}\` works and ${ROOT} is writable` };
@@ -1792,6 +1833,7 @@ async function spawnSubagent(
 	// The success path overwrites this with the full task meta.
 	writeMeta(id, {
 		kind: "subagent",
+		name: opts.name ?? id,
 		task: opts.task,
 		notified: true,
 		depth: opts.depth,
@@ -1851,6 +1893,7 @@ async function spawnSubagent(
 
 	writeMeta(id, {
 		kind: "subagent",
+		name: opts.name ?? id,
 		task: opts.task,
 		promptOffset: resp.offset,
 		model: resolvedModel,
@@ -2136,8 +2179,14 @@ async function waitForExit(
 
 	if (expectPattern) {
 		const e = await bs(["expect", "-s", id, "--timeout", t, expectPattern], { signal });
-		if (signal?.aborted || e.code === 130) {
+		if (signal?.aborted) {
 			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
+		}
+		if (e.code === 130) {
+			const interruptedStatus = await statusOf(id);
+			if (interruptedStatus?.state === "running") {
+				return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
+			}
 		}
 		if (e.code === 0) {
 			return {
@@ -2164,9 +2213,16 @@ async function waitForExit(
 		// another wait that is still pending.
 		updateWaitReservation(id, "reserve");
 		const w = await bs(["wait", "-s", id, "--timeout", t], { signal });
-		if (signal?.aborted || w.code === 130) {
+		if (signal?.aborted) {
 			updateWaitReservation(id, "abandon");
 			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
+		}
+		if (w.code === 130) {
+			const interruptedStatus = await statusOf(id);
+			if (interruptedStatus?.state === "running") {
+				updateWaitReservation(id, "abandon");
+				return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
+			}
 		}
 		if (w.code === 124) {
 			// 124 is ambiguous (timeout vs child exiting 124) — disambiguate.
@@ -2256,6 +2312,44 @@ export function isAllowedDirectBash(_command: string): boolean {
 
 export function activeToolsWithoutDirectBash(activeTools: string[], allowDirectBash: boolean): string[] {
 	return allowDirectBash ? activeTools : activeTools.filter((name) => name !== "bash");
+}
+
+export function automaticNotificationGroup(entry: unknown): string | undefined {
+	const candidate = entry as {
+		id?: unknown;
+		type?: unknown;
+		message?: { role?: unknown; content?: unknown };
+	};
+	if (
+		candidate?.type !== "message" ||
+		candidate.message?.role !== "assistant" ||
+		typeof candidate.id !== "string" ||
+		!Array.isArray(candidate.message.content)
+	) {
+		return undefined;
+	}
+	const group = `turn-${candidate.id}`;
+	const runs = candidate.message.content.filter((part) => {
+		if (!part || typeof part !== "object") return false;
+		const call = part as {
+			type?: unknown;
+			name?: unknown;
+			arguments?: Record<string, unknown>;
+		};
+		if (call.type !== "toolCall" || call.name !== "babysit_run") return false;
+		const args = call.arguments ?? {};
+		const existing = typeof args.notificationGroup === "string"
+			? args.notificationGroup.trim()
+			: "";
+		return (
+			typeof args.command === "string" &&
+			args.command.length > 0 &&
+			args.profile !== "subagent" &&
+			args.foreground !== true &&
+			(existing === "" || existing === group)
+		);
+	});
+	return runs.length >= 2 ? group : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -2688,7 +2782,25 @@ export default function (pi: ExtensionAPI) {
 		rootLeasePath = undefined;
 	});
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName === "babysit_run") {
+			const input = event.input as {
+				command?: unknown;
+				profile?: unknown;
+				foreground?: unknown;
+				notificationGroup?: unknown;
+			};
+			if (
+				typeof input.command === "string" &&
+				input.profile !== "subagent" &&
+				input.foreground !== true &&
+				(typeof input.notificationGroup !== "string" || input.notificationGroup.trim() === "")
+			) {
+				const group = automaticNotificationGroup(ctx.sessionManager.getLeafEntry());
+				if (group) input.notificationGroup = group;
+			}
+			return;
+		}
 		if (event.toolName !== "bash") return;
 		const command = String((event.input as { command?: unknown }).command ?? "");
 		if (backgroundsItself(command)) {
@@ -2714,10 +2826,12 @@ export default function (pi: ExtensionAPI) {
 		name: "babysit_run",
 		label: "Babysit: run",
 		description:
-			"Run any shell command in a supervised babysit session. Commands that finish within a short " +
-			"grace period return completion metadata immediately; longer commands continue in the background " +
-			"and trigger an automatic notification on exit. Complete output is returned inline only when it is " +
-			"small; larger output stays in the log path for bounded inspection with babysit_check. " +
+			"Run any shell command in a supervised babysit session. Set `foreground: true` when the next step " +
+			"needs the exit result in this tool call. Otherwise commands that finish within a short grace period " +
+			"return completion metadata immediately; longer commands continue in the background and trigger an " +
+			"automatic notification on exit. Sibling background runs in one assistant message are grouped " +
+			"automatically. Complete output is returned inline only when it is small; larger output stays " +
+			"in the log path for bounded inspection with babysit_check. " +
 			"In non-interactive mode (`pi -p`, no UI), process mode blocks until exit because there is no " +
 			"notification loop. Two modes: (1) `command` — run any shell command, including builds, tests, " +
 			"dev servers, watchers, and interactive TUIs; you can type into it with babysit_send and read " +
@@ -2730,13 +2844,15 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet:
 			"Run any shell command with context-safe captured output; quick commands return metadata, longer ones continue in background",
 		promptGuidelines: [
-			"Use babysit_run as the default for shell commands, not only long-running work. Small output is returned directly; large stdout/stderr stays out of model context in the returned log path. Give meaningful commands a clear stable `name`.",
+			"Use babysit_run as the default for shell commands, not only long-running work. Small output is returned directly; large stdout/stderr stays out of model context in the returned log path. Give every meaningful process or subagent a clear stable `name`.",
+			"Use babysit_run { command, foreground: true } when the result is required before the next step; this avoids a separate babysit_wait model turn. Do not use foreground for servers, watchers, or commands of unknown duration without a timeout.",
 			"Bundle closely related tiny observations into one babysit_run command when that reduces tool turns without obscuring lifecycle or failure handling.",
 			"Inspect a babysit log with babysit_check { id, lines, pattern? }; never read or cat a potentially large log file in full. Prefer a targeted `pattern` search over returning a broad tail.",
 			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
 			"If a babysit worker is killed externally, babysit_run reports it as worker-dead rather than hanging. Set retryOnWorkerDeath: true only for safe, idempotent commands; it retries at most once and may otherwise duplicate side effects.",
 			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
 			"Delegate self-contained tasks (codebase recon, a parallelizable subtask, work that would pollute your context) with babysit_run { profile: \"subagent\", task }. Launch several for independent subtasks; they run concurrently.",
+			"Set at least one subagent budget (`maxCost`, `maxTurns`, `maxToolCalls`, or `maxUsageTokens`) for bounded recon and review tasks. Omit budgets only for intentionally open-ended work; the absolute timeout remains a separate safety limit.",
 			"Subagents cannot create further subagents by default (maximum depth 1). Only the top-level caller can explicitly opt in by setting maxDepth when it creates the first worker; nested workers inherit that limit and cannot raise it.",
 			"After spawning subagents, do not idle-wait and do not end your turn to wait for them: keep making progress, then call babysit_wait (ids + mode any/all) when you need their results. Steer or send follow-up tasks with babysit_send; kill runaways with babysit_kill.",
 		],
@@ -2748,7 +2864,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			name: Type.Optional(
 				Type.String({
-					description: "Friendly stable name for a process (becomes the session id), e.g. 'cargo-build'.",
+					description: "Friendly stable name for a process or subagent (becomes the session id), e.g. 'cargo-build' or 'review-api'.",
 				}),
 			),
 			profile: Type.Optional(
@@ -2814,10 +2930,16 @@ export default function (pi: ExtensionAPI) {
 						"Process mode: run in a PTY (default true; enables interactive input/screen). false = plain pipes for cleaner line-oriented logs.",
 				}),
 			),
+			foreground: Type.Optional(
+				Type.Boolean({
+					description:
+						"Process mode: wait for exit and return the result in this tool call. Use when the next step needs the result; avoid for servers/watchers unless bounded by timeout.",
+				}),
+			),
 			notificationGroup: Type.Optional(
 				Type.String({
 					description:
-						"Process mode: defer automatic completion until every running process with this group has stopped, then send one batched notification.",
+						"Process mode: defer automatic completion until every running process with this group has stopped, then send one batched notification. Sibling background runs are auto-grouped when omitted.",
 				}),
 			),
 			continueAfterStart: Type.Optional(
@@ -2877,6 +2999,20 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			if (isSubagent && params.foreground) {
+				return {
+					content: [{ type: "text", text: "`foreground` is available only in process mode; use babysit_wait for subagent task completion." }],
+					isError: true,
+					details: {},
+				};
+			}
+			if (!isSubagent && params.foreground && params.continueAfterStart) {
+				return {
+					content: [{ type: "text", text: "`foreground` and `continueAfterStart` are mutually exclusive." }],
+					isError: true,
+					details: {},
+				};
+			}
 
 			// Compute nesting only for subagent mode. Ordinary command processes remain
 			// available even when the hosting agent is at its subagent depth limit.
@@ -2913,24 +3049,27 @@ export default function (pi: ExtensionAPI) {
 				pollNeeded = true;
 				await refreshWidget(ctx);
 
-				// One-shot / non-interactive mode (e.g. `pi -p`): there is no live
-				// event loop to deliver the exit notification, and ending the turn
-				// would exit pi entirely — orphaning the babysat process and losing
-				// the session (the agent "settles" the moment it is told the turn will
-				// stop). So block inline like a normal command and return the full
-				// outcome in THIS turn. The process still runs under babysit (logged,
-				// killable), we just wait for it here instead of fire-and-forget.
-				if (!ctx.hasUI) {
-					let outcome = await waitForExit(res.id, parseDurMs(params.timeout), _signal);
+				// One-shot / non-interactive mode has no event loop that can deliver an
+				// exit notification. `foreground: true` provides the same single-tool-call
+				// result in interactive mode, avoiding a separate babysit_wait model turn.
+				// The command remains supervised, logged, killable, and subject to its
+				// babysit timeout in either case.
+				if (!ctx.hasUI || params.foreground) {
+					// The babysit supervisor owns the absolute command timeout. Waiting with
+					// the same deadline here races its terminal-state write and can return a
+					// false "still running" result at the boundary, so wait for the
+					// supervisor's definitive exit instead.
+					let outcome = await waitForExit(res.id, null, _signal);
 					let retried = false;
 					if (params.retryOnWorkerDeath && outcome.status?.state === "dead" && outcome.status.exit_code == null) {
 						const retry = await spawnProcess(spawnOpts);
 						if (!("error" in retry)) {
 							res = retry;
 							retried = true;
-							outcome = await waitForExit(res.id, parseDurMs(params.timeout), _signal);
+							outcome = await waitForExit(res.id, null, _signal);
 						}
 					}
+					if (ctx.hasUI) await refreshWidget(ctx);
 					return {
 						content: [{ type: "text", text: `${retried ? "Retried once after external worker death.\n" : ""}${outcome.text}` }],
 						isError: !outcome.ok,
@@ -2946,9 +3085,9 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Keep ordinary quick commands ergonomic. Give the process a short grace
-				// period; if it exits, return only lifecycle metadata + log path now.
-				// A timeout means it is genuinely background work and follows the normal
-				// parked-turn / automatic-notification contract below.
+				// period; if it exits, return lifecycle metadata + log path immediately.
+				// A process still running after the grace follows the parked-turn /
+				// automatic-notification contract below.
 				await bs(["wait", "-s", res.id, "--timeout", QUICK_COMMAND_GRACE], { signal: _signal });
 				let quickStatus = await statusOf(res.id);
 				let retried = false;
@@ -3036,6 +3175,7 @@ export default function (pi: ExtensionAPI) {
 			// The branch above guarantees a successful plan in subagent mode.
 			const subagentNesting = nesting as Extract<SubagentSpawnPlan, { allowed: true }>;
 			const res = await spawnSubagent({
+				name: params.name,
 				agent,
 				task: params.task as string,
 				model: params.model,
@@ -3081,6 +3221,7 @@ export default function (pi: ExtensionAPI) {
 				details: {
 					id: res.id,
 					kind: "subagent",
+					name: params.name ?? res.id,
 					agent: agent?.name,
 					model: res.model,
 					task: params.task,
@@ -3140,14 +3281,25 @@ export default function (pi: ExtensionAPI) {
 		name: "babysit_check",
 		label: "Babysit: check",
 		description:
-			"Inspect babysit session(s). Without an id: lists all sessions (processes + subagents). " +
-			"With an id: a process shows state + recent output, searches its log with `pattern`, " +
+			"Inspect babysit session(s). Without an id: lists running sessions by default; use `state: \"all\"` " +
+			"for history, or filter by terminal state/kind. With an id: a process shows state + recent " +
+			"output, searches its log with `pattern`, " +
 			"or captures the rendered screen with `screen: true`; a subagent shows live progress " +
 			"(or raw log matches with `pattern`). Results are bounded by `lines` and clipped. " +
 			"Do NOT poll this while merely waiting for a process to end — the exit notification is automatic.",
 		promptSnippet: "Check status/progress of babysit sessions (processes and subagents)",
 		parameters: Type.Object({
-			id: Type.Optional(Type.String({ description: "Session id. Omit to list all sessions." })),
+			id: Type.Optional(Type.String({ description: "Session id. Omit to list sessions." })),
+			state: Type.Optional(
+				StringEnum(["running", "terminal", "all"] as const, {
+					description: "List mode only: state filter. Defaults to running; terminal means any non-running state.",
+				}),
+			),
+			kind: Type.Optional(
+				StringEnum(["process", "subagent", "all"] as const, {
+					description: "List mode only: session kind filter. Defaults to all.",
+				}),
+			),
 			tools: Type.Optional(
 				Type.Number({ description: "Subagent: how many recent tool calls to show (default 8, max 50)." }),
 			),
@@ -3179,9 +3331,38 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				if (sessions.length === 0) {
-					return { content: [{ type: "text", text: "No babysit sessions." }], details: {} };
+					return { content: [{ type: "text", text: "No babysit sessions." }], details: { sessions: [] } };
 				}
-				const lines = sessions.map((s) => {
+				const stateFilter = params.state ?? "running";
+				const kindFilter = params.kind ?? "all";
+				const stateMatches = (session: BsSession) => stateFilter === "all"
+					? true
+					: stateFilter === "running"
+						? session.state === "running"
+						: session.state !== "running";
+				const kindOfSession = (session: BsSession) => readMeta(session.id)?.kind ?? "process";
+				const selected = sessions.filter((session) =>
+					stateMatches(session) && (kindFilter === "all" || kindOfSession(session) === kindFilter),
+				);
+				const reveal: string[] = [];
+				if (stateFilter !== "all" && sessions.some((session) => !stateMatches(session))) {
+					reveal.push('state: "all"');
+				}
+				if (kindFilter !== "all" && sessions.some((session) => kindOfSession(session) !== kindFilter)) {
+					reveal.push('kind: "all"');
+				}
+				const revealHint = reveal.length > 0 ? `; use ${reveal.join(" and ")} to widen the list` : "";
+				if (selected.length === 0) {
+					const hidden = sessions.length;
+					return {
+						content: [{
+							type: "text",
+							text: `No ${stateFilter}${kindFilter === "all" ? "" : ` ${kindFilter}`} babysit sessions.${hidden > 0 ? ` ${hidden} session(s) hidden${revealHint}.` : ""}`,
+						}],
+						details: { sessions: [], total: sessions.length, hidden, state: stateFilter, kind: kindFilter },
+					};
+				}
+				const lines = selected.map((s) => {
 					const meta = readMeta(s.id);
 					const kind = meta?.kind ?? "process";
 					const flag = s.note ? ` ⚑ ${s.note}` : "";
@@ -3194,7 +3375,12 @@ export default function (pi: ExtensionAPI) {
 					const preview = what.length > 60 ? `${what.slice(0, 57)}…` : what;
 					return `${s.id}  [${kind}] ${s.state}${ec}${depth}${flag}${preview ? `  — ${preview}` : ""}`;
 				});
-				return { content: [{ type: "text", text: clip(lines.join("\n")) }], details: { sessions } };
+				const hidden = sessions.length - selected.length;
+				const suffix = hidden > 0 ? `\n… ${hidden} session(s) hidden${revealHint}.` : "";
+				return {
+					content: [{ type: "text", text: clip(lines.join("\n") + suffix) }],
+					details: { sessions: selected, total: sessions.length, hidden, state: stateFilter, kind: kindFilter },
+				};
 			}
 
 			const st = await statusOf(params.id);

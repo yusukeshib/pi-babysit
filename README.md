@@ -56,8 +56,8 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`) or start a subagent (`profile: "subagent"`, `task`, optional `agent`/`model`/`tools`/`maxDepth` and `maxCost`/`maxTurns`/`maxToolCalls`/`maxUsageTokens` budgets). `maxDepth` defaults to 1 and can only be set by the top-level caller. Quick commands return inline; longer ones continue in the background |
-| `babysit_check` | List all sessions, inspect one, tail its bounded recent output, or search its raw log with `pattern`; `screen: true` captures TUIs and subagents otherwise show structured live progress |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` when the next step needs the result in the same tool call, avoiding a separate `babysit_wait` turn. Or start a named subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and `maxCost`/`maxTurns`/`maxToolCalls`/`maxUsageTokens` budgets). `maxDepth` defaults to 1 and can only be set by the top-level caller. Quick commands return inline; longer ones continue in the background |
+| `babysit_check` | Without an id, list running sessions by default (`state: "all"` includes history; `state`/`kind` filters are available). With an id, inspect one session, tail bounded recent output, or search its raw log with `pattern`; `screen: true` captures TUIs and subagents otherwise show structured live progress |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when idle (`mode: auto/steer/task`) |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: up to 32 unique `ids` + `mode: "any"\|"all"` |
 | `babysit_kill` | Terminate a session, verify terminal state, then suppress the exit notification |
@@ -106,13 +106,13 @@ a raw RPC JSON tail.
 
 Subagent logs compact Pi's streaming `message_update` events before they are
 recorded. Pi repeats the complete growing assistant message and partial snapshot
-on every token; pi-babysit retains only the incremental delta. The opt-in
-`compact` RPC log mode also removes duplicate payloads from `message_start`,
+on every token; pi-babysit retains only the incremental delta. Compact RPC
+logging is the default and also removes duplicate payloads from `message_start`,
 `turn_end`, successful `tool_execution_end`, and `agent_end`, while preserving
 authoritative `message_end`, failures, responses, and errors. Parked-process
 state is materialized as a small boolean so completion detection is unchanged.
-Set `PI_BABYSIT_RPC_LOG_MODE=standard` for the legacy lifecycle payloads. Live
-`/babysit` and attach views render either format.
+Set `PI_BABYSIT_RPC_LOG_MODE=standard` only when legacy lifecycle payloads are
+needed for debugging. Live `/babysit` and attach views render either format.
 
 All shell commands, including `pwd` and Git, go through `babysit_run`. Bundle
 closely related tiny observations when doing so safely reduces tool turns.
@@ -134,9 +134,11 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   `pi.sendMessage(…, { triggerTurn: true, deliverAs: "steer" })` containing every
   deliverable exit observed in that poll (deduped via `meta/<id>.json`). Waiting
   for idleness prevents an immediately-following `babysit_wait` from racing the
-  poller and receiving a duplicate completion. Processes with the same
-  `notificationGroup` wait for every currently running group member to stop and
-  then share one notification even when their exits span multiple polls.
+  poller and receiving a duplicate completion. Background process calls emitted
+  together in one assistant message automatically share a notification group;
+  an explicit `notificationGroup` overrides this. Group members wait for every
+  currently running member to stop and then share one notification even when
+  their exits span multiple polls.
   `babysit_kill` and an exit already reported by `babysit_wait` suppress the
   notification.
 - **Subagent**: `babysit_wait` blocks on `babysit expect '"type":"agent_settled"'`.
@@ -152,8 +154,10 @@ because blindly rerunning an arbitrary command can duplicate side effects.
 
 Subagents load `self-reap.ts`, which exits an idle finished subagent after a
 grace window (`PI_BABYSIT_REAP_AFTER`, default 120s) using the same parked-turn
-rule, so a subagent waiting on a long build is never false-killed. Optional task
-budgets are checked by the parent poller. On the first exceeded limit the worker
+rule, so a subagent waiting on a long build is never false-killed. Give bounded
+recon/review tasks at least one cost, turn, tool-call, or token budget; omit
+budgets only for intentionally open-ended work. Optional task budgets are
+checked by the parent poller. On the first exceeded limit the worker
 is steered to stop using tools and return its best answer; if it remains active
 after `PI_BABYSIT_BUDGET_GRACE`, termination is verified before the task is
 marked budget-killed. Usage shown by check/wait is cumulative for the task.
@@ -166,9 +170,10 @@ marked budget-killed. Usage shown by check/wait is cumulative for the task.
 | `PI_BABYSIT_BIN` | `pi` | agent binary for subagents |
 | `PI_BABYSIT_CLI` | `babysit` | babysit binary |
 | `PI_BABYSIT_VIEW_CMD` | bundled `format-stream.mjs` | live-attach pretty printer for subagent JSONL (`""` disables) |
+| `PI_BABYSIT_QUICK_GRACE` | `2s` | interactive process grace before a still-running command is returned as background work; use `foreground: true` to wait explicitly |
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
 | `PI_BABYSIT_BUDGET_GRACE` | `30s` | grace after a subagent budget is exceeded before verified termination |
-| `PI_BABYSIT_RPC_LOG_MODE` | `standard` | `compact` removes duplicate RPC lifecycle payloads; `standard` retains legacy payloads |
+| `PI_BABYSIT_RPC_LOG_MODE` | `compact` | `compact` removes duplicate RPC lifecycle payloads; `standard` opts into legacy payloads |
 | `PI_BABYSIT_RETENTION_DAYS` | unset | when set to a positive number, remove safe terminal roots older than this at session startup |
 | `PI_BABYSIT_TAIL_MAX_BYTES` | `8000` | cap for explicit log tails/screens returned by `babysit_check` |
 | `PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES` | `8000` | cap for complete process output and aggregate multi-wait results |
