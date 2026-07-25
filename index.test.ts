@@ -17,6 +17,7 @@ import { isParked as selfReaperIsParked } from "./self-reap.ts";
 import { discoverAgents } from "./agents.ts";
 import extension, {
 	activeToolsWithoutDirectBash,
+	automaticNotificationGroup,
 	buildProcessCompletionMessage,
 	buildSubagentDoneResult,
 	buildSubagentExitDiagnostic,
@@ -40,6 +41,7 @@ import extension, {
 	shouldKeepPollingAfterList,
 	subagentBudgetAction,
 	subagentBudgetViolation,
+	subagentGuidance,
 	summarizeNotificationCommand,
 	transitionWaitReservation,
 	validateKillResponse,
@@ -71,6 +73,11 @@ extension({
 } as any);
 
 const ctx = { hasUI: false, cwd: process.cwd() };
+const interactiveCtx = {
+	hasUI: true,
+	cwd: process.cwd(),
+	ui: { setWidget() {} },
+};
 let sequence = 0;
 
 async function run(command: string, extras: Record<string, unknown> = {}) {
@@ -173,6 +180,16 @@ test("babysit version policy requires 0.13.0 or newer", () => {
 	expect(isSupportedBabysitVersion("babysit 0.14.0-beta.1")).toBe(true);
 	expect(isSupportedBabysitVersion("babysit 1.0.0")).toBe(true);
 	expect(isSupportedBabysitVersion("unknown")).toBe(false);
+});
+
+test("compact RPC logging is the default while standard remains an opt-out", () => {
+	const turnEnd = JSON.stringify({
+		type: "turn_end",
+		message: { role: "assistant", content: [{ type: "text", text: "large" }] },
+		toolResults: [{ content: "large" }],
+	});
+	expect(JSON.parse(compactRpcLine(turnEnd))).toEqual({ type: "turn_end" });
+	expect(compactRpcLine(turnEnd, "standard")).toBe(turnEnd);
 });
 
 test("RPC stream compaction removes only cumulative message_update snapshots", () => {
@@ -676,6 +693,21 @@ test("agent discovery accepts YAML tool arrays and skips invalid definitions", (
 	}
 });
 
+test("subagent guidance reflects shell availability and inherited depth", () => {
+	const bounded = subagentGuidance(1, 1, false);
+	expect(bounded).toContain("Direct bash is unavailable");
+	expect(bounded).toContain("depth limit (1/1)");
+	expect(bounded).toContain("do not attempt to spawn another subagent");
+
+	const nested = subagentGuidance(1, 2, true);
+	expect(nested).toContain("Direct bash is available");
+	expect(nested).toContain("depth is 1/2");
+	expect(nested).toContain("maxDepth 2");
+
+	const noShell = subagentGuidance(1, 1, false, false);
+	expect(noShell).toContain("No shell execution tool is available");
+});
+
 test("subagent nesting defaults to one level and requires top-level opt-in", () => {
 	expect(planSubagentSpawn(0, {}).allowed).toBe(false);
 	expect(
@@ -769,19 +801,52 @@ test("mode-specific notification and budget parameters reject misuse", async () 
 	);
 	expect(subagentGroup.isError).toBe(true);
 	expect(subagentGroup.content[0]?.text).toContain("process mode");
-});
 
-test("long subagent messages fail before spawn when the read tool is unavailable", async () => {
-	const result = await tools.get("babysit_run").execute(
-		"long-task-no-read",
-		{ profile: "subagent", task: "x".repeat(601), tools: ["grep"] },
+	const subagentForeground = await tools.get("babysit_run").execute(
+		"subagent-foreground",
+		{ profile: "subagent", task: "do nothing", foreground: true },
 		undefined,
 		undefined,
 		ctx,
 	);
-	const text = result.content[0]?.text ?? "";
-	expect(result.isError).toBe(true);
-	expect(text).toContain("allowlist excludes `read`");
+	expect(subagentForeground.isError).toBe(true);
+	expect(subagentForeground.content[0]?.text).toContain("process mode");
+
+	const conflictingProcessModes = await tools.get("babysit_run").execute(
+		"foreground-continue",
+		{ command: "true", foreground: true, continueAfterStart: true },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(conflictingProcessModes.isError).toBe(true);
+	expect(conflictingProcessModes.content[0]?.text).toContain("mutually exclusive");
+});
+
+test("long subagent messages fail before spawn when the read tool is unavailable", async () => {
+	const depthKey = "PI_BABYSIT_INTERNAL_SUBAGENT_DEPTH";
+	const maxDepthKey = "PI_BABYSIT_INTERNAL_SUBAGENT_MAX_DEPTH";
+	const previousDepth = process.env[depthKey];
+	const previousMaxDepth = process.env[maxDepthKey];
+	delete process.env[depthKey];
+	delete process.env[maxDepthKey];
+	try {
+		const result = await tools.get("babysit_run").execute(
+			"long-task-no-read",
+			{ profile: "subagent", task: "x".repeat(601), tools: ["grep"] },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const text = result.content[0]?.text ?? "";
+		expect(result.isError).toBe(true);
+		expect(text).toContain("allowlist excludes `read`");
+	} finally {
+		if (previousDepth === undefined) delete process.env[depthKey];
+		else process.env[depthKey] = previousDepth;
+		if (previousMaxDepth === undefined) delete process.env[maxDepthKey];
+		else process.env[maxDepthKey] = previousMaxDepth;
+	}
 });
 
 test("multi-wait rejects duplicates and excessive fan-out before spawning waits", async () => {
@@ -923,6 +988,29 @@ test("idle polling stops unless a worker or completion still needs attention", (
 	expect(shouldKeepPollingAfterList({ sessions: [], error: "temporary failure" }, metaFor)).toBe(
 		true,
 	);
+});
+
+test("parallel background runs inherit one automatic notification group", () => {
+	const entry = {
+		type: "message",
+		id: "abcd1234",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", name: "babysit_run", arguments: { command: "npm test" } },
+				{ type: "toolCall", name: "babysit_run", arguments: { command: "npm run lint" } },
+				{ type: "toolCall", name: "read", arguments: { path: "README.md" } },
+			],
+		},
+	};
+	expect(automaticNotificationGroup(entry)).toBe("turn-abcd1234");
+	(entry.message.content[0] as any).arguments.notificationGroup = "turn-abcd1234";
+	expect(automaticNotificationGroup(entry)).toBe("turn-abcd1234");
+	(entry.message.content[1] as any).arguments.foreground = true;
+	expect(automaticNotificationGroup(entry)).toBeUndefined();
+	(entry.message.content[1] as any).arguments.foreground = false;
+	(entry.message.content[1] as any).arguments.notificationGroup = "explicit";
+	expect(automaticNotificationGroup(entry)).toBeUndefined();
 });
 
 test("notification groups wait for every running member", () => {
@@ -1210,6 +1298,33 @@ test("built-in bash is removed from the active tool set unless explicitly allowe
 	await hooks.get("session_shutdown")();
 });
 
+test("tool hook applies automatic groups to sibling background runs", async () => {
+	const hook = hooks.get("tool_call");
+	const calls: Array<{
+		type: string;
+		name: string;
+		arguments: { command: string; notificationGroup?: string };
+	}> = [
+		{ type: "toolCall", name: "babysit_run", arguments: { command: "npm test" } },
+		{ type: "toolCall", name: "babysit_run", arguments: { command: "npm run lint" } },
+	];
+	const entry = {
+		type: "message",
+		id: "facefeed",
+		message: { role: "assistant", content: calls },
+	};
+	await hook(
+		{ toolName: "babysit_run", input: calls[0]!.arguments },
+		{ sessionManager: { getLeafEntry: () => entry } },
+	);
+	await hook(
+		{ toolName: "babysit_run", input: calls[1]!.arguments },
+		{ sessionManager: { getLeafEntry: () => entry } },
+	);
+	expect(calls[0]!.arguments.notificationGroup).toBe("turn-facefeed");
+	expect(calls[1]!.arguments.notificationGroup).toBe("turn-facefeed");
+});
+
 test("tool hook redirects every shell command to babysit_run if bash is re-enabled", async () => {
 	const hook = hooks.get("tool_call");
 	for (const command of ["ls -la", "git diff", "pwd", "tail -n 40 /tmp/build.log"]) {
@@ -1231,6 +1346,63 @@ test("small process output is returned with metadata and a log path", async () =
 	expect(readFileSync(result.details.logPath, "utf8")).toContain("private-output-line");
 });
 
+test("foreground process mode returns a long command result in one tool call", async () => {
+	const name = `foreground-test-${Date.now()}-${sequence++}`;
+	const started = Date.now();
+	const result = await tools.get("babysit_run").execute(
+		name,
+		{
+			name,
+			command: "sleep 2.2; printf 'foreground-done\\n'",
+			pty: false,
+			foreground: true,
+			timeout: "10s",
+		},
+		undefined,
+		undefined,
+		interactiveCtx,
+	);
+	const text = result.content[0]?.text ?? "";
+	expect(Date.now() - started).toBeGreaterThanOrEqual(2_000);
+	expect(result.isError).not.toBe(true);
+	expect(result.details.status).toBe("success");
+	expect(text).toContain("completed successfully");
+	expect(text).toContain("foreground-done");
+	expect(text).not.toContain("[notify-on-exit]");
+});
+
+test("foreground mode lets the supervisor own the absolute timeout boundary", async () => {
+	const name = `foreground-timeout-${Date.now()}-${sequence++}`;
+	const result = await tools.get("babysit_run").execute(
+		name,
+		{
+			name,
+			command: "sleep 10",
+			pty: false,
+			foreground: true,
+			timeout: "1s",
+		},
+		undefined,
+		undefined,
+		interactiveCtx,
+	);
+	const text = result.content[0]?.text ?? "";
+	expect(result.isError).toBe(true);
+	expect(result.details.status).not.toBe("running");
+	expect(text).not.toContain("wait timed out");
+	expect(text).toContain(`Log: ${result.details.logPath}`);
+});
+
+test("parallel sessions requesting one name receive unique stable ids", async () => {
+	const name = `parallel-name-${Date.now()}-${sequence++}`;
+	const [first, second] = await Promise.all([
+		run("sleep 0.1", { name }),
+		run("sleep 0.1", { name }),
+	]);
+	expect(new Set([first.details.id, second.details.id]).size).toBe(2);
+	expect([first.details.id, second.details.id].sort()).toEqual([name, `${name}-2`].sort());
+});
+
 test("babysit_check searches a session log with bounded latest matches", async () => {
 	const result = await run(
 		"python3 -c \"print('\\\\n'.join(f'ERROR {i}' for i in range(205))); print('INFO ignored')\"",
@@ -1242,6 +1414,11 @@ test("babysit_check searches a session log with bounded latest matches", async (
 		lines: 500,
 	});
 	const after = await tools.get("babysit_check").execute("test", {});
+	const allSessions = await tools.get("babysit_check").execute("test", { state: "all" });
+	const noSubagents = await tools.get("babysit_check").execute("test", {
+		state: "all",
+		kind: "subagent",
+	});
 	const text = checked.content[0]?.text ?? "";
 	const matches = text.split("\n").filter((line: string) => /^\d+:ERROR /.test(line));
 
@@ -1249,6 +1426,11 @@ test("babysit_check searches a session log with bounded latest matches", async (
 	expect(after.details.sessions.map((session: { id: string }) => session.id)).toEqual(
 		before.details.sessions.map((session: { id: string }) => session.id),
 	);
+	expect(after.details.sessions.some((session: { id: string }) => session.id === result.details.id)).toBe(false);
+	expect(allSessions.details.sessions.some((session: { id: string }) => session.id === result.details.id)).toBe(true);
+	expect(allSessions.content[0]?.text).toContain(result.details.id);
+	expect(noSubagents.content[0]?.text).toContain('kind: "all"');
+	expect(noSubagents.content[0]?.text).not.toContain('state: "all" to widen');
 	expect(matches).toHaveLength(200);
 	expect(matches[0]).toEndWith("ERROR 5");
 	expect(matches.at(-1)).toEndWith("ERROR 204");

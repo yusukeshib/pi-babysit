@@ -8,10 +8,10 @@
  * message. Persisting every snapshot makes babysit logs grow quadratically.
  *
  * This proxy forwards stdin byte-for-byte. `message_update` snapshots are
- * always compacted. In opt-in `compact` log mode, redundant payloads on
- * lifecycle/tool events are also removed while authoritative `message_end`,
+ * always compacted. Compact log mode is the default: redundant payloads on
+ * lifecycle/tool events are removed while authoritative `message_end`,
  * response, and error events remain intact. Set PI_BABYSIT_RPC_LOG_MODE=standard
- * to retain the legacy lifecycle payloads.
+ * to opt back into the legacy lifecycle payloads.
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
@@ -44,7 +44,7 @@ function isParkedMessages(messages) {
 
 export function compactRpcLine(
 	line,
-	mode = process.env.PI_BABYSIT_RPC_LOG_MODE ?? "standard",
+	mode = process.env.PI_BABYSIT_RPC_LOG_MODE ?? "compact",
 ) {
 	if (!line.trimStart().startsWith("{")) return line;
 
