@@ -3,23 +3,31 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readdirSync,
 	rmSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { compactRpcLine } from "./rpc-stream-proxy.mjs";
+import { isParked as selfReaperIsParked } from "./self-reap.ts";
 import { discoverAgents } from "./agents.ts";
 import extension, {
 	activeToolsWithoutDirectBash,
 	buildProcessCompletionMessage,
+	buildSubagentDoneResult,
+	buildSubagentExitDiagnostic,
 	canRestoreNotificationAfterWait,
 	clip,
+	clipMultiWaitResult,
 	deliverProcessCompletionMessage,
+	gcBabysitRoots,
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
+	isNotificationGroupReady,
 	isSupportedBabysitVersion,
 	parseEvents,
 	parseRpcResponseBytes,
@@ -30,6 +38,8 @@ import extension, {
 	shouldInlineCompleteOutput,
 	shouldKeepPolling,
 	shouldKeepPollingAfterList,
+	subagentBudgetAction,
+	subagentBudgetViolation,
 	summarizeNotificationCommand,
 	transitionWaitReservation,
 	validateKillResponse,
@@ -230,7 +240,7 @@ test("RPC stream compaction preserves parseEvents final state", () => {
 		{ type: "agent_settled" },
 	];
 	const raw = events.map((event) => JSON.stringify(event)).join("\n");
-	const compact = raw.split("\n").map(compactRpcLine).join("\n");
+	const compact = raw.split("\n").map((line) => compactRpcLine(line, "compact")).join("\n");
 	expect(parseEvents(compact)).toEqual(parseEvents(raw));
 	expect(parseEvents(compact)).toMatchObject({
 		done: true,
@@ -241,6 +251,214 @@ test("RPC stream compaction preserves parseEvents final state", () => {
 	});
 });
 
+test("subagent progress accumulates usage and captures extension errors", () => {
+	const events = [
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "first" }],
+				usage: {
+					input: 100,
+					output: 20,
+					cacheRead: 300,
+					cacheWrite: 4,
+					reasoning: 5,
+					totalTokens: 420,
+					cost: { total: 0.12 },
+				},
+			},
+		},
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "final" }],
+				usage: {
+					input: 50,
+					output: 10,
+					cacheRead: 400,
+					totalTokens: 460,
+					cost: { total: 0.08 },
+				},
+			},
+		},
+		{
+			type: "extension_error",
+			extensionPath: "/tmp/broken-extension.ts",
+			error: "stale context",
+		},
+	];
+	const progress = parseEvents(events.map((event) => JSON.stringify(event)).join("\n"));
+	expect(progress).toMatchObject({
+		finalText: "final",
+		tokens: 460,
+		modelCalls: 2,
+		usageTokens: 880,
+		inputTokens: 150,
+		outputTokens: 30,
+		cacheReadTokens: 700,
+		cacheWriteTokens: 4,
+		reasoningTokens: 5,
+		cost: 0.2,
+		errorMsg: "/tmp/broken-extension.ts: stale context",
+	});
+});
+
+test("subagent budgets report the first reached limit", () => {
+	const progress = parseEvents(
+		[
+			{ type: "turn_start" },
+			{ type: "tool_execution_start", toolName: "read", args: { path: "a" } },
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [],
+					usage: { totalTokens: 500, cost: { total: 0.25 } },
+				},
+			},
+		]
+			.map((event) => JSON.stringify(event))
+			.join("\n"),
+	);
+	expect(subagentBudgetViolation(progress, { maxCost: 0.2 })).toContain("maxCost");
+	expect(subagentBudgetViolation(progress, { maxTurns: 1 })).toContain("maxTurns");
+	expect(subagentBudgetViolation(progress, { maxToolCalls: 1 })).toContain("maxToolCalls");
+	expect(subagentBudgetViolation(progress, { maxUsageTokens: 500 })).toContain("maxUsageTokens");
+	expect(subagentBudgetViolation(progress, { maxCost: 1 })).toBeNull();
+	expect(subagentBudgetAction(progress, { maxCost: 0.2 }, undefined, 1_000, 30_000)).toMatchObject({
+		action: "steer",
+	});
+	expect(subagentBudgetAction(progress, { maxCost: 0.2 }, 1_000, 30_999, 30_000)).toMatchObject({
+		action: "none",
+	});
+	expect(subagentBudgetAction(progress, { maxCost: 0.2 }, 1_000, 31_000, 30_000)).toMatchObject({
+		action: "kill",
+	});
+});
+
+test("multi-wait output defaults to an 8 KB context cap", () => {
+	const clipped = clipMultiWaitResult("界".repeat(10_000));
+	expect(Buffer.byteLength(clipped, "utf8")).toBeLessThanOrEqual(8_000);
+	expect(clipped).toContain("bytes elided");
+	expect(Buffer.byteLength(clipMultiWaitResult("x".repeat(30_000), 24_000), "utf8")).toBeLessThanOrEqual(24_000);
+});
+
+test("completed subagents surface extension errors alongside final text", () => {
+	const progress = parseEvents(
+		[
+			{
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text: "useful final" }] },
+			},
+			{ type: "extension_error", extensionPath: "broken.ts", error: "hook failed" },
+		]
+			.map((event) => JSON.stringify(event))
+			.join("\n"),
+	);
+	const completed = buildSubagentDoneResult(progress);
+	expect(completed.ok).toBe(false);
+	expect(completed.body).toContain("broken.ts: hook failed");
+	expect(completed.body).toContain("useful final");
+});
+
+test("subagent exit diagnostics never include raw RPC tails", () => {
+	const progress = parseEvents(
+		JSON.stringify({
+			type: "extension_error",
+			extensionPath: "broken.ts",
+			error: "provider hook failed",
+		}),
+	);
+	const diagnostic = buildSubagentExitDiagnostic(progress, "/tmp/subagent/output.log");
+	expect(diagnostic).toContain("broken.ts: provider hook failed");
+	expect(diagnostic).toContain("Full log: /tmp/subagent/output.log");
+	expect(diagnostic).not.toContain('"type":"message_update"');
+});
+
+test("compact RPC mode removes redundant lifecycle and successful tool payloads", () => {
+	const messages = [{ role: "assistant", content: [{ type: "text", text: "x".repeat(10_000) }] }];
+	const cases = [
+		{
+			event: { type: "message_start", message: messages[0] },
+			assert: (value: any) => expect(value.message).toEqual({ role: "assistant" }),
+		},
+		{
+			event: { type: "turn_end", message: messages[0], toolResults: messages },
+			assert: (value: any) => expect(value).toEqual({ type: "turn_end" }),
+		},
+		{
+			event: { type: "agent_end", messages },
+			assert: (value: any) => expect(value).toEqual({ type: "agent_end", piBabysitParked: false }),
+		},
+		{
+			event: { type: "tool_execution_end", toolName: "read", isError: false, result: messages[0] },
+			assert: (value: any) =>
+				expect(value).toEqual({ type: "tool_execution_end", toolName: "read", isError: false }),
+		},
+	];
+	for (const { event, assert } of cases) {
+		const line = JSON.stringify(event);
+		assert(JSON.parse(compactRpcLine(line, "compact")));
+		expect(compactRpcLine(line, "standard")).toBe(line);
+	}
+	const failedTool = JSON.stringify({
+		type: "tool_execution_end",
+		isError: true,
+		result: { content: "diagnostic" },
+	});
+	expect(compactRpcLine(failedTool, "compact")).toBe(failedTool);
+	const parked = JSON.parse(
+		compactRpcLine(
+			JSON.stringify({
+				type: "agent_end",
+				messages: [
+					{
+						role: "toolResult",
+						toolName: "babysit_run",
+						content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
+						details: { kind: "process", status: "started" },
+					},
+					{ role: "toolResult", toolName: "babysit_run", content: "quick command" },
+				],
+			}),
+			"compact",
+		),
+	);
+	expect(parked.piBabysitParked).toBe(true);
+	const spoofed = JSON.parse(
+		compactRpcLine(
+			JSON.stringify({
+				type: "agent_end",
+				messages: [
+					{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" },
+				],
+			}),
+			"compact",
+		),
+	);
+	expect(spoofed.piBabysitParked).toBe(false);
+});
+
+test("self-reaper parked detection cannot be spoofed by command output", () => {
+	expect(
+		selfReaperIsParked([
+			{
+				role: "toolResult",
+				toolName: "babysit_run",
+				content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
+				details: { kind: "process", status: "started" },
+			},
+		]),
+	).toBe(true);
+	expect(
+		selfReaperIsParked([
+			{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" },
+		]),
+	).toBe(false);
+});
+
 test("RPC stream compaction preserves parked, resumed, and failed RPC state", () => {
 	const parkedEnd = {
 		type: "agent_end",
@@ -248,7 +466,13 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 			{
 				role: "toolResult",
 				toolName: "babysit_run",
-				content: [{ type: "text", text: `Process started ${"[notify-on-exit]"}` }],
+				content: [
+					{
+						type: "text",
+						text: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
+					},
+				],
+				details: { kind: "process", status: "started" },
 			},
 		],
 	};
@@ -264,7 +488,7 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 	];
 	const compare = (events: unknown[]) => {
 		const raw = events.map((event) => JSON.stringify(event)).join("\n");
-		const compact = raw.split("\n").map(compactRpcLine).join("\n");
+		const compact = raw.split("\n").map((line) => compactRpcLine(line, "compact")).join("\n");
 		expect(parseEvents(compact)).toEqual(parseEvents(raw));
 		return parseEvents(compact);
 	};
@@ -342,6 +566,37 @@ test("RPC stream proxy forwards multiple and unterminated records", () => {
 		assistantMessageEvent: { type: "text_delta", delta: "héllo" },
 	});
 	expect(lines[1]).toBe(final);
+});
+
+test("RPC stream proxy compact mode preserves parser state end-to-end", () => {
+	const assistant = {
+		role: "assistant",
+		content: [{ type: "text", text: "done" }],
+		usage: { input: 10, output: 2, cacheRead: 30, totalTokens: 42, cost: { total: 0.01 } },
+	};
+	const events = [
+		{ type: "agent_start" },
+		{ type: "turn_start" },
+		{ type: "message_start", message: assistant },
+		{ type: "tool_execution_end", toolName: "read", isError: false, result: { content: "large".repeat(100) } },
+		{ type: "message_end", message: assistant },
+		{ type: "turn_end", message: assistant, toolResults: [{ content: "large".repeat(100) }] },
+		{ type: "agent_end", messages: [assistant] },
+		{ type: "agent_settled" },
+	];
+	const input = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+	const result = spawnSync(
+		process.execPath,
+		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", "process.stdin.pipe(process.stdout)"],
+		{
+			input,
+			encoding: "utf8",
+			env: { ...process.env, PI_BABYSIT_RPC_LOG_MODE: "compact" },
+		},
+	);
+	expect(result.status).toBe(0);
+	expect(Buffer.byteLength(result.stdout)).toBeLessThan(Buffer.byteLength(input));
+	expect(parseEvents(result.stdout)).toEqual(parseEvents(input));
 });
 
 test("RPC stream proxy preserves an early child's exit status during EPIPE", () => {
@@ -494,6 +749,28 @@ test("subagent depth limit blocks profile mode but leaves process mode available
 	}
 });
 
+test("mode-specific notification and budget parameters reject misuse", async () => {
+	const processBudget = await tools.get("babysit_run").execute(
+		"process-budget",
+		{ command: "true", maxCost: 1 },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(processBudget.isError).toBe(true);
+	expect(processBudget.content[0]?.text).toContain("require profile 'subagent'");
+
+	const subagentGroup = await tools.get("babysit_run").execute(
+		"subagent-group",
+		{ profile: "subagent", task: "do nothing", notificationGroup: "checks" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(subagentGroup.isError).toBe(true);
+	expect(subagentGroup.content[0]?.text).toContain("process mode");
+});
+
 test("long subagent messages fail before spawn when the read tool is unavailable", async () => {
 	const result = await tools.get("babysit_run").execute(
 		"long-task-no-read",
@@ -505,6 +782,28 @@ test("long subagent messages fail before spawn when the read tool is unavailable
 	const text = result.content[0]?.text ?? "";
 	expect(result.isError).toBe(true);
 	expect(text).toContain("allowlist excludes `read`");
+});
+
+test("multi-wait rejects duplicates and excessive fan-out before spawning waits", async () => {
+	const duplicate = await tools.get("babysit_wait").execute(
+		"duplicate-wait",
+		{ ids: ["same", "same"] },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(duplicate.isError).toBe(true);
+	expect(duplicate.content[0]?.text).toContain("unique");
+
+	const excessive = await tools.get("babysit_wait").execute(
+		"excessive-wait",
+		{ ids: Array.from({ length: 33 }, (_, index) => `job-${index}`) },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(excessive.isError).toBe(true);
+	expect(excessive.content[0]?.text).toContain("at most 32");
 });
 
 test("invalid wait durations fail instead of becoming infinite waits", async () => {
@@ -626,6 +925,24 @@ test("idle polling stops unless a worker or completion still needs attention", (
 	);
 });
 
+test("notification groups wait for every running member", () => {
+	const metadata = new Map([
+		["build", { kind: "process" as const, notificationGroup: "checks" }],
+		["test", { kind: "process" as const, notificationGroup: "checks" }],
+		["other", { kind: "process" as const, notificationGroup: "other" }],
+	]);
+	const metaFor = (id: string) => metadata.get(id) ?? null;
+	const sessions = [
+		{ id: "build", state: "exited" },
+		{ id: "test", state: "running" },
+		{ id: "other", state: "running" },
+	] as any[];
+	expect(isNotificationGroupReady(metadata.get("build")!, sessions, metaFor)).toBe(false);
+	sessions[1]!.state = "exited";
+	expect(isNotificationGroupReady(metadata.get("build")!, sessions, metaFor)).toBe(true);
+	expect(isNotificationGroupReady({ kind: "process" } as any, sessions, metaFor)).toBe(true);
+});
+
 test("completion notification eligibility excludes wait, kill, and subagent sessions", () => {
 	expect(shouldDeliverProcessCompletion({ kind: "process" })).toBe(true);
 	expect(shouldDeliverProcessCompletion({ kind: "process", notified: true })).toBe(false);
@@ -634,6 +951,83 @@ test("completion notification eligibility excludes wait, kill, and subagent sess
 	);
 	expect(shouldDeliverProcessCompletion({ kind: "subagent" })).toBe(false);
 	expect(shouldDeliverProcessCompletion(null)).toBe(false);
+});
+
+test("GC removes only old roots without live supervisors", () => {
+	const rootBase = mkdtempSync(path.join(os.tmpdir(), "pi-babysit-gc-"));
+	const currentRoot = path.join(rootBase, "current");
+	mkdirSync(currentRoot, { recursive: true });
+	const now = Date.now();
+	const createRoot = (
+		name: string,
+		state: string,
+		supervisorPid: number,
+		ageDays: number,
+		childPid?: number,
+	) => {
+		const root = path.join(rootBase, name);
+		const session = path.join(root, "sessions", "job");
+		mkdirSync(session, { recursive: true });
+		writeFileSync(path.join(session, "status.json"), JSON.stringify({ state, child_pid: childPid }));
+		writeFileSync(path.join(session, "meta.json"), JSON.stringify({ babysit_pid: supervisorPid }));
+		writeFileSync(path.join(session, "output.log"), "payload");
+		const at = new Date(now - ageDays * 86_400_000);
+		for (const target of [
+			path.join(session, "status.json"),
+			path.join(session, "meta.json"),
+			path.join(session, "output.log"),
+			session,
+			path.dirname(session),
+			root,
+		]) {
+			utimesSync(target, at, at);
+		}
+		return root;
+	};
+	const old = createRoot("old", "exited", 0, 30);
+	createRoot("stale-running", "running", 99_999_999, 30);
+	const locked = createRoot("locked", "exited", 0, 30);
+	writeFileSync(path.join(locked, ".pi-babysit-gc.lock"), "busy");
+	createRoot("live", "running", process.pid, 30);
+	createRoot("child-live", "running", 99_999_999, 30, process.pid);
+	const leased = createRoot("leased", "exited", 0, 30);
+	writeFileSync(
+		path.join(leased, `.pi-babysit-active-${process.pid}-test.json`),
+		JSON.stringify({ pid: process.pid }),
+	);
+	createRoot("fresh", "exited", 0, 1);
+	createRoot("unknown-state", "mystery", 0, 30);
+	try {
+		const preview = gcBabysitRoots({
+			rootBase,
+			currentRoot,
+			olderThanMs: 14 * 86_400_000,
+			dryRun: true,
+			now,
+		});
+		expect(preview.candidates.sort()).toEqual(["locked", "old", "stale-running"]);
+		expect(preview.skippedLive.sort()).toEqual([
+			"child-live",
+			"leased",
+			"live",
+			"unknown-state",
+		]);
+		expect(readFileSync(path.join(old, "sessions", "job", "output.log"), "utf8")).toBe("payload");
+		const removed = gcBabysitRoots({
+			rootBase,
+			currentRoot,
+			olderThanMs: 14 * 86_400_000,
+			dryRun: false,
+			now,
+		});
+		expect(removed.deleted.sort()).toEqual(["old", "stale-running"]);
+		expect(readFileSync(path.join(locked, "sessions", "job", "output.log"), "utf8")).toBe("payload");
+		expect(() => readFileSync(path.join(old, "sessions", "job", "output.log"), "utf8")).toThrow();
+		expect(readFileSync(path.join(rootBase, "live", "sessions", "job", "output.log"), "utf8")).toBe("payload");
+		expect(readdirSync(rootBase).some((name) => name.startsWith(".pi-babysit-gc-"))).toBe(false);
+	} finally {
+		rmSync(rootBase, { recursive: true, force: true });
+	}
 });
 
 test("a single completion preserves the existing notification shape", () => {
