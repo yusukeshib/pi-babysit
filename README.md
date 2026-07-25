@@ -33,7 +33,7 @@ reachable from anywhere (`~/.pi-babysit/<pi-session-id>/`). Two kinds:
 | kind | started by | completion | on completion |
 | ---- | ---------- | ---------- | ------------- |
 | **process** | `babysit_run { command }` | process **exit** | automatic notification message (`triggerTurn`), batched for all exits observed in the same poll — the agent may end its turn after starting and is resumed on exit, same contract as the old `process` tool |
-| **subagent** | `babysit_run { profile: "subagent", task }` | `agent_end` in the RPC event stream (process stays alive) | none — the agent polls `babysit_check` or blocks on `babysit_wait`; the idle session accepts follow-up tasks |
+| **subagent** | `babysit_run { profile: "subagent", task }` | `agent_settled` in the RPC event stream (process stays alive) | none — the agent polls `babysit_check` or blocks on `babysit_wait`; the idle session accepts follow-up tasks |
 
 The **profile is a tool parameter, not a separate tool set**: domain knowledge
 (RPC bookkeeping, per-task byte offsets, parked-turn detection, PTY-safe
@@ -130,13 +130,16 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   poller and receiving a duplicate completion.
   `babysit_kill` and an exit already reported by `babysit_wait` suppress the
   notification.
-- **Subagent**: `babysit_wait` blocks on `babysit expect '"type":"agent_end"'`.
-  An `agent_end` whose last message is a **parked** toolResult — a
-  `babysit_run { command }` result carrying the `[notify-on-exit]` marker (or
-  the legacy `process` tool) — only means "turn parked awaiting a process-exit
-  notification; pi resumes on its own", so the wait continues. Any other
-  `agent_end` is real completion. Per-task byte offsets scope check/wait to the
-  CURRENT task, which is what makes follow-up tasks work.
+- **Subagent**: `babysit_wait` blocks on `babysit expect '"type":"agent_settled"'`.
+  Unlike `agent_end`, `agent_settled` cannot precede an automatic retry,
+  compaction retry, or queued continuation. A settled run containing a
+  **parked** toolResult — a `babysit_run { command }` result carrying the
+  `[notify-on-exit]` marker (or the legacy `process` tool) — only means "turn
+  parked awaiting a process-exit notification; pi resumes on its own", so the
+  wait continues. The marker-bearing result may be followed by a short
+  assistant note without defeating parked detection. Per-task byte offsets
+  scope check/wait to the CURRENT task, and appended log bytes are parsed
+  incrementally, which keeps follow-up tasks efficient.
 
 Subagents load `self-reap.ts`, which exits an idle finished subagent after a
 grace window (`PI_BABYSIT_REAP_AFTER`, default 120s) using the same parked-turn

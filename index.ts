@@ -18,7 +18,7 @@
  *   kind=subagent  `babysit_run { profile: "subagent", task }` — a long-lived
  *                  `pi --mode rpc` worker. Tasks are injected as RPC `prompt`
  *                  commands over stdin, completion is detected from the JSONL
- *                  event stream (`agent_end`), NOT process exit; the session
+ *                  event stream (`agent_settled`), NOT process exit; the session
  *                  stays alive for cheap follow-up tasks. Same design as the
  *                  old pi-subagent extension.
  *
@@ -132,7 +132,7 @@ export function planSubagentSpawn(
 
 // Marker embedded in babysit_run's tool RESULT text for kind=process runs.
 // It is how "the turn parked awaiting a process-exit notification" is told
-// apart from any other turn end (see isParkedToolResult / self-reap.ts).
+// apart from any other turn end (see isParkedMessages / self-reap.ts).
 export const NOTIFY_MARKER = "[notify-on-exit]";
 
 // Human-readable view for the compact subagent JSONL stream when a human
@@ -302,22 +302,11 @@ async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }
 }
 
 async function statusOf(id: string): Promise<BsSession | null> {
-	// `status --json` shape: { session, status: { state, exit_code, ... } }.
-	// `note` lives only in `list --json`, so fold it in from there.
-	const r = await bs(["status", "-s", id, "--json"]);
-	if (r.code !== 0) return null;
+	// `list --json` already carries every lifecycle field used by the extension,
+	// including `alive` and `note`. Using it directly avoids the old
+	// status-then-list pair (two CLI subprocesses for every status lookup).
 	try {
-		const parsed = JSON.parse(r.stdout);
-		const inner = parsed.status ?? parsed;
-		// `note` and `alive` live only in `list --json`, so fold them in from there
-		// (alive is what lets us detect a crashed-but-"running" worker).
-		const listed = (await listSessions()).sessions.find((s) => s.id === id);
-		return normalizeSession({
-			id: parsed.session ?? id,
-			note: listed?.note ?? null,
-			alive: listed?.alive,
-			...inner,
-		});
+		return (await listSessions()).sessions.find((session) => session.id === id) ?? null;
 	} catch {
 		return null;
 	}
@@ -380,6 +369,8 @@ interface Meta {
 	task?: string;
 	promptOffset?: number;
 	model?: string;
+	tools?: string[];
+	messageTempDirs?: Array<{ dir: string; afterAgentEnd: number }>;
 	depth?: number;
 	maxDepth?: number;
 }
@@ -404,18 +395,50 @@ function readMeta(id: string): Meta | null {
 	}
 }
 
+function cleanupMessageTempDirs(id: string, meta: Meta, agentEnds: number): void {
+	if (!meta.messageTempDirs?.length) return;
+	const keep: NonNullable<Meta["messageTempDirs"]> = [];
+	for (const entry of meta.messageTempDirs) {
+		if (entry.afterAgentEnd > agentEnds) {
+			keep.push(entry);
+			continue;
+		}
+		try {
+			fs.rmSync(entry.dir, { recursive: true, force: true });
+		} catch {
+			/* best-effort */
+		}
+	}
+	if (keep.length > 0) meta.messageTempDirs = keep;
+	else delete meta.messageTempDirs;
+	writeMeta(id, meta);
+}
+
 export function shouldDeliverProcessCompletion(
-	meta: {
-		kind: "process" | "subagent";
-		notified?: boolean;
-		notificationPaused?: boolean;
-	} | null,
-): meta is { kind: "process"; notified?: boolean; notificationPaused?: boolean } {
+	meta: Meta | null,
+): meta is Meta & { kind: "process" } {
 	return meta?.kind === "process" && !meta.notified && !meta.notificationPaused;
 }
 
 export function shouldDeferCompletionNotification(agentIsIdle: boolean): boolean {
 	return !agentIsIdle;
+}
+
+export function shouldKeepPolling(
+	sessions: Array<{ id: string; state: string }>,
+	metaFor: (id: string) => Meta | null,
+): boolean {
+	return sessions.some(
+		(session) =>
+			session.state === "running" || shouldDeliverProcessCompletion(metaFor(session.id)),
+	);
+}
+
+export function shouldKeepPollingAfterList(
+	listed: { sessions: Array<{ id: string; state: string }>; error?: string },
+	metaFor: (id: string) => Meta | null,
+): boolean {
+	return Boolean(listed.error) || shouldKeepPolling(listed.sessions, metaFor);
 }
 
 const kindOf = (id: string): "process" | "subagent" => readMeta(id)?.kind ?? "process";
@@ -455,6 +478,44 @@ async function sendRpc(
 	}
 }
 
+export function parseRpcResponseBytes(
+	bytes: Buffer,
+	since: number,
+	command: string,
+):
+	| { ok: true; data?: Record<string, unknown>; offset: number }
+	| { ok: false; error: string } {
+	let start = 0;
+	while (start < bytes.length) {
+		const newline = bytes.indexOf(0x0a, start);
+		const end = newline < 0 ? bytes.length : newline + 1;
+		const line = bytes
+			.subarray(start, newline < 0 ? end : newline)
+			.toString("utf8")
+			.replace(/\r$/, "")
+			.trim();
+		if (line.startsWith("{")) {
+			try {
+				const event = JSON.parse(line);
+				if (event.type === "response" && event.command === command) {
+					if (event.success === false) {
+						return { ok: false, error: clip(String(event.error ?? `${command} failed`)) };
+					}
+					return {
+						ok: true,
+						data: event.data as Record<string, unknown> | undefined,
+						offset: since + end,
+					};
+				}
+			} catch {
+				/* partial line */
+			}
+		}
+		start = end;
+	}
+	return { ok: false, error: `no ${command} response found in log` };
+}
+
 // Wait for `{"type":"response","command":<command>}` after `since`, then parse
 // it. Distinguishes: success, explicit failure (success:false → the error
 // message, e.g. "No API key found for …"), subagent death, and timeout — this
@@ -465,7 +526,10 @@ async function rpcResponse(
 	command: string,
 	timeout = "30s",
 	signal?: AbortSignal,
-): Promise<{ ok: true; data?: Record<string, unknown> } | { ok: false; error: string }> {
+): Promise<
+	| { ok: true; data?: Record<string, unknown>; offset: number }
+	| { ok: false; error: string }
+> {
 	const e = await bs(
 		["expect", "-s", id, "--since", String(since), "--timeout", timeout, `"command":"${command}"`],
 		{ signal },
@@ -489,23 +553,26 @@ async function rpcResponse(
 					: e.stderr || `expect failed (code ${e.code})`,
 		};
 	}
-	const lg = await bs(["log", "-s", id, "--since", String(since)]);
-	for (const raw of lg.stdout.split("\n")) {
-		const line = raw.replace(/\r$/, "").trim();
-		if (!line.startsWith("{")) continue;
+	try {
+		const file = logPath(id);
+		const size = fs.statSync(file).size;
+		const length = Math.max(0, size - since);
+		const bytes = Buffer.allocUnsafe(length);
+		const fd = fs.openSync(file, "r");
+		let read = 0;
 		try {
-			const ev = JSON.parse(line);
-			if (ev.type === "response" && ev.command === command) {
-				if (ev.success === false) {
-					return { ok: false, error: clip(String(ev.error ?? `${command} failed`)) };
-				}
-				return { ok: true, data: ev.data as Record<string, unknown> | undefined };
+			while (read < length) {
+				const count = fs.readSync(fd, bytes, read, length - read, since + read);
+				if (count === 0) break;
+				read += count;
 			}
-		} catch {
-			/* partial line */
+		} finally {
+			fs.closeSync(fd);
 		}
+		return parseRpcResponseBytes(bytes.subarray(0, read), since, command);
+	} catch (error) {
+		return { ok: false, error: `could not read ${command} response: ${String(error)}` };
 	}
-	return { ok: false, error: `no ${command} response found in log` };
 }
 
 // "5m" / "30s" / "2h" → milliseconds (null = no limit).
@@ -880,19 +947,27 @@ export function deliverProcessCompletionMessage(
 // (A subagent-profile run does NOT carry the marker: ending a turn to "wait"
 // for a subagent is a guidance violation, and treating it as completion keeps
 // the parent from hanging forever.) `process` is the legacy pi-processes tool.
-function isParkedToolResult(
-	last: { role?: string; toolName?: string; content?: unknown } | undefined,
+function isParkedMessages(
+	messages: { role?: string; toolName?: string; content?: unknown }[] | undefined,
 ): boolean {
-	if (!last || last.role !== "toolResult") return false;
-	if (last.toolName === "process") return true; // legacy
-	if (last.toolName !== "babysit_run") return false;
-	try {
-		const s = JSON.stringify(last.content ?? null);
-		if (s === "null") return true; // content unavailable — err on "parked" (never false-kill a build wait)
-		return s.includes(NOTIFY_MARKER);
-	} catch {
-		return true;
+	if (!messages) return false;
+	// Models sometimes add a short assistant note after starting a process. Scan
+	// the run rather than requiring the marker-bearing tool result to be the last
+	// message, otherwise that harmless note turns a parked build into false task
+	// completion (and lets the self-reaper kill it).
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role !== "toolResult") continue;
+		if (message.toolName === "process") return true; // legacy pi-processes
+		if (message.toolName !== "babysit_run") continue;
+		try {
+			const serialized = JSON.stringify(message.content ?? null);
+			if (serialized === "null" || serialized.includes(NOTIFY_MARKER)) return true;
+		} catch {
+			return true; // content unavailable — never false-kill a possible build wait
+		}
 	}
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +988,7 @@ export interface Progress {
 	// RPC lifecycle bookkeeping (computed over the analyzed log slice):
 	agentStarts: number;
 	agentEnds: number;
+	agentSettled: number;
 	lastEndWasProcessWait: boolean;
 	running: boolean; // an agent run is in flight right now
 	waitingOnProcess: boolean; // idle, but a process resume is pending
@@ -946,82 +1022,158 @@ function summarizeToolCall(name: string, args: Record<string, unknown>): string 
 	}
 }
 
-export function parseEvents(logText: string): Progress {
-	const p: Progress = {
+function emptyProgress(): Progress {
+	return {
 		turns: 0,
 		toolCalls: [],
 		finalText: "",
 		agentStarts: 0,
 		agentEnds: 0,
+		agentSettled: 0,
 		lastEndWasProcessWait: false,
 		running: false,
 		waitingOnProcess: false,
 		done: false,
 	};
-	for (const raw of logText.split("\n")) {
-		const line = raw.replace(/\r$/, "").trim();
-		if (!line.startsWith("{")) continue;
-		let ev: Record<string, unknown>;
-		try {
-			ev = JSON.parse(line);
-		} catch {
-			continue; // partial trailing line, etc.
-		}
-		switch (ev.type) {
-			case "turn_start":
-				p.turns++;
-				break;
-			case "tool_execution_start": {
-				const name = String(ev.toolName ?? "tool");
-				p.toolCalls.push({
-					name,
-					summary: summarizeToolCall(name, (ev.args as Record<string, unknown>) ?? {}),
-				});
-				break;
-			}
-			case "message_end": {
-				const msg = ev.message as
-					| { role?: string; content?: { type: string; text?: string }[]; usage?: { totalTokens?: number; cost?: { total?: number } } }
-					| undefined;
-				if (msg?.role === "assistant") {
-					const txt = (msg.content ?? [])
-						.filter((c) => c.type === "text" && c.text)
-						.map((c) => c.text)
-						.join("");
-					if (txt.trim()) p.finalText = txt; // keep the latest non-empty assistant text
-					if (msg.usage) {
-						p.tokens = msg.usage.totalTokens;
-						p.cost = msg.usage.cost?.total;
-					}
-				}
-				break;
-			}
-			case "agent_start":
-				p.agentStarts++;
-				break;
-			case "agent_end": {
-				p.agentEnds++;
-				const msgs = ev.messages as
-					| { role?: string; toolName?: string; content?: unknown }[]
-					| undefined;
-				p.lastEndWasProcessWait = isParkedToolResult(msgs?.[msgs.length - 1]);
-				break;
-			}
-			case "response":
-				// RPC command failures (bad model, no API key, …) surface here.
-				if (ev.success === false) {
-					p.errorMsg = String(ev.error ?? `rpc ${ev.command ?? "command"} failed`);
-				}
-				break;
-			case "error":
-				p.errorMsg = String(ev.message ?? ev.error ?? line);
-				break;
-		}
+}
+
+function updateProgressState(progress: Progress): Progress {
+	progress.running = progress.agentStarts > progress.agentEnds;
+	progress.waitingOnProcess =
+		!progress.running && progress.agentEnds > 0 && progress.lastEndWasProcessWait;
+	// `agent_end` is not final: Pi may still retry, compact-and-retry, or process
+	// queued continuations. `agent_settled` is the authoritative completion event.
+	progress.done =
+		!progress.running &&
+		progress.agentSettled > 0 &&
+		!progress.lastEndWasProcessWait;
+	return progress;
+}
+
+function parseEventLine(progress: Progress, raw: string): void {
+	const line = raw.replace(/\r$/, "").trim();
+	if (!line.startsWith("{")) return;
+	let event: Record<string, unknown>;
+	try {
+		event = JSON.parse(line);
+	} catch {
+		return; // partial trailing line, etc.
 	}
-	p.running = p.agentStarts > p.agentEnds;
-	p.waitingOnProcess = !p.running && p.agentEnds > 0 && p.lastEndWasProcessWait;
-	p.done = !p.running && p.agentEnds > 0 && !p.lastEndWasProcessWait;
-	return p;
+	switch (event.type) {
+		case "turn_start":
+			progress.turns++;
+			break;
+		case "tool_execution_start": {
+			const name = String(event.toolName ?? "tool");
+			progress.toolCalls.push({
+				name,
+				summary: summarizeToolCall(name, (event.args as Record<string, unknown>) ?? {}),
+			});
+			break;
+		}
+		case "message_end": {
+			const message = event.message as
+				| { role?: string; content?: { type: string; text?: string }[]; usage?: { totalTokens?: number; cost?: { total?: number } } }
+				| undefined;
+			if (message?.role === "assistant") {
+				const text = (message.content ?? [])
+					.filter((content) => content.type === "text" && content.text)
+					.map((content) => content.text)
+					.join("");
+				if (text.trim()) progress.finalText = text;
+				if (message.usage) {
+					progress.tokens = message.usage.totalTokens;
+					progress.cost = message.usage.cost?.total;
+				}
+			}
+			break;
+		}
+		case "agent_start":
+			progress.agentStarts++;
+			break;
+		case "agent_end": {
+			progress.agentEnds++;
+			progress.lastEndWasProcessWait = isParkedMessages(
+				event.messages as
+					| { role?: string; toolName?: string; content?: unknown }[]
+					| undefined,
+			);
+			break;
+		}
+		case "agent_settled":
+			progress.agentSettled++;
+			break;
+		case "response":
+			if (event.success === false) {
+				progress.errorMsg = String(event.error ?? `rpc ${event.command ?? "command"} failed`);
+			}
+			break;
+		case "error":
+			progress.errorMsg = String(event.message ?? event.error ?? line);
+			break;
+	}
+}
+
+export function parseEvents(logText: string): Progress {
+	const progress = emptyProgress();
+	for (const line of logText.split("\n")) parseEventLine(progress, line);
+	return updateProgressState(progress);
+}
+
+interface TaskProgressCache {
+	base: number;
+	offset: number;
+	pending: Buffer;
+	progress: Progress;
+}
+const taskProgressCache = new Map<string, TaskProgressCache>();
+
+/** Parse only bytes appended since the previous observation of this task. */
+function taskProgressOf(id: string): { progress: Progress; offset: number } {
+	const base = readMeta(id)?.promptOffset ?? 0;
+	const file = logPath(id);
+	const size = fs.statSync(file).size;
+	let cached = taskProgressCache.get(id);
+	if (!cached || cached.base !== base || size < cached.offset) {
+		cached = { base, offset: base, pending: Buffer.alloc(0), progress: emptyProgress() };
+		taskProgressCache.set(id, cached);
+	}
+	if (size > cached.offset) {
+		const added = Buffer.allocUnsafe(size - cached.offset);
+		const fd = fs.openSync(file, "r");
+		let read = 0;
+		try {
+			while (read < added.length) {
+				const count = fs.readSync(fd, added, read, added.length - read, cached.offset + read);
+				if (count === 0) break;
+				read += count;
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+		cached.offset += read;
+		const bytes = cached.pending.length
+			? Buffer.concat([cached.pending, added.subarray(0, read)])
+			: added.subarray(0, read);
+		let start = 0;
+		for (let index = 0; index < bytes.length; index++) {
+			if (bytes[index] !== 0x0a) continue;
+			parseEventLine(cached.progress, bytes.subarray(start, index).toString("utf8"));
+			start = index + 1;
+		}
+		cached.pending = Buffer.from(bytes.subarray(start));
+	}
+	updateProgressState(cached.progress);
+	if (cached.progress.agentEnds > 0) {
+		const meta = readMeta(id);
+		if (meta) cleanupMessageTempDirs(id, meta, cached.progress.agentEnds);
+	}
+	// If the writer was observed mid-record, let `babysit expect --since` start
+	// before that partial line so a split agent_settled marker cannot be missed.
+	return {
+		progress: cached.progress,
+		offset: cached.offset - cached.pending.length,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,13 +1250,32 @@ function writePromptTempFile(agentName: string, prompt: string): string {
 // Anything over this budget is written to a file instead, and only a short
 // "read this file" instruction travels through the PTY.
 const PTY_SAFE_MESSAGE_BYTES = 600;
+const messageNeedsReadTool = (text: string): boolean =>
+	Buffer.byteLength(text, "utf-8") > PTY_SAFE_MESSAGE_BYTES;
 
-function deliverableMessage(kind: "task" | "steering message", text: string): string {
-	if (Buffer.byteLength(text, "utf-8") <= PTY_SAFE_MESSAGE_BYTES) return text;
+interface DeliverableMessage {
+	message: string;
+	tempDir?: string;
+}
+
+function deliverableMessage(kind: "task" | "steering message", text: string): DeliverableMessage {
+	if (!messageNeedsReadTool(text)) return { message: text };
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-babysit-msg-"));
 	const file = path.join(dir, "message.md");
 	fs.writeFileSync(file, text, "utf-8");
-	return `Your full ${kind} is in the file ${file} — read it with the Read tool FIRST, then carry it out exactly as written.`;
+	return {
+		message: `Your full ${kind} is in the file ${file} — read it with the Read tool FIRST, then carry it out exactly as written.`,
+		tempDir: dir,
+	};
+}
+
+function discardDelivery(delivery: DeliverableMessage): void {
+	if (!delivery.tempDir) return;
+	try {
+		fs.rmSync(delivery.tempDir, { recursive: true, force: true });
+	} catch {
+		/* best-effort */
+	}
 }
 
 interface SubagentOpts {
@@ -1132,12 +1303,29 @@ async function spawnSubagent(
 	const model = opts.model ?? opts.agent?.model;
 	if (model) piArgs.push("--model", model);
 	const tools = opts.tools ?? opts.agent?.tools;
+	if (messageNeedsReadTool(opts.task) && tools?.length && !tools.includes("read")) {
+		return {
+			error:
+				"This task exceeds the PTY-safe inline limit and must be delivered through a file, " +
+				"but the subagent tool allowlist excludes `read`. Add `read` or shorten the task.",
+		};
+	}
 	if (tools && tools.length > 0) piArgs.push("--tools", tools.join(","));
 	piArgs.push("--append-system-prompt", SUBAGENT_GUIDANCE);
+	let promptTempFile: string | undefined;
 	if (opts.agent?.systemPrompt?.trim()) {
-		const f = writePromptTempFile(opts.agent.name, opts.agent.systemPrompt);
-		piArgs.push("--append-system-prompt", f);
+		promptTempFile = writePromptTempFile(opts.agent.name, opts.agent.systemPrompt);
+		piArgs.push("--append-system-prompt", promptTempFile);
 	}
+	const cleanupPromptTemp = () => {
+		if (!promptTempFile) return;
+		try {
+			fs.rmSync(path.dirname(promptTempFile), { recursive: true, force: true });
+		} catch {
+			/* best-effort */
+		}
+		promptTempFile = undefined;
+	};
 	// Self-reaper: a finished subagent exits after a short idle grace instead of
 	// lingering until the absolute --timeout. Cancelled by a follow-up task, and
 	// it never reaps a turn parked on a process-exit notification. See self-reap.ts.
@@ -1178,12 +1366,14 @@ async function spawnSubagent(
 		},
 	});
 	if (r.code !== 0) {
+		cleanupPromptTemp();
 		return { error: r.stderr || r.stdout || `babysit run failed (exit ${r.code}, no output) — check that \`${BABYSIT_BIN}\` works and ${ROOT} is writable` };
 	}
 	let id: string;
 	try {
 		id = JSON.parse(r.stdout).id;
 	} catch {
+		cleanupPromptTemp();
 		return { error: `could not parse id from: ${r.stdout}` };
 	}
 
@@ -1200,12 +1390,25 @@ async function spawnSubagent(
 	});
 
 	// Wait for pi to boot (first JSON event in the log), then inject the task.
-	await bs(["expect", "-s", id, "--timeout", "30s", '\\{"type"']);
+	// Pi has loaded --append-system-prompt before emitting that event, so the
+	// anonymous prompt file can be removed immediately instead of leaking.
+	const boot = await bs(["expect", "-s", id, "--timeout", "30s", '\\{"type"']);
+	cleanupPromptTemp();
+	if (boot.code !== 0) {
+		await bs(["kill", "-s", id]);
+		return {
+			error: boot.code === 124
+				? `subagent ${id} did not emit an RPC startup event within 30s`
+				: boot.stderr || `subagent ${id} startup probe failed (code ${boot.code})`,
+		};
+	}
+	const delivery = deliverableMessage("task", opts.task);
 	const sent = await sendRpc(id, {
 		type: "prompt",
-		message: `Task: ${deliverableMessage("task", opts.task)}`,
+		message: `Task: ${delivery.message}`,
 	});
 	if ("error" in sent) {
+		discardDelivery(delivery);
 		await bs(["kill", "-s", id]);
 		return { error: `could not send task to subagent ${id}: ${sent.error}` };
 	}
@@ -1213,6 +1416,7 @@ async function spawnSubagent(
 	// and similar config errors surface — fail the spawn loudly).
 	const resp = await rpcResponse(id, sent.offset, "prompt", "60s");
 	if (!resp.ok) {
+		discardDelivery(delivery);
 		await bs(["kill", "-s", id]);
 		return { error: `subagent ${id} rejected the task: ${resp.error}` };
 	}
@@ -1225,6 +1429,7 @@ async function spawnSubagent(
 		if (st.ok && st.data) {
 			const m = (st.data as { model?: { id?: string } | null }).model;
 			if (m === null) {
+				discardDelivery(delivery);
 				await bs(["kill", "-s", id]);
 				return {
 					error: `subagent ${id} has no usable model${opts.model ? ` (requested "${opts.model}")` : ""} — check the model name with \`pi --list-models\`.`,
@@ -1237,8 +1442,12 @@ async function spawnSubagent(
 	writeMeta(id, {
 		kind: "subagent",
 		task: opts.task,
-		promptOffset: sent.offset,
+		promptOffset: resp.offset,
 		model: resolvedModel,
+		tools,
+		messageTempDirs: delivery.tempDir
+			? [{ dir: delivery.tempDir, afterAgentEnd: 1 }]
+			: undefined,
 		depth: opts.depth,
 		maxDepth: opts.maxDepth,
 		startedAt: Date.now(),
@@ -1282,41 +1491,29 @@ function sanitizeTailLine(s: string): string {
 // Trailing lines to show for a running session (sanitized, unprefixed).
 // process → raw log tail; subagent → derived activity (recent tool calls /
 // partial answer), since its log is RPC JSONL, not human-readable.
-async function widgetTail(id: string, isSub: boolean): Promise<string[]> {
+async function widgetTail(
+	id: string,
+	isSub: boolean,
+	subagentProgress?: Progress,
+): Promise<string[]> {
 	let raw: string[];
 	if (!isSub) {
 		const out = (await bs(["log", "-s", id, "--tail", String(WIDGET_TAIL_LINES)])).stdout;
 		raw = out.split("\n");
 	} else {
-		const meta = readMeta(id);
-		const logArgs = ["log", "-s", id];
-		if (meta?.promptOffset) logArgs.push("--since", String(meta.promptOffset));
-		const prog = parseEvents((await bs(logArgs)).stdout);
-		if (prog.finalText.trim()) {
-			raw = prog.finalText.trim().split("\n");
-		} else if (prog.toolCalls.length > 0) {
-			raw = prog.toolCalls.map((t) => t.summary);
+		const progress = subagentProgress ?? taskProgressOf(id).progress;
+		if (progress.finalText.trim()) {
+			raw = progress.finalText.trim().split("\n");
+		} else if (progress.toolCalls.length > 0) {
+			raw = progress.toolCalls.map((tool) => tool.summary);
 		} else {
-			raw = prog.errorMsg ? [`⚠ ${prog.errorMsg}`] : [];
+			raw = progress.errorMsg ? [`⚠ ${progress.errorMsg}`] : [];
 		}
 	}
 	return raw
 		.map(sanitizeTailLine)
-		.filter((l) => l.trim().length > 0)
+		.filter((line) => line.trim().length > 0)
 		.slice(-WIDGET_TAIL_LINES);
-}
-
-// Classify a running subagent as busy or idle by analyzing the current task's
-// log slice (same logic babysit_check uses).
-async function isTaskDone(id: string): Promise<boolean> {
-	try {
-		const meta = readMeta(id);
-		const logArgs = ["log", "-s", id];
-		if (meta?.promptOffset) logArgs.push("--since", String(meta.promptOffset));
-		return parseEvents((await bs(logArgs)).stdout).done;
-	} catch {
-		return false; // when unsure, treat as busy — never hide a live worker
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,32 +1540,25 @@ interface WaitOutcome {
 	progress?: Progress;
 }
 
-// Wait for ONE subagent's current task. Completion = an agent_end whose last
-// message is NOT a parked babysit_run/process toolResult (that one only means
-// "turn parked, waiting for a background process — pi resumes on its own").
-// Loop: analyze the current-task log slice; done → return; still going →
-// block on the next agent_end via `babysit expect` (race-free byte offsets).
+// Wait for ONE subagent's current task. Completion = agent_settled without a
+// parked babysit_run/process result (a parked run only means "waiting for
+// process exit; pi will resume itself"). Parse appended bytes incrementally,
+// then block on the next agent_settled via race-free byte offsets.
 async function waitForTask(
 	id: string,
 	limitMs: number | null,
 	signal?: AbortSignal,
 ): Promise<WaitOutcome> {
-	const meta = readMeta(id);
-	const base = meta?.promptOffset ?? 0;
 	const t0 = Date.now();
 
 	for (;;) {
-		const lg = await bs(["log", "-s", id, "--since", String(base), "--json"]);
-		let text = "";
-		let cur = base;
+		let observed: { progress: Progress; offset: number };
 		try {
-			const j = JSON.parse(lg.stdout);
-			text = j.text ?? "";
-			cur = j.offset ?? base;
+			observed = taskProgressOf(id);
 		} catch {
-			text = lg.stdout;
+			observed = { progress: emptyProgress(), offset: readMeta(id)?.promptOffset ?? 0 };
 		}
-		const prog = parseEvents(text);
+		const { progress: prog, offset: cur } = observed;
 		const st = await statusOf(id);
 
 		const stats =
@@ -1425,7 +1615,8 @@ async function waitForTask(
 			progress: prog,
 		});
 
-		// Still working — block on the next agent_end.
+		// Still working — block until Pi declares the run fully settled. Unlike
+		// agent_end, this cannot fire before an automatic retry/compaction retry.
 		let expectTimeout = "0"; // indefinite
 		if (limitMs != null) {
 			const remaining = limitMs - (Date.now() - t0);
@@ -1433,7 +1624,7 @@ async function waitForTask(
 			expectTimeout = `${Math.ceil(remaining / 1000)}s`;
 		}
 		const e = await bs(
-			["expect", "-s", id, "--since", String(cur), "--timeout", expectTimeout, '"type":"agent_end"'],
+			["expect", "-s", id, "--since", String(cur), "--timeout", expectTimeout, '"type":"agent_settled"'],
 			{ signal },
 		);
 		if (signal?.aborted || e.code === 130) {
@@ -1658,14 +1849,15 @@ export function activeToolsWithoutDirectBash(activeTools: string[], allowDirectB
 
 export default function (pi: ExtensionAPI) {
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	let pollNeeded = true;
 	const declaredToolErrors = new Set<string>();
 
 	// Pi only persists custom-tool failures when they are thrown or patched by a
 	// tool_result hook; an `isError` property returned from execute() is ignored.
 	// Keep the structured result (status, log path, diagnostics) while promoting
 	// its declared error bit at the supported hook boundary.
-	const registerTool = <TParams extends TSchema, TDetails, TState>(
-		tool: ToolDefinition<TParams, TDetails, TState>,
+	const registerTool = <TParams extends TSchema>(
+		tool: ToolDefinition<TParams, unknown, unknown>,
 	): void => {
 		const execute = tool.execute;
 		pi.registerTool({
@@ -1690,12 +1882,15 @@ export default function (pi: ExtensionAPI) {
 	// that ended its turn after babysit_run without spending one turn per exit.
 	// Kills via babysit_kill and exits already reported by babysit_wait are
 	// suppressed via meta.notified.
-	async function notifyEndedProcesses(ctx: ExtensionContext): Promise<void> {
+	async function notifyEndedProcesses(
+		ctx: ExtensionContext,
+		snapshot?: BsSession[],
+	): Promise<void> {
 		// Never steer a completion into an active agent turn. In particular, this
 		// lets an immediately-following babysit_wait reserve the completion first,
 		// instead of racing the poller and receiving both wait + auto notification.
 		if (shouldDeferCompletionNotification(ctx.isIdle())) return;
-		const { sessions } = await listSessions();
+		const sessions = snapshot ?? (await listSessions()).sessions;
 		const ready: Array<{ session: BsSession; meta: Meta }> = [];
 		for (const session of sessions) {
 			if (session.state === "running") continue;
@@ -1769,30 +1964,45 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	const refreshWidget = async (ctx: ExtensionContext) => {
+	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
-		const active = (await listSessions()).sessions.filter((s) => s.state === "running");
-		const subs = active.filter((s) => kindOf(s.id) === "subagent");
-		const procs = active.length - subs.length;
-		const doneFlags = await Promise.all(subs.map((s) => isTaskDone(s.id)));
-		const idle = doneFlags.filter(Boolean).length;
-		const lines = renderWidgetLines(procs, subs.length - idle, idle);
-		// Per-session elapsed time (live: refreshed every poll tick).
-		const doneById = new Map(subs.map((s, i) => [s.id, doneFlags[i]]));
-		const tails = await Promise.all(
-			active.map((s) => widgetTail(s.id, kindOf(s.id) === "subagent")),
+		const active = (snapshot ?? (await listSessions()).sessions).filter(
+			(session) => session.state === "running",
 		);
-		active.forEach((s, i) => {
-			const isSub = kindOf(s.id) === "subagent";
-			const tag = isSub ? (doneById.get(s.id) ? "sub idle" : "sub") : "proc";
-			const el = elapsedOf(s.id);
-			const header = `  ⏳ ${s.id} [${tag}]${el ? ` ${el}` : ""}`;
-			if (tails[i].length === 1) {
-				// Single tail line: keep it on the same row as the header.
-				lines.push(`${header}  │ ${tails[i][0]}`);
+		const subs = active.filter((session) => kindOf(session.id) === "subagent");
+		const procs = active.length - subs.length;
+		const progressById = new Map<string, Progress>();
+		for (const subagent of subs) {
+			try {
+				progressById.set(subagent.id, taskProgressOf(subagent.id).progress);
+			} catch {
+				progressById.set(subagent.id, emptyProgress());
+			}
+		}
+		const idle = subs.filter((session) => progressById.get(session.id)?.done).length;
+		const lines = renderWidgetLines(procs, subs.length - idle, idle);
+		const tails = await Promise.all(
+			active.map((session) => {
+				const isSubagent = kindOf(session.id) === "subagent";
+				return widgetTail(
+					session.id,
+					isSubagent,
+					isSubagent ? progressById.get(session.id) : undefined,
+				);
+			}),
+		);
+		active.forEach((session, index) => {
+			const isSubagent = kindOf(session.id) === "subagent";
+			const tag = isSubagent
+				? progressById.get(session.id)?.done ? "sub idle" : "sub"
+				: "proc";
+			const elapsed = elapsedOf(session.id);
+			const header = `  ⏳ ${session.id} [${tag}]${elapsed ? ` ${elapsed}` : ""}`;
+			if (tails[index].length === 1) {
+				lines.push(`${header}  │ ${tails[index][0]}`);
 			} else {
 				lines.push(header);
-				for (const t of tails[i]) lines.push(`     │ ${t}`);
+				for (const tail of tails[index]) lines.push(`     │ ${tail}`);
 			}
 		});
 		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });
@@ -1887,20 +2097,36 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			ROOT = ROOT_BASE;
 		}
+		taskProgressCache.clear();
+		pollNeeded = true;
 		// Warn early if the binary is missing so the user isn't surprised only when
 		// a tool later fails. Tools/commands still enforce it via requireBabysit.
 		if (ctx.hasUI && !(await babysitAvailable())) {
-			ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "warn");
+			ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "warning");
 		}
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = setInterval(() => {
-			// Skip if the previous (async) poll hasn't finished, so slow babysit
-			// calls never stack up.
-			if (polling) return;
+			// Once a namespace has no live workers or pending notifications, avoid
+			// spawning `babysit list` forever while the UI is idle. A successful
+			// babysit_run re-arms polling below.
+			if (polling || !pollNeeded) return;
 			polling = true;
-			Promise.all([notifyEndedProcesses(ctx), refreshWidget(ctx)])
+			void (async () => {
+				const listed = await listSessions();
+				if (listed.error) {
+					pollNeeded = shouldKeepPollingAfterList(listed, readMeta);
+					throw new Error(listed.error);
+				}
+				const snapshot = listed.sessions;
+				await Promise.all([
+					notifyEndedProcesses(ctx, snapshot),
+					refreshWidget(ctx, snapshot),
+				]);
+				pollNeeded = shouldKeepPolling(snapshot, readMeta);
+			})()
 				.catch(() => {
-					/* ignore poll errors */
+					// Keep polling armed after a transient CLI/filesystem error.
+					pollNeeded = true;
 				})
 				.finally(() => {
 					polling = false;
@@ -2091,6 +2317,7 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
+				pollNeeded = true;
 				await refreshWidget(ctx);
 
 				// One-shot / non-interactive mode (e.g. `pi -p`): there is no live
@@ -2235,6 +2462,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			pollNeeded = true;
 			await refreshWidget(ctx);
 			return {
 				content: [
@@ -2439,10 +2667,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// --- subagent: analyze only the current task's slice ---
-			const logArgs = ["log", "-s", params.id];
-			if (meta?.promptOffset) logArgs.push("--since", String(meta.promptOffset));
-			const prog = parseEvents((await bs(logArgs)).stdout);
+			// --- subagent: analyze only bytes appended for the current task ---
+			const prog = taskProgressOf(params.id).progress;
 			const nTools = Math.min(Math.max(1, params.tools ?? 8), 50);
 			const recent = prog.toolCalls.slice(-nTools);
 
@@ -2489,7 +2715,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			return {
-				content: [{ type: "text", text: parts.join("\n") }],
+				content: [{ type: "text", text: clip(parts.join("\n")) }],
 				details: { status: st, progress: prog, kind: "subagent" },
 			};
 		},
@@ -2591,6 +2817,18 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			if (messageNeedsReadTool(params.text) && meta.tools?.length && !meta.tools.includes("read")) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "This message is too large for PTY-safe inline delivery, but the subagent cannot read the required temporary file. Add `read` to its tool allowlist or shorten the message.",
+						},
+					],
+					isError: true,
+					details: {},
+				};
+			}
 			let mode = params.mode ?? "auto";
 			if (mode === "auto") {
 				// isStreaming tells us whether an agent run is in flight right now.
@@ -2602,12 +2840,27 @@ export default function (pi: ExtensionAPI) {
 				}
 				mode = streaming ? "steer" : "task";
 			}
+			const deliveryCleanupAfter =
+				mode === "steer"
+					? (() => {
+							try {
+								return taskProgressOf(params.id).progress.agentEnds + 1;
+							} catch {
+								return 1;
+							}
+						})()
+					: 1;
+			const delivery = deliverableMessage(
+				mode === "steer" ? "steering message" : "task",
+				params.text,
+			);
 			const cmd =
 				mode === "steer"
-					? { type: "steer", message: deliverableMessage("steering message", params.text) }
-					: { type: "prompt", message: deliverableMessage("task", params.text) };
+					? { type: "steer", message: delivery.message }
+					: { type: "prompt", message: delivery.message };
 			const sent = await sendRpc(params.id, cmd);
 			if ("error" in sent) {
+				discardDelivery(delivery);
 				return {
 					content: [{ type: "text", text: sent.error }],
 					isError: true,
@@ -2616,6 +2869,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const resp = await rpcResponse(params.id, sent.offset, cmd.type, "15s");
 			if (!resp.ok) {
+				discardDelivery(delivery);
 				return {
 					content: [{ type: "text", text: `${cmd.type} was not accepted: ${resp.error}` }],
 					isError: true,
@@ -2627,10 +2881,24 @@ export default function (pi: ExtensionAPI) {
 				writeMeta(params.id, {
 					kind: "subagent",
 					task: params.text,
-					promptOffset: sent.offset,
+					// Start after the prompt-acceptance response. This excludes a
+					// preceding run that settled between `send` and RPC acceptance.
+					promptOffset: resp.offset,
 					model: meta?.model,
+					tools: meta?.tools,
+					messageTempDirs: delivery.tempDir
+						? [{ dir: delivery.tempDir, afterAgentEnd: deliveryCleanupAfter }]
+						: undefined,
 					depth: meta?.depth,
 					maxDepth: meta?.maxDepth,
+				});
+			} else if (delivery.tempDir && meta) {
+				writeMeta(params.id, {
+					...meta,
+					messageTempDirs: [
+						...(meta.messageTempDirs ?? []),
+						{ dir: delivery.tempDir, afterAgentEnd: deliveryCleanupAfter },
+					],
 				});
 			}
 			return {
@@ -2694,6 +2962,11 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const limitMs = parseDurMs(params.timeout);
+			if (params.timeout !== undefined && limitMs === null) {
+				throw new Error(
+					`Invalid timeout ${JSON.stringify(params.timeout)}; use an integer with ms, s, m, or h (for example "90s" or "5m").`,
+				);
+			}
 
 			if (ids.length === 1) {
 				const r = await waitFor(ids[0], limitMs, signal, params.expect);
@@ -2719,7 +2992,10 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: results.map((r) => `── ${r.id} [${r.kind}] ──\n${r.text}`).join("\n\n"),
+							text: clip(
+								results.map((result) => `── ${result.id} [${result.kind}] ──\n${result.text}`).join("\n\n"),
+								ANSWER_MAX_BYTES,
+							),
 						},
 					],
 					isError: !ok,
@@ -2743,10 +3019,12 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text:
+							text: clip(
 								`First to finish: ${first.id} [${first.kind}]` +
-								(others.length ? ` — still waiting-able: ${others.join(", ")}` : "") +
-								`\n\n${first.text}`,
+									(others.length ? ` — still waiting-able: ${others.join(", ")}` : "") +
+									`\n\n${first.text}`,
+								ANSWER_MAX_BYTES,
+							),
 						},
 					],
 					isError: !first.ok,
@@ -2860,7 +3138,7 @@ export default function (pi: ExtensionAPI) {
 			// Inline snapshot (running) or summary (finished) — no tmux window.
 			if (kind === "subagent") {
 				// Parse the RPC event stream and show the final answer, not raw JSONL.
-				const prog = parseEvents((await bs(["log", "-s", picked.id])).stdout);
+				const prog = taskProgressOf(picked.id).progress;
 				const stats =
 					`turns=${prog.turns} tools=${prog.toolCalls.length}` +
 					(prog.tokens != null ? ` ctx=${prog.tokens}` : "") +
