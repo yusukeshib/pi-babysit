@@ -394,6 +394,26 @@ test("subagent exit diagnostics never include raw RPC tails", () => {
 	expect(diagnostic).not.toContain('"type":"message_update"');
 });
 
+test("killed subagents preserve their partially streamed final answer", () => {
+	const progress = parseEvents(
+		[
+			{
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text: "Earlier status note" }] },
+			},
+			{ type: "turn_start" },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "## Findings\n" } },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Useful partial review" } },
+		]
+			.map((event) => JSON.stringify(event))
+			.join("\n"),
+	);
+	const diagnostic = buildSubagentExitDiagnostic(progress, "/tmp/subagent/output.log");
+	expect(diagnostic).toContain("## Findings\nUseful partial review");
+	expect(diagnostic).not.toContain("Earlier status note");
+	expect(diagnostic).not.toContain("no structured error");
+});
+
 test("compact RPC mode removes redundant lifecycle and successful tool payloads", () => {
 	const messages = [{ role: "assistant", content: [{ type: "text", text: "x".repeat(10_000) }] }];
 	const cases = [

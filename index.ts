@@ -1285,6 +1285,8 @@ export interface Progress {
 	turns: number;
 	toolCalls: ToolCall[];
 	finalText: string;
+	/** Best-effort text from the currently streaming assistant message. */
+	streamingText: string;
 	/** Context size reported by the most recent assistant response. */
 	tokens?: number;
 	/** Cumulative model usage for the current subagent task. */
@@ -1339,6 +1341,7 @@ function emptyProgress(): Progress {
 		turns: 0,
 		toolCalls: [],
 		finalText: "",
+		streamingText: "",
 		modelCalls: 0,
 		usageTokens: 0,
 		inputTokens: 0,
@@ -1417,7 +1420,17 @@ function parseEventLine(progress: Progress, raw: string): void {
 	switch (event.type) {
 		case "turn_start":
 			progress.turns++;
+			progress.streamingText = "";
 			break;
+		case "message_update": {
+			const update = event.assistantMessageEvent as
+				| { type?: string; delta?: string }
+				| undefined;
+			if (update?.type === "text_delta" && typeof update.delta === "string") {
+				progress.streamingText += update.delta;
+			}
+			break;
+		}
 		case "tool_execution_start": {
 			const name = String(event.toolName ?? "tool");
 			progress.toolCalls.push({
@@ -1448,6 +1461,7 @@ function parseEventLine(progress: Progress, raw: string): void {
 					.map((content) => content.text)
 					.join("");
 				if (text.trim()) progress.finalText = text;
+				progress.streamingText = "";
 				if (message.usage) {
 					const finite = (value: number | undefined) =>
 						typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -1531,6 +1545,7 @@ export function buildSubagentExitDiagnostic(
 ): string {
 	const body = clip(
 		progress.errorMsg ||
+			progress.streamingText.trim() ||
 			progress.finalText.trim() ||
 			"(no structured error was emitted; inspect the full log)",
 		ANSWER_MAX_BYTES,
@@ -2525,7 +2540,7 @@ export default function (pi: ExtensionAPI) {
 					: "failed";
 			const output = await inlineOutput(session.id, session, NOTIFY_OUTPUT_MAX_BYTES);
 			const runtime = meta.startedAt
-				? `${Math.round((Date.now() - meta.startedAt) / 1000)}s`
+				? `${Math.round(((meta.completionObservedAt ?? Date.now()) - meta.startedAt) / 1000)}s`
 				: "?";
 			const summary = ok
 				? `Process "${session.id}" completed successfully after ${runtime}.`
@@ -2544,6 +2559,8 @@ export default function (pi: ExtensionAPI) {
 				output,
 			});
 		}
+
+		if (prepared.length === 0) return;
 
 		// Output loading above is asynchronous. Refresh sessions and metadata
 		// immediately before the single send so concurrent wait/kill calls and newly
