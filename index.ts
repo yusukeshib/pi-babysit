@@ -791,6 +791,33 @@ export function parseRpcResponseBytes(
 // it. Distinguishes: success, explicit failure (success:false → the error
 // message, e.g. "No API key found for …"), subagent death, and timeout — this
 // is what makes bad-model/config failures LOUD instead of silent.
+export function rpcResponsePattern(command: string): string {
+	const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	// Match only a complete response record. A loose `"command":"…"` can occur
+	// in assistant/tool text, and matching before the terminating newline can
+	// race the writer while the JSON record is still partial.
+	return `(?m)^\\{(?:"id":"[^"\\n]*",)?"type":"response","command":"${escaped}"[^\\n]*\\}\\r?\\n`;
+}
+
+export function readLogBytesFrom(file: string, since: number): Buffer {
+	const size = fs.statSync(file).size;
+	const offset = Math.min(Math.max(0, since), size);
+	const length = size - offset;
+	const bytes = Buffer.allocUnsafe(length);
+	const fd = fs.openSync(file, "r");
+	let read = 0;
+	try {
+		while (read < length) {
+			const count = fs.readSync(fd, bytes, read, length - read, offset + read);
+			if (count === 0) break;
+			read += count;
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	return bytes.subarray(0, read);
+}
+
 async function rpcResponse(
 	id: string,
 	since: number,
@@ -802,7 +829,16 @@ async function rpcResponse(
 	| { ok: false; error: string }
 > {
 	const e = await bs(
-		["expect", "-s", id, "--since", String(since), "--timeout", timeout, `"command":"${command}"`],
+		[
+			"expect",
+			"-s",
+			id,
+			"--since",
+			String(since),
+			"--timeout",
+			timeout,
+			rpcResponsePattern(command),
+		],
 		{ signal },
 	);
 	if (e.code !== 0) {
@@ -810,8 +846,9 @@ async function rpcResponse(
 		if (st && st.state !== "running") {
 			let structuredError = "";
 			try {
-				const bytes = fs.readFileSync(logPath(id));
-				structuredError = parseEvents(bytes.subarray(Math.min(since, bytes.length)).toString("utf8")).errorMsg ?? "";
+				// Long-lived follow-up workers can have very large historical logs. Read
+				// only the response window rather than synchronously loading all history.
+				structuredError = parseEvents(readLogBytesFrom(logPath(id), since).toString("utf8")).errorMsg ?? "";
 			} catch {
 				/* full log path below remains the diagnostic source */
 			}
@@ -832,22 +869,7 @@ async function rpcResponse(
 		};
 	}
 	try {
-		const file = logPath(id);
-		const size = fs.statSync(file).size;
-		const length = Math.max(0, size - since);
-		const bytes = Buffer.allocUnsafe(length);
-		const fd = fs.openSync(file, "r");
-		let read = 0;
-		try {
-			while (read < length) {
-				const count = fs.readSync(fd, bytes, read, length - read, since + read);
-				if (count === 0) break;
-				read += count;
-			}
-		} finally {
-			fs.closeSync(fd);
-		}
-		return parseRpcResponseBytes(bytes.subarray(0, read), since, command);
+		return parseRpcResponseBytes(readLogBytesFrom(logPath(id), since), since, command);
 	} catch (error) {
 		return { ok: false, error: `could not read ${command} response: ${String(error)}` };
 	}
@@ -887,7 +909,7 @@ const NOTIFY_BATCH_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_NOTIFY_BATCH_MAX_BYT
 const ANSWER_MAX_BYTES = 24_000; // single subagent answers / structured error messages
 const MAX_MULTI_WAIT_SESSIONS = 32;
 const SUBAGENT_BUDGET_GRACE_MS =
-	parseDurMs(process.env.PI_BABYSIT_BUDGET_GRACE ?? "30s") ?? 30_000;
+	parseDurMs(process.env.PI_BABYSIT_BUDGET_GRACE ?? "90s") ?? 90_000;
 
 export function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 	if (maxBytes <= 0) return "";
@@ -1560,6 +1582,22 @@ interface TaskProgressCache {
 	progress: Progress;
 }
 const taskProgressCache = new Map<string, TaskProgressCache>();
+
+export function pruneTerminalSessionCache<T>(
+	cache: Map<string, T>,
+	sessions: Array<{ id: string; state: string }>,
+): number {
+	const running = new Set(
+		sessions.filter((session) => session.state === "running").map((session) => session.id),
+	);
+	let removed = 0;
+	for (const id of cache.keys()) {
+		if (running.has(id)) continue;
+		cache.delete(id);
+		removed++;
+	}
+	return removed;
+}
 
 /** Parse only bytes appended since the previous observation of this task. */
 function taskProgressOf(id: string): { progress: Progress; offset: number } {
@@ -2424,16 +2462,8 @@ export default function (pi: ExtensionAPI) {
 		for (const session of sessions) {
 			if (session.state !== "running") continue;
 			await withSessionRpcLock(session.id, async () => {
-				const latestStatus = await statusOf(session.id);
 				const meta = readMeta(session.id);
-				if (
-					latestStatus?.state !== "running" ||
-					meta?.kind !== "subagent" ||
-					!meta.budget ||
-					meta.budgetKilled
-				) {
-					return;
-				}
+				if (meta?.kind !== "subagent" || !meta.budget || meta.budgetKilled) return;
 
 				let progress: Progress;
 				try {
@@ -2452,6 +2482,12 @@ export default function (pi: ExtensionAPI) {
 				);
 				if (decision.action === "none") return;
 				const reason = decision.reason as string;
+
+				// The poll already supplied a running-session snapshot. Revalidate only
+				// when a limit requires action; checking every healthy worker made each
+				// interval launch N extra `babysit list` subprocesses.
+				const latestStatus = await statusOf(session.id);
+				if (latestStatus?.state !== "running") return;
 
 				if (decision.action === "steer") {
 					// Start the grace period only after Pi accepts the steering command.
@@ -2780,6 +2816,7 @@ export default function (pi: ExtensionAPI) {
 					notifyEndedProcesses(ctx, snapshot),
 					refreshWidget(ctx, snapshot),
 				]);
+				pruneTerminalSessionCache(taskProgressCache, snapshot);
 				pollNeeded = shouldKeepPolling(snapshot, readMeta);
 			})()
 				.catch(() => {
@@ -2913,15 +2950,24 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			maxTurns: Type.Optional(
-				Type.Integer({ minimum: 1, description: "Subagent only: maximum turns per task." }),
+				Type.Integer({
+					minimum: 1,
+					description:
+						"Subagent only: observed turn threshold for steering it to wrap up. In-flight work can overshoot before the poller intervenes.",
+				}),
 			),
 			maxToolCalls: Type.Optional(
-				Type.Integer({ minimum: 1, description: "Subagent only: maximum tool calls per task." }),
+				Type.Integer({
+					minimum: 1,
+					description:
+						"Subagent only: observed tool-call threshold for steering it to wrap up. A parallel in-flight tool batch can overshoot.",
+				}),
 			),
 			maxUsageTokens: Type.Optional(
 				Type.Integer({
 					minimum: 1,
-					description: "Subagent only: maximum cumulative reported totalTokens across model calls.",
+					description:
+						"Subagent only: observed cumulative reported totalTokens threshold for steering it to wrap up.",
 				}),
 			),
 			agentScope: Type.Optional(
@@ -3453,7 +3499,7 @@ export default function (pi: ExtensionAPI) {
 					if (el) header += ` elapsed=${el}`;
 				}
 				if (st.exit_code != null) header += ` exit_code=${st.exit_code}`;
-				if (meta?.command) header += `\ncommand: ${meta.command}`;
+				if (meta?.command) header += `\ncommand: ${summarizeNotificationCommand(meta.command)}`;
 				header += `\nlog: ${logPath(params.id)}`;
 				if (st.note) header += ` ⚑ ${st.note}`;
 				parts.push(header);
