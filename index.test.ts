@@ -33,6 +33,9 @@ import extension, {
 	parseEvents,
 	parseRpcResponseBytes,
 	planSubagentSpawn,
+	pruneTerminalSessionCache,
+	readLogBytesFrom,
+	rpcResponsePattern,
 	type ProcessCompletionNotice,
 	shouldDeferCompletionNotification,
 	shouldDeliverProcessCompletion,
@@ -228,6 +231,58 @@ test("RPC response offsets exclude lifecycle events from the preceding run", () 
 	if (!parsed.ok) throw new Error(parsed.error);
 	expect(parsed.offset).toBe(since + Buffer.byteLength(previousEnd + response));
 	expect(parseEvents(nextRun)).toMatchObject({ agentStarts: 1, agentEnds: 0 });
+});
+
+test("RPC response waits for a complete top-level response record", () => {
+	const pattern = new RegExp(rpcResponsePattern("steer").replace(/^\(\?m\)/, ""), "m");
+	const assistantText = `${JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: '\\"command\\":\\"steer\\"' }] },
+	})}\n`;
+	const nestedResponse = `${JSON.stringify({
+		type: "event",
+		details: { type: "response", command: "steer", success: true },
+	})}\n`;
+	const partial = JSON.stringify({ id: "rpc-123", type: "response", command: "steer", success: true });
+	const complete = `${partial}\n`;
+	const withoutId = `${JSON.stringify({ type: "response", command: "steer", success: true })}\n`;
+
+	expect(pattern.test(assistantText)).toBe(false);
+	expect(pattern.test(nestedResponse)).toBe(false);
+	expect(pattern.test(partial)).toBe(false);
+	expect(pattern.test(complete)).toBe(true);
+	expect(pattern.test(withoutId)).toBe(true);
+});
+
+test("RPC response-window reads exclude historical log bytes", () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "pi-babysit-rpc-window-"));
+	try {
+		const file = path.join(dir, "output.log");
+		const prefix = "x".repeat(1_000_000);
+		const response = `${JSON.stringify({ type: "response", command: "prompt", success: false, error: "bad model" })}\n`;
+		writeFileSync(file, prefix + response);
+
+		const bytes = readLogBytesFrom(file, Buffer.byteLength(prefix));
+		expect(bytes.toString("utf8")).toBe(response);
+		expect(bytes.byteLength).toBe(Buffer.byteLength(response));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("terminal subagent progress cache entries are pruned while running entries remain", () => {
+	const cache = new Map([
+		["working", { progress: 1 }],
+		["done", { progress: 2 }],
+		["missing", { progress: 3 }],
+	]);
+	const removed = pruneTerminalSessionCache(cache, [
+		{ id: "working", state: "running" },
+		{ id: "done", state: "exited" },
+	]);
+
+	expect(removed).toBe(2);
+	expect([...cache.keys()]).toEqual(["working"]);
 });
 
 test("RPC stream compaction preserves parseEvents final state", () => {
@@ -1544,4 +1599,18 @@ test("large output stays out of the run result and remains available through bou
 	expect(checkedText).toContain("LAST-MARKER");
 	expect(checkedText).toContain("bytes elided");
 	expect(Buffer.byteLength(checkedText)).toBeLessThanOrEqual(8_000);
+});
+
+test("process checks bound huge command metadata without crowding out recent output", async () => {
+	const result = await run(`printf '${"x".repeat(20_000)}' >/dev/null; printf 'CHECK-TAIL-MARKER\\n'`);
+	const checked = await tools.get("babysit_check").execute("test", {
+		id: result.details.id,
+		lines: 2,
+	});
+	const text = checked.content[0]?.text ?? "";
+
+	expect(checked.isError).not.toBe(true);
+	expect(text).toContain("CHECK-TAIL-MARKER");
+	expect(text).toContain("command:");
+	expect(Buffer.byteLength(text)).toBeLessThan(1_000);
 });

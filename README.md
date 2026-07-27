@@ -157,10 +157,12 @@ grace window (`PI_BABYSIT_REAP_AFTER`, default 120s) using the same parked-turn
 rule, so a subagent waiting on a long build is never false-killed. Give bounded
 recon/review tasks at least one cost, turn, tool-call, or token budget; omit
 budgets only for intentionally open-ended work. Optional task budgets are
-checked by the parent poller. On the first exceeded limit the worker
-is steered to stop using tools and return its best answer; if it remains active
-after `PI_BABYSIT_BUDGET_GRACE`, termination is verified before the task is
-marked budget-killed. Usage shown by check/wait is cumulative for the task.
+observed by the parent poller. They are wrap-up thresholds rather than exact
+hard caps: an already in-flight model call or parallel tool batch can overshoot
+before the next poll. On the first observed threshold the worker is steered to
+stop using tools and return its best answer; if it remains active after
+`PI_BABYSIT_BUDGET_GRACE`, termination is verified before the task is marked
+budget-killed. Usage shown by check/wait is cumulative for the task.
 
 ## Environment overrides
 
@@ -172,7 +174,7 @@ marked budget-killed. Usage shown by check/wait is cumulative for the task.
 | `PI_BABYSIT_VIEW_CMD` | bundled `format-stream.mjs` | live-attach pretty printer for subagent JSONL (`""` disables) |
 | `PI_BABYSIT_QUICK_GRACE` | `2s` | interactive process grace before a still-running command is returned as background work; use `foreground: true` to wait explicitly |
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
-| `PI_BABYSIT_BUDGET_GRACE` | `30s` | grace after a subagent budget is exceeded before verified termination |
+| `PI_BABYSIT_BUDGET_GRACE` | `90s` | grace after a subagent budget is exceeded before verified termination |
 | `PI_BABYSIT_RPC_LOG_MODE` | `compact` | `compact` removes duplicate RPC lifecycle payloads; `standard` opts into legacy payloads |
 | `PI_BABYSIT_RETENTION_DAYS` | unset | when set to a positive number, remove safe terminal roots older than this at session startup |
 | `PI_BABYSIT_TAIL_MAX_BYTES` | `8000` | cap for explicit log tails/screens returned by `babysit_check` |
