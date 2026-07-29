@@ -33,7 +33,7 @@ reachable from anywhere (`~/.pi-babysit/<pi-session-id>/`). Two kinds:
 | kind | started by | completion | on completion |
 | ---- | ---------- | ---------- | ------------- |
 | **process** | `babysit_run { command }` | process **exit** | automatic notification message (`triggerTurn`), batched for all exits observed in the same poll — the agent may end its turn after starting and is resumed on exit, same contract as the old `process` tool |
-| **subagent** | `babysit_run { profile: "subagent", task }` | `agent_settled` in the RPC event stream (process stays alive) | none — the agent polls `babysit_check` or blocks on `babysit_wait`; the idle session accepts follow-up tasks |
+| **subagent** | `babysit_run { profile: "subagent", task }` | `agent_settled` in the RPC event stream (worker remains reusable during its idle grace) | none — the agent polls `babysit_check` or blocks on `babysit_wait`; the idle session accepts follow-up tasks until self-reap |
 
 The **profile is a tool parameter, not a separate tool set**: domain knowledge
 (RPC bookkeeping, per-task byte offsets, parked-turn detection, PTY-safe
@@ -56,9 +56,9 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` when the next step needs the result in the same tool call, avoiding a separate `babysit_wait` turn. Or start a named subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and `maxCost`/`maxTurns`/`maxToolCalls`/`maxUsageTokens` budgets). `maxDepth` defaults to 1 and can only be set by the top-level caller. Quick commands return inline; longer ones continue in the background |
-| `babysit_check` | Without an id, list running sessions by default (`state: "all"` includes history; `state`/`kind` filters are available). With an id, inspect one session, tail bounded recent output, or search its raw log with `pattern`; `screen: true` captures TUIs and subagents otherwise show structured live progress |
-| `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when idle (`mode: auto/steer/task`) |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` when the next step needs the result in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy output bounded without a second check turn. Or start a named subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields). `maxDepth` defaults to 1. Quick commands return inline; longer ones notify in the background |
+| `babysit_check` | Without an id, list sessions with state/kind filters. With an id, inspect bounded output, search with `pattern`, or capture a TUI with `screen: true`; `maxBytes` overrides the 4 KB default up to 24 KB |
+| `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when confirmed settled (`mode: auto/steer/task`); explicit task mode rejects busy, parked, or unknown state |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: up to 32 unique `ids` + `mode: "any"\|"all"` |
 | `babysit_kill` | Terminate a session, verify terminal state, then suppress the exit notification |
 
@@ -95,10 +95,12 @@ babysit_check { id: "cargo-test", lines: 50 }
 babysit_check { id: "cargo-test", pattern: "FAIL|ERROR", lines: 50 }
 ```
 
-Tail and search results are capped at 200 lines, and ordinary returned tool
-results (including lifecycle headers) are clipped to 8 KB. A single explicitly
-waited-for subagent answer may use up to 24 KB; multi-session wait results default
-to the 8 KB inline-output limit and can opt into a larger cap with `maxBytes`.
+Tail and search results are capped at 200 lines and default to a 4 KB total
+result cap; `babysit_check.maxBytes` can raise or lower that per call (up to
+24 KB). A single explicitly waited-for subagent answer may use up to 24 KB;
+multi-session wait results default to the 8 KB inline-output limit and can opt
+into a larger cap with `maxBytes`. Foreground runs can apply `returnPattern` or
+`returnLines` before output enters context, avoiding a follow-up check turn.
 Pattern search returns the latest matching lines with line numbers. Prefer a
 targeted pattern over a broad tail, and do not read a potentially large log file
 in full. Subagent crashes return structured errors plus the full log path, never
@@ -157,12 +159,14 @@ grace window (`PI_BABYSIT_REAP_AFTER`, default 120s) using the same parked-turn
 rule, so a subagent waiting on a long build is never false-killed. Give bounded
 recon/review tasks at least one cost, turn, tool-call, or token budget; omit
 budgets only for intentionally open-ended work. Optional task budgets are
-observed by the parent poller. They are wrap-up thresholds rather than exact
-hard caps: an already in-flight model call or parallel tool batch can overshoot
-before the next poll. On the first observed threshold the worker is steered to
-stop using tools and return its best answer; if it remains active after
-`PI_BABYSIT_BUDGET_GRACE`, termination is verified before the task is marked
-budget-killed. Usage shown by check/wait is cumulative for the task.
+observed by the parent poller. At 80% of a limit the worker is steered to wrap
+up; reaching the configured limit starts the hard grace immediately, even if a
+wedged worker cannot accept steering. An in-flight model call or parallel tool
+batch can still overshoot before the next poll. If the worker remains active
+after `PI_BABYSIT_BUDGET_GRACE`, termination is verified before it is marked
+budget-killed. Usage shown by check/wait is cumulative, and the first terminal
+wait for each task charges that nested usage exactly once to the parent Pi
+session totals.
 
 ## Environment overrides
 
@@ -176,8 +180,8 @@ budget-killed. Usage shown by check/wait is cumulative for the task.
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
 | `PI_BABYSIT_BUDGET_GRACE` | `90s` | grace after a subagent budget is exceeded before verified termination |
 | `PI_BABYSIT_RPC_LOG_MODE` | `compact` | `compact` removes duplicate RPC lifecycle payloads; `standard` opts into legacy payloads |
-| `PI_BABYSIT_RETENTION_DAYS` | unset | when set to a positive number, remove safe terminal roots older than this at session startup |
-| `PI_BABYSIT_TAIL_MAX_BYTES` | `8000` | cap for explicit log tails/screens returned by `babysit_check` |
+| `PI_BABYSIT_RETENTION_DAYS` | `3` | at most once per day, remove safe terminal roots older than this; set `0` to disable automatic retention |
+| `PI_BABYSIT_TAIL_MAX_BYTES` | `4000` | default cap for explicit log tails/screens returned by `babysit_check`; override per call with `maxBytes` |
 | `PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES` | `8000` | cap for complete process output and aggregate multi-wait results |
 | `PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES` | `2000` | per-process output cap for unsolicited completion notifications (`0` omits all output) |
 | `PI_BABYSIT_NOTIFY_COMMAND_MAX_BYTES` | `240` | cap for each command preview in completion notifications |

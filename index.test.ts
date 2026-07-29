@@ -22,6 +22,7 @@ import extension, {
 	buildSubagentDoneResult,
 	buildSubagentExitDiagnostic,
 	canRestoreNotificationAfterWait,
+	claimFileOnce,
 	clip,
 	clipMultiWaitResult,
 	deliverProcessCompletionMessage,
@@ -35,6 +36,7 @@ import extension, {
 	planSubagentSpawn,
 	pruneTerminalSessionCache,
 	readLogBytesFrom,
+	resolveSubagentSendMode,
 	rpcResponsePattern,
 	type ProcessCompletionNotice,
 	shouldDeferCompletionNotification,
@@ -43,10 +45,12 @@ import extension, {
 	shouldKeepPolling,
 	shouldKeepPollingAfterList,
 	subagentBudgetAction,
+	subagentBudgetSoftViolation,
 	subagentBudgetViolation,
 	subagentGuidance,
 	summarizeNotificationCommand,
 	transitionWaitReservation,
+	usageFromProgress,
 	validateKillResponse,
 } from "./index.ts";
 
@@ -337,7 +341,7 @@ test("subagent progress accumulates usage and captures extension errors", () => 
 					cacheWrite: 4,
 					reasoning: 5,
 					totalTokens: 420,
-					cost: { total: 0.12 },
+					cost: { input: 0.03, output: 0.06, cacheRead: 0.02, cacheWrite: 0.01, total: 0.12 },
 				},
 			},
 		},
@@ -351,7 +355,7 @@ test("subagent progress accumulates usage and captures extension errors", () => 
 					output: 10,
 					cacheRead: 400,
 					totalTokens: 460,
-					cost: { total: 0.08 },
+					cost: { input: 0.02, output: 0.04, cacheRead: 0.02, total: 0.08 },
 				},
 			},
 		},
@@ -373,8 +377,56 @@ test("subagent progress accumulates usage and captures extension errors", () => 
 		cacheWriteTokens: 4,
 		reasoningTokens: 5,
 		cost: 0.2,
+		inputCost: 0.05,
+		outputCost: 0.1,
+		cacheReadCost: 0.04,
+		cacheWriteCost: 0.01,
 		errorMsg: "/tmp/broken-extension.ts: stale context",
 	});
+	expect(usageFromProgress(progress)).toEqual({
+		input: 150,
+		output: 30,
+		cacheRead: 700,
+		cacheWrite: 4,
+		totalTokens: 880,
+		cost: { input: 0.05, output: 0.1, cacheRead: 0.04, cacheWrite: 0.01, total: 0.2 },
+	});
+});
+
+test("nested usage remains valid when a provider omits price components", () => {
+	const progress = parseEvents(
+		JSON.stringify({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				usage: { input: 10, output: 2, totalTokens: 12 },
+			},
+		}),
+	);
+	expect(usageFromProgress(progress)).toEqual({
+		input: 10,
+		output: 2,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 12,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	});
+});
+
+test("subagent progress bounds rendered tool history while preserving the exact count", () => {
+	const progress = parseEvents(
+		Array.from({ length: 250 }, (_, index) => ({
+			type: "tool_execution_start",
+			toolName: "read",
+			args: { path: `file-${index}` },
+		}))
+			.map((event) => JSON.stringify(event))
+			.join("\n"),
+	);
+	expect(progress.toolCallCount).toBe(250);
+	expect(progress.toolCalls).toHaveLength(200);
+	expect(progress.toolCalls[0]?.summary).toContain("file-50");
 });
 
 test("subagent budgets report the first reached limit", () => {
@@ -399,6 +451,8 @@ test("subagent budgets report the first reached limit", () => {
 	expect(subagentBudgetViolation(progress, { maxToolCalls: 1 })).toContain("maxToolCalls");
 	expect(subagentBudgetViolation(progress, { maxUsageTokens: 500 })).toContain("maxUsageTokens");
 	expect(subagentBudgetViolation(progress, { maxCost: 1 })).toBeNull();
+	expect(subagentBudgetSoftViolation(progress, { maxCost: 0.3 })).toContain("80%");
+	expect(subagentBudgetSoftViolation(progress, { maxTurns: 2 })).toBeNull();
 	expect(subagentBudgetAction(progress, { maxCost: 0.2 }, undefined, 1_000, 30_000)).toMatchObject({
 		action: "steer",
 	});
@@ -408,6 +462,55 @@ test("subagent budgets report the first reached limit", () => {
 	expect(subagentBudgetAction(progress, { maxCost: 0.2 }, 1_000, 31_000, 30_000)).toMatchObject({
 		action: "kill",
 	});
+});
+
+test("a completed subagent task charges nested usage to the parent exactly once", async () => {
+	const events = [
+		{ type: "agent_start" },
+		{ type: "turn_start" },
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "accounted answer" }],
+				usage: {
+					input: 100,
+					output: 20,
+					cacheRead: 300,
+					cacheWrite: 4,
+					totalTokens: 424,
+					cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.01, total: 0.34 },
+				},
+			},
+		},
+		{ type: "agent_end", piBabysitParked: false },
+		{ type: "agent_settled" },
+	].map((event) => JSON.stringify(event)).join("\n") + "\n";
+	const encoded = Buffer.from(events).toString("base64");
+	const processResult = await run(`printf %s '${encoded}' | base64 -d`);
+	const root = path.dirname(path.dirname(path.dirname(processResult.details.logPath)));
+	writeFileSync(
+		path.join(root, "meta", `${processResult.details.id}.json`),
+		JSON.stringify({ kind: "subagent", task: "accounting test", promptOffset: 0 }),
+	);
+
+	const [first, second] = await Promise.all([
+		tools.get("babysit_wait").execute("usage-first", { id: processResult.details.id }),
+		tools.get("babysit_wait").execute("usage-second", { id: processResult.details.id }),
+	]);
+	const charged = [first.usage, second.usage].filter(Boolean);
+	expect(charged).toEqual([{
+		input: 100,
+		output: 20,
+		cacheRead: 300,
+		cacheWrite: 4,
+		totalTokens: 424,
+		cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.01, total: 0.34 },
+	}]);
+	const repeated = await tools.get("babysit_wait").execute("usage-repeated", {
+		id: processResult.details.id,
+	});
+	expect(repeated.usage).toBeUndefined();
 });
 
 test("multi-wait output defaults to an 8 KB context cap", () => {
@@ -433,6 +536,22 @@ test("completed subagents surface extension errors alongside final text", () => 
 	expect(completed.ok).toBe(false);
 	expect(completed.body).toContain("broken.ts: hook failed");
 	expect(completed.body).toContain("useful final");
+});
+
+test("subagent progress captures provider failures reported after prompt acceptance", () => {
+	const progress = parseEvents(
+		JSON.stringify({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				stopReason: "error",
+				errorMessage: "No API key found for provider",
+			},
+		}),
+	);
+	expect(progress.errorMsg).toContain("No API key");
+	expect(progress.modelCalls).toBe(0);
 });
 
 test("subagent exit diagnostics never include raw RPC tails", () => {
@@ -853,6 +972,37 @@ test("subagent depth limit blocks profile mode but leaves process mode available
 		else process.env[depthKey] = previousDepth;
 		if (previousMaxDepth === undefined) delete process.env[maxDepthKey];
 		else process.env[maxDepthKey] = previousMaxDepth;
+	}
+});
+
+test("new subagent tasks require a confirmed settled worker", () => {
+	expect(resolveSubagentSendMode("auto", true, false)).toEqual({ mode: "steer" });
+	expect(resolveSubagentSendMode("auto", undefined, undefined)).toEqual({ mode: "steer" });
+	expect(resolveSubagentSendMode("auto", false, false)).toEqual({ mode: "steer" });
+	expect(resolveSubagentSendMode("auto", false, true)).toEqual({ mode: "task" });
+	expect(resolveSubagentSendMode("steer", undefined, undefined)).toEqual({ mode: "steer" });
+	expect(resolveSubagentSendMode("task", true, false)).toEqual({ error: "busy" });
+	expect(resolveSubagentSendMode("task", undefined, undefined)).toEqual({ error: "unknown" });
+	expect(resolveSubagentSendMode("task", false, false)).toEqual({ error: "unsettled" });
+	expect(resolveSubagentSendMode("task", false, true)).toEqual({ mode: "task" });
+});
+
+test("exclusive claim files elect exactly one caller across processes", async () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "pi-babysit-claim-"));
+	const marker = path.join(dir, "usage.claimed");
+	try {
+		const modulePath = path.join(process.cwd(), "index.ts");
+		const script =
+			`import { claimFileOnce } from ${JSON.stringify(modulePath)};` +
+			`process.exit(claimFileOnce(${JSON.stringify(marker)}, String(process.pid)) ? 0 : 1);`;
+		const children = Array.from({ length: 8 }, () =>
+			Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "pipe" }),
+		);
+		const statuses = await Promise.all(children.map((child) => child.exited));
+		expect(statuses.filter((status) => status === 0)).toHaveLength(1);
+		expect(claimFileOnce(marker, "late")).toBe(false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
@@ -1446,6 +1596,40 @@ test("foreground process mode returns a long command result in one tool call", a
 	expect(text).not.toContain("[notify-on-exit]");
 });
 
+test("foreground mode filters noisy output without a second check turn", async () => {
+	const name = `foreground-filter-${Date.now()}-${sequence++}`;
+	const result = await tools.get("babysit_run").execute(
+		name,
+		{
+			name,
+			command: "python3 -c \"print('noise\\n' * 5000); print('IMPORTANT final')\"",
+			pty: false,
+			foreground: true,
+			returnPattern: "IMPORTANT",
+			returnLines: 5,
+			maxBytes: 1_500,
+		},
+		undefined,
+		undefined,
+		interactiveCtx,
+	);
+	const text = result.content[0]?.text ?? "";
+	expect(result.isError).not.toBe(true);
+	expect(text).toContain("IMPORTANT final");
+	expect(text.split("Selected output").at(-1)).not.toContain("noise");
+	expect(Buffer.byteLength(text)).toBeLessThan(2_000);
+
+	const invalid = await tools.get("babysit_run").execute(
+		"invalid-filter",
+		{ name: "invalid-filter", command: "printf never", foreground: true, returnPattern: "[" },
+		undefined,
+		undefined,
+		interactiveCtx,
+	);
+	expect(invalid.isError).toBe(true);
+	expect(invalid.content[0]?.text).toContain("Invalid returnPattern");
+});
+
 test("foreground mode lets the supervisor own the absolute timeout boundary", async () => {
 	const name = `foreground-timeout-${Date.now()}-${sequence++}`;
 	const result = await tools.get("babysit_run").execute(
@@ -1487,6 +1671,7 @@ test("babysit_check searches a session log with bounded latest matches", async (
 		id: result.details.id,
 		pattern: "ERROR",
 		lines: 500,
+		maxBytes: 24_000,
 	});
 	const after = await tools.get("babysit_check").execute("test", {});
 	const allSessions = await tools.get("babysit_check").execute("test", { state: "all" });
@@ -1598,7 +1783,13 @@ test("large output stays out of the run result and remains available through bou
 	const checkedText = checked.content[0]?.text ?? "";
 	expect(checkedText).toContain("LAST-MARKER");
 	expect(checkedText).toContain("bytes elided");
-	expect(Buffer.byteLength(checkedText)).toBeLessThanOrEqual(8_000);
+	expect(Buffer.byteLength(checkedText)).toBeLessThanOrEqual(4_000);
+	const tighter = await tools.get("babysit_check").execute("test", {
+		id: result.details.id,
+		lines: 2,
+		maxBytes: 1_500,
+	});
+	expect(Buffer.byteLength(tighter.content[0]?.text ?? "")).toBeLessThanOrEqual(1_500);
 });
 
 test("process checks bound huge command metadata without crowding out recent output", async () => {
