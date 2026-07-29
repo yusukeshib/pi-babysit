@@ -19,7 +19,7 @@
  *                  `pi --mode rpc` worker. Tasks are injected as RPC `prompt`
  *                  commands over stdin, completion is detected from the JSONL
  *                  event stream (`agent_settled`), NOT process exit; the session
- *                  stays alive for cheap follow-up tasks. Same design as the
+ *                  remains reusable during its configured idle grace. Same design as the
  *                  old pi-subagent extension.
  *
  * The "profile" is a tool-parameter, not a separate tool set: one small tool
@@ -274,11 +274,14 @@ export function isSupportedBabysitVersion(output: string): boolean {
 // Cached preflight — probe `babysit --version` exactly once per process.
 // undefined = not probed, null = supported, string = actionable error.
 let babysitPreflightError: string | null | undefined;
+let babysitPreflightCheckedAt = 0;
 async function babysitAvailable(): Promise<boolean> {
-	// Cache only success. A missing or outdated binary may be installed while pi
-	// stays open, so subsequent tool calls must be able to recover without a restart.
 	if (babysitPreflightError === null) return true;
+	// Briefly negative-cache failures so repeated mistaken calls do not fork a
+	// version probe each time, while still recovering quickly after installation.
+	if (babysitPreflightError && Date.now() - babysitPreflightCheckedAt < 2_000) return false;
 	const r = await bs(["--version"]);
+	babysitPreflightCheckedAt = Date.now();
 	if (r.code !== 0) {
 		babysitPreflightError = INSTALL_HINT;
 	} else if (!isSupportedBabysitVersion(r.stdout)) {
@@ -406,21 +409,52 @@ interface Meta {
 	depth?: number;
 	maxDepth?: number;
 	budget?: SubagentBudget;
+	/** Soft-limit warning (80% by default) was accepted for this task. */
+	budgetWarnedAt?: number;
+	budgetWarningReason?: string;
+	/** Hard limit was first observed; grace is measured from observation, not RPC acceptance. */
 	budgetExceededAt?: number;
 	budgetReason?: string;
 	budgetKilled?: boolean;
+	/** Prompt offset whose nested usage has already been charged to the parent session. */
+	usageReportedOffset?: number;
 }
 
 const metaDir = () => path.join(ROOT, "meta");
 const logPath = (id: string) => path.join(ROOT, "sessions", id, "output.log");
 
-function writeMeta(id: string, m: Meta): void {
+function writeMeta(id: string, m: Meta): boolean {
+	const target = path.join(metaDir(), `${id}.json`);
+	const temp = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
 	try {
 		fs.mkdirSync(metaDir(), { recursive: true });
-		fs.writeFileSync(path.join(metaDir(), `${id}.json`), JSON.stringify(m));
+		fs.writeFileSync(temp, JSON.stringify(m));
+		fs.renameSync(temp, target);
+		return true;
 	} catch {
-		/* best-effort */
+		try {
+			fs.rmSync(temp, { force: true });
+		} catch {
+			/* best-effort */
+		}
+		return false;
 	}
+}
+
+export function claimFileOnce(file: string, payload: string): boolean {
+	let fd: number;
+	try {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fd = fs.openSync(file, "wx");
+	} catch {
+		return false;
+	}
+	try {
+		fs.writeFileSync(fd, payload);
+	} finally {
+		fs.closeSync(fd);
+	}
+	return true;
 }
 
 function readMeta(id: string): Meta | null {
@@ -448,7 +482,26 @@ function processIsAlive(pid: number): boolean {
 }
 
 const GC_LOCK_FILE = ".pi-babysit-gc.lock";
+const GC_STAMP_FILE = ".pi-babysit-gc.last";
+const AUTOMATIC_GC_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const ACTIVE_LEASE_PREFIX = ".pi-babysit-active-";
+
+function automaticGcDue(now = Date.now()): boolean {
+	try {
+		return now - fs.statSync(path.join(ROOT_BASE, GC_STAMP_FILE)).mtimeMs >= AUTOMATIC_GC_INTERVAL_MS;
+	} catch {
+		return true;
+	}
+}
+
+function markAutomaticGc(now = new Date()): void {
+	try {
+		fs.mkdirSync(ROOT_BASE, { recursive: true });
+		fs.writeFileSync(path.join(ROOT_BASE, GC_STAMP_FILE), now.toISOString());
+	} catch {
+		/* best-effort; GC safety does not depend on this throttle stamp */
+	}
+}
 
 function scanTreeStats(root: string): { bytes: number; newestMtimeMs: number } {
 	let bytes = 0;
@@ -818,6 +871,18 @@ export function readLogBytesFrom(file: string, since: number): Buffer {
 	return bytes.subarray(0, read);
 }
 
+const RPC_RESPONSE_WINDOW_MAX_BYTES = 1_000_000;
+function readLogWindowFrom(
+	file: string,
+	since: number,
+	maxBytes = RPC_RESPONSE_WINDOW_MAX_BYTES,
+): { bytes: Buffer; offset: number } {
+	const size = fs.statSync(file).size;
+	const requested = Math.min(Math.max(0, since), size);
+	const offset = Math.max(requested, size - maxBytes);
+	return { bytes: readLogBytesFrom(file, offset), offset };
+}
+
 async function rpcResponse(
 	id: string,
 	since: number,
@@ -848,7 +913,8 @@ async function rpcResponse(
 			try {
 				// Long-lived follow-up workers can have very large historical logs. Read
 				// only the response window rather than synchronously loading all history.
-				structuredError = parseEvents(readLogBytesFrom(logPath(id), since).toString("utf8")).errorMsg ?? "";
+				const window = readLogWindowFrom(logPath(id), since);
+				structuredError = parseEvents(window.bytes.toString("utf8")).errorMsg ?? "";
 			} catch {
 				/* full log path below remains the diagnostic source */
 			}
@@ -869,7 +935,8 @@ async function rpcResponse(
 		};
 	}
 	try {
-		return parseRpcResponseBytes(readLogBytesFrom(logPath(id), since), since, command);
+		const window = readLogWindowFrom(logPath(id), since);
+		return parseRpcResponseBytes(window.bytes, window.offset, command);
 	} catch (error) {
 		return { ok: false, error: `could not read ${command} response: ${String(error)}` };
 	}
@@ -899,7 +966,7 @@ function byteLimitFromEnv(name: string, fallback: number): number {
 	return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 }
 
-const TAIL_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_TAIL_MAX_BYTES", 8_000);
+const TAIL_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_TAIL_MAX_BYTES", 4_000);
 // Direct run/wait results can carry more context because the caller explicitly
 // requested them. Unsolicited completion notifications default much smaller.
 const INLINE_OUTPUT_MAX_BYTES = byteLimitFromEnv("PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES", 8_000);
@@ -910,6 +977,11 @@ const ANSWER_MAX_BYTES = 24_000; // single subagent answers / structured error m
 const MAX_MULTI_WAIT_SESSIONS = 32;
 const SUBAGENT_BUDGET_GRACE_MS =
 	parseDurMs(process.env.PI_BABYSIT_BUDGET_GRACE ?? "90s") ?? 90_000;
+const SUBAGENT_REAP_AFTER =
+	process.env.PI_BABYSIT_REAP_AFTER ?? process.env.PI_SUBAGENT_REAP_AFTER ?? "120s";
+const SUBAGENT_REUSE_HINT = ["0", "off", "none"].includes(SUBAGENT_REAP_AFTER)
+	? "Session remains available until its absolute timeout."
+	: `Session remains available for follow-ups during the ${SUBAGENT_REAP_AFTER} idle grace.`;
 
 export function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 	if (maxBytes <= 0) return "";
@@ -940,15 +1012,27 @@ export function clipMultiWaitResult(
 	return clip(value, Math.min(maxBytes, ANSWER_MAX_BYTES));
 }
 
+interface SearchLogCacheEntry {
+	size: number;
+	mtimeMs: number;
+	text: string;
+}
+const searchLogCache = new Map<string, SearchLogCacheEntry>();
+
 async function searchLog(
 	id: string,
 	pattern: string,
 	maxLines: number,
 	signal?: AbortSignal,
+	maxBytes = TAIL_MAX_BYTES,
 ): Promise<{ text: string; error?: string }> {
 	const file = logPath(id);
 	if (!fs.existsSync(file)) return { text: "", error: `Log file is missing: ${file}` };
 	if (signal?.aborted) return { text: "", error: "Log search was interrupted." };
+	const stat = fs.statSync(file);
+	const cacheKey = `${file}\u0000${pattern}\u0000${maxLines}\u0000${maxBytes}`;
+	const cached = searchLogCache.get(cacheKey);
+	if (cached?.size === stat.size && cached.mtimeMs === stat.mtimeMs) return { text: cached.text };
 
 	// Run regex evaluation out of process so catastrophic backtracking or a huge
 	// no-newline log cannot freeze or exhaust pi's main Node process. The helper
@@ -996,7 +1080,10 @@ async function searchLog(
 			} else if (code !== 0) {
 				finish({ text: "", error: stderr.trim() || `Log search failed (exit ${code ?? "?"}).` });
 			} else {
-				finish({ text: clip(stdout.trimEnd()) });
+				const text = clip(stdout.trimEnd(), maxBytes);
+				searchLogCache.set(cacheKey, { size: stat.size, mtimeMs: stat.mtimeMs, text });
+				while (searchLogCache.size > 64) searchLogCache.delete(searchLogCache.keys().next().value as string);
+				finish({ text });
 			}
 		});
 	});
@@ -1028,6 +1115,33 @@ async function inlineOutput(
 		return `\nOutput omitted (exceeds inline limit ${maxBytes} bytes).`;
 	}
 	return output ? `\n\nOutput:\n${output}` : "";
+}
+
+interface ProcessOutputSelection {
+	pattern?: string;
+	lines?: number;
+	maxBytes?: number;
+}
+
+async function selectedProcessOutput(
+	id: string,
+	status: BsSession,
+	selection?: ProcessOutputSelection,
+	signal?: AbortSignal,
+): Promise<string> {
+	if (!selection || (!selection.pattern && selection.lines == null && selection.maxBytes == null)) {
+		return inlineOutput(id, status);
+	}
+	const maxBytes = selection.maxBytes ?? INLINE_OUTPUT_MAX_BYTES;
+	const lines = Math.min(Math.max(1, Math.floor(selection.lines ?? 30)), 200);
+	if (selection.pattern) {
+		const result = await searchLog(id, selection.pattern, lines, signal, maxBytes);
+		if (result.error) return `\nOutput filter failed: ${result.error}`;
+		const body = result.text || `(no output matching /${selection.pattern}/)`;
+		return `\n\nSelected output /${selection.pattern}/:\n${clip(body, maxBytes)}`;
+	}
+	const tail = (await bs(["log", "-s", id, "--tail", String(lines)])).stdout.trimEnd();
+	return tail ? `\n\nSelected tail (${lines} lines max):\n${clip(tail, maxBytes)}` : "";
 }
 
 export function summarizeNotificationCommand(command: string | undefined): string {
@@ -1305,7 +1419,10 @@ interface ToolCall {
 }
 export interface Progress {
 	turns: number;
+	/** Bounded recent calls for status rendering. */
 	toolCalls: ToolCall[];
+	/** Exact count, independent of the bounded recent-call ring. */
+	toolCallCount: number;
 	finalText: string;
 	/** Best-effort text from the currently streaming assistant message. */
 	streamingText: string;
@@ -1320,6 +1437,10 @@ export interface Progress {
 	cacheWriteTokens: number;
 	reasoningTokens: number;
 	cost: number;
+	inputCost: number;
+	outputCost: number;
+	cacheReadCost: number;
+	cacheWriteCost: number;
 	errorMsg?: string;
 	// RPC lifecycle bookkeeping (computed over the analyzed log slice):
 	agentStarts: number;
@@ -1362,6 +1483,7 @@ function emptyProgress(): Progress {
 	return {
 		turns: 0,
 		toolCalls: [],
+		toolCallCount: 0,
 		finalText: "",
 		streamingText: "",
 		modelCalls: 0,
@@ -1372,6 +1494,10 @@ function emptyProgress(): Progress {
 		cacheWriteTokens: 0,
 		reasoningTokens: 0,
 		cost: 0,
+		inputCost: 0,
+		outputCost: 0,
+		cacheReadCost: 0,
+		cacheWriteCost: 0,
 		agentStarts: 0,
 		agentEnds: 0,
 		agentSettled: 0,
@@ -1393,11 +1519,38 @@ export function subagentBudgetViolation(
 	if (budget.maxTurns != null && progress.turns >= budget.maxTurns) {
 		return `${progress.turns} turns reached maxTurns ${budget.maxTurns}`;
 	}
-	if (budget.maxToolCalls != null && progress.toolCalls.length >= budget.maxToolCalls) {
-		return `${progress.toolCalls.length} tool calls reached maxToolCalls ${budget.maxToolCalls}`;
+	if (budget.maxToolCalls != null && progress.toolCallCount >= budget.maxToolCalls) {
+		return `${progress.toolCallCount} tool calls reached maxToolCalls ${budget.maxToolCalls}`;
 	}
 	if (budget.maxUsageTokens != null && progress.usageTokens >= budget.maxUsageTokens) {
 		return `${progress.usageTokens} usage tokens reached maxUsageTokens ${budget.maxUsageTokens}`;
+	}
+	return null;
+}
+
+export function subagentBudgetSoftViolation(
+	progress: Progress,
+	budget?: SubagentBudget,
+	ratio = 0.8,
+): string | null {
+	if (!budget || ratio <= 0 || ratio >= 1) return null;
+	if (budget.maxCost != null && progress.cost >= budget.maxCost * ratio) {
+		return `cost $${progress.cost.toFixed(4)} reached ${Math.round(ratio * 100)}% of maxCost $${budget.maxCost.toFixed(4)}`;
+	}
+	if (budget.maxTurns != null && progress.turns >= Math.max(1, Math.ceil(budget.maxTurns * ratio))) {
+		return `${progress.turns} turns reached ${Math.round(ratio * 100)}% of maxTurns ${budget.maxTurns}`;
+	}
+	if (
+		budget.maxToolCalls != null &&
+		progress.toolCallCount >= Math.max(1, Math.ceil(budget.maxToolCalls * ratio))
+	) {
+		return `${progress.toolCallCount} tool calls reached ${Math.round(ratio * 100)}% of maxToolCalls ${budget.maxToolCalls}`;
+	}
+	if (
+		budget.maxUsageTokens != null &&
+		progress.usageTokens >= Math.max(1, Math.ceil(budget.maxUsageTokens * ratio))
+	) {
+		return `${progress.usageTokens} usage tokens reached ${Math.round(ratio * 100)}% of maxUsageTokens ${budget.maxUsageTokens}`;
 	}
 	return null;
 }
@@ -1449,16 +1602,19 @@ function parseEventLine(progress: Progress, raw: string): void {
 				| { type?: string; delta?: string }
 				| undefined;
 			if (update?.type === "text_delta" && typeof update.delta === "string") {
-				progress.streamingText += update.delta;
+				progress.streamingText = clip(progress.streamingText + update.delta, ANSWER_MAX_BYTES);
 			}
 			break;
 		}
 		case "tool_execution_start": {
 			const name = String(event.toolName ?? "tool");
+			progress.toolCallCount++;
 			progress.toolCalls.push({
 				name,
 				summary: summarizeToolCall(name, (event.args as Record<string, unknown>) ?? {}),
 			});
+			// Open-ended workers must not retain an unbounded tool history in Pi.
+			if (progress.toolCalls.length > 200) progress.toolCalls.splice(0, progress.toolCalls.length - 200);
 			break;
 		}
 		case "message_end": {
@@ -1466,6 +1622,8 @@ function parseEventLine(progress: Progress, raw: string): void {
 				| {
 						role?: string;
 						content?: { type: string; text?: string }[];
+						stopReason?: string;
+						errorMessage?: string;
 						usage?: {
 							input?: number;
 							output?: number;
@@ -1473,7 +1631,13 @@ function parseEventLine(progress: Progress, raw: string): void {
 							cacheWrite?: number;
 							reasoning?: number;
 							totalTokens?: number;
-							cost?: { total?: number };
+							cost?: {
+								input?: number;
+								output?: number;
+								cacheRead?: number;
+								cacheWrite?: number;
+								total?: number;
+							};
 						};
 					}
 				| undefined;
@@ -1482,7 +1646,10 @@ function parseEventLine(progress: Progress, raw: string): void {
 					.filter((content) => content.type === "text" && content.text)
 					.map((content) => content.text)
 					.join("");
-				if (text.trim()) progress.finalText = text;
+				if (text.trim()) progress.finalText = clip(text, ANSWER_MAX_BYTES);
+				if (message.stopReason === "error") {
+					progress.errorMsg = message.errorMessage || "subagent model request failed";
+				}
 				progress.streamingText = "";
 				if (message.usage) {
 					const finite = (value: number | undefined) =>
@@ -1495,6 +1662,10 @@ function parseEventLine(progress: Progress, raw: string): void {
 					progress.cacheReadTokens += finite(message.usage.cacheRead);
 					progress.cacheWriteTokens += finite(message.usage.cacheWrite);
 					progress.reasoningTokens += finite(message.usage.reasoning);
+					progress.inputCost += finite(message.usage.cost?.input);
+					progress.outputCost += finite(message.usage.cost?.output);
+					progress.cacheReadCost += finite(message.usage.cost?.cacheRead);
+					progress.cacheWriteCost += finite(message.usage.cost?.cacheWrite);
 					progress.cost += finite(message.usage.cost?.total);
 				}
 			}
@@ -1925,6 +2096,33 @@ async function spawnSubagent(
 		await bs(["kill", "-s", id]);
 		return { error: `subagent ${id} rejected the task: ${resp.error}` };
 	}
+	// Prompt acceptance does not guarantee provider authentication: Pi reports
+	// failures that occur after acceptance through the event stream. Probe a short
+	// window so immediate missing-key/config errors fail the spawn instead of
+	// creating a zero-work worker that the caller must discover later.
+	const startupProbe = await bs([
+		"expect",
+		"-s",
+		id,
+		"--since",
+		String(resp.offset),
+		"--timeout",
+		"500ms",
+		'(?m)^\\{"type":"(?:message_end|error|extension_error|agent_settled)"',
+	]);
+	if (startupProbe.code === 0) {
+		try {
+			const window = readLogWindowFrom(logPath(id), resp.offset);
+			const initialProgress = parseEvents(window.bytes.toString("utf8"));
+			if (initialProgress.errorMsg && initialProgress.modelCalls === 0) {
+				discardDelivery(delivery);
+				await bs(["kill", "-s", id]);
+				return { error: `subagent ${id} failed before its first model response: ${initialProgress.errorMsg}` };
+			}
+		} catch {
+			/* normal startup continues; the full stream remains available to check/wait */
+		}
+	}
 	// Report the RESOLVED model (a fuzzy pattern may match something unexpected;
 	// null means nothing resolved at all).
 	let resolvedModel: string | undefined;
@@ -1985,8 +2183,10 @@ const WIDGET_TAIL_WIDTH = 100;
 // Strip ANSI/control escapes and clamp width so raw PTY output can't wrap or
 // corrupt the widget area.
 function sanitizeTailLine(s: string): string {
-	const clean = s
-		.replace(/\r/g, "")
+	// PTY progress bars often redraw one logical line with carriage returns.
+	// Keep the latest frame rather than concatenating every historical frame.
+	const terminalFrame = s.split("\r").filter(Boolean).at(-1) ?? "";
+	const clean = terminalFrame
 		// CSI / OSC / other escape sequences
 		.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
 		.replace(/\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]/g, "")
@@ -1995,9 +2195,34 @@ function sanitizeTailLine(s: string): string {
 	return clean.length > WIDGET_TAIL_WIDTH ? `${clean.slice(0, WIDGET_TAIL_WIDTH - 1)}…` : clean;
 }
 
+function readTailLines(file: string, lines: number, maxBytes = 64_000): string[] {
+	try {
+		const size = fs.statSync(file).size;
+		const start = Math.max(0, size - maxBytes);
+		const length = size - start;
+		const bytes = Buffer.allocUnsafe(length);
+		const fd = fs.openSync(file, "r");
+		let read = 0;
+		try {
+			while (read < length) {
+				const count = fs.readSync(fd, bytes, read, length - read, start + read);
+				if (count === 0) break;
+				read += count;
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+		const parts = bytes.subarray(0, read).toString("utf8").split("\n");
+		if (start > 0) parts.shift(); // first fragment may begin mid-line
+		return parts.slice(-Math.max(1, lines + 1));
+	} catch {
+		return [];
+	}
+}
+
 // Trailing lines to show for a running session (sanitized, unprefixed).
-// process → raw log tail; subagent → derived activity (recent tool calls /
-// partial answer), since its log is RPC JSONL, not human-readable.
+// Process tails are read directly from the bounded end of output.log, avoiding
+// one `babysit log` subprocess per active process on every poll.
 async function widgetTail(
 	id: string,
 	isSub: boolean,
@@ -2005,8 +2230,7 @@ async function widgetTail(
 ): Promise<string[]> {
 	let raw: string[];
 	if (!isSub) {
-		const out = (await bs(["log", "-s", id, "--tail", String(WIDGET_TAIL_LINES)])).stdout;
-		raw = out.split("\n");
+		raw = readTailLines(logPath(id), WIDGET_TAIL_LINES);
 	} else {
 		const progress = subagentProgress ?? taskProgressOf(id).progress;
 		if (progress.finalText.trim()) {
@@ -2047,6 +2271,90 @@ interface WaitOutcome {
 	progress?: Progress;
 }
 
+export interface NestedUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+	cost: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+}
+
+export function usageFromProgress(progress: Progress): NestedUsage | undefined {
+	if (progress.modelCalls === 0) return undefined;
+	return {
+		input: progress.inputTokens,
+		output: progress.outputTokens,
+		cacheRead: progress.cacheReadTokens,
+		cacheWrite: progress.cacheWriteTokens,
+		totalTokens: progress.usageTokens,
+		cost: {
+			input: progress.inputCost,
+			output: progress.outputCost,
+			cacheRead: progress.cacheReadCost,
+			cacheWrite: progress.cacheWriteCost,
+			total: progress.cost,
+		},
+	};
+}
+
+/** Charge one completed task exactly once, even across concurrent wait callers. */
+function claimOutcomeUsage(outcome: WaitOutcome): NestedUsage | undefined {
+	if (!outcome.progress || (outcome.kind !== "done" && outcome.kind !== "exited")) return undefined;
+	const usage = usageFromProgress(outcome.progress);
+	if (!usage) return undefined;
+	const meta = readMeta(outcome.id);
+	if (meta?.kind !== "subagent") return undefined;
+	const offset = meta.promptOffset ?? 0;
+	if (meta.usageReportedOffset === offset) return undefined;
+
+	// `open(..., "wx")` is the cross-process compare-and-set. A resumed Pi
+	// session can briefly have overlapping extension processes; metadata alone
+	// would let both read the old value and charge the same nested usage.
+	const marker = path.join(metaDir(), `${outcome.id}.usage-${offset}.claimed`);
+	if (!claimFileOnce(marker, JSON.stringify({ pid: process.pid, claimedAt: Date.now() }))) {
+		return undefined;
+	}
+	meta.usageReportedOffset = offset;
+	writeMeta(outcome.id, meta); // compatibility/display hint; marker is authoritative
+	return usage;
+}
+
+function sumNestedUsage(values: Array<NestedUsage | undefined>): NestedUsage | undefined {
+	const present = values.filter((value): value is NestedUsage => Boolean(value));
+	if (present.length === 0) return undefined;
+	return present.reduce<NestedUsage>(
+		(total, value) => ({
+			input: total.input + value.input,
+			output: total.output + value.output,
+			cacheRead: total.cacheRead + value.cacheRead,
+			cacheWrite: total.cacheWrite + value.cacheWrite,
+			totalTokens: total.totalTokens + value.totalTokens,
+			cost: {
+				input: total.cost.input + value.cost.input,
+				output: total.cost.output + value.cost.output,
+				cacheRead: total.cost.cacheRead + value.cost.cacheRead,
+				cacheWrite: total.cost.cacheWrite + value.cost.cacheWrite,
+				total: total.cost.total + value.cost.total,
+			},
+		}),
+		{
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	);
+}
+
 // Wait for ONE subagent's current task. Completion = agent_settled without a
 // parked babysit_run/process result (a parked run only means "waiting for
 // process exit; pi will resume itself"). Parse appended bytes incrementally,
@@ -2069,7 +2377,7 @@ async function waitForTask(
 		const st = await statusOf(id);
 
 		const stats =
-			`turns=${prog.turns} calls=${prog.modelCalls} tools=${prog.toolCalls.length}` +
+			`turns=${prog.turns} calls=${prog.modelCalls} tools=${prog.toolCallCount}` +
 			(prog.tokens != null ? ` ctx=${prog.tokens}` : "") +
 			(prog.modelCalls > 0
 				? ` usage=${prog.usageTokens} (in=${prog.inputTokens} out=${prog.outputTokens} cache=${prog.cacheReadTokens}) $${prog.cost.toFixed(4)}`
@@ -2083,7 +2391,7 @@ async function waitForTask(
 				ok: completed.ok,
 				text:
 					`Subagent ${id} finished its task (${stats}).\n` +
-					`Session stays alive — follow-up: babysit_send { id: "${id}" }, ` +
+					`${SUBAGENT_REUSE_HINT} Follow-up: babysit_send { id: "${id}" }, ` +
 					`or babysit_kill when done.\n\n${completed.body}`,
 				status: st,
 				progress: prog,
@@ -2227,6 +2535,7 @@ async function waitForExit(
 	limitMs: number | null,
 	signal?: AbortSignal,
 	expectPattern?: string,
+	outputSelection?: ProcessOutputSelection,
 ): Promise<WaitOutcome> {
 	const t = limitMs != null ? `${Math.ceil(limitMs / 1000)}s` : "0";
 
@@ -2315,7 +2624,7 @@ async function waitForExit(
 	const meta = readMeta(id);
 	const workerDead = st.state === "dead" && st.exit_code == null;
 	const ok = st.exit_code === 0;
-	const output = await inlineOutput(id, st);
+	const output = await selectedProcessOutput(id, st, outputSelection, signal);
 	return {
 		id,
 		kind: "exited",
@@ -2405,6 +2714,21 @@ export function automaticNotificationGroup(entry: unknown): string | undefined {
 	return runs.length >= 2 ? group : undefined;
 }
 
+export function resolveSubagentSendMode(
+	requested: "auto" | "steer" | "task",
+	streaming?: boolean,
+	currentTaskDone?: boolean,
+): { mode: "steer" | "task" } | { error: "busy" | "unknown" | "unsettled" } {
+	if (requested === "steer") return { mode: "steer" };
+	if (requested === "auto") {
+		return { mode: streaming === false && currentTaskDone === true ? "task" : "steer" };
+	}
+	if (streaming === true) return { error: "busy" };
+	if (streaming === undefined || currentTaskDone === undefined) return { error: "unknown" };
+	if (!currentTaskDone) return { error: "unsettled" };
+	return { mode: "task" };
+}
+
 // ---------------------------------------------------------------------------
 // extension
 // ---------------------------------------------------------------------------
@@ -2459,76 +2783,88 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function enforceSubagentBudgets(sessions: BsSession[]): Promise<void> {
-		for (const session of sessions) {
-			if (session.state !== "running") continue;
-			await withSessionRpcLock(session.id, async () => {
-				const meta = readMeta(session.id);
-				if (meta?.kind !== "subagent" || !meta.budget || meta.budgetKilled) return;
+		// Independent workers must not serialize 3-second RPC probes and delay
+		// unrelated completion notifications. Per-session RPC locks still preserve
+		// ordering within each worker.
+		await Promise.all(
+			sessions
+				.filter((session) => session.state === "running")
+				.map((session) =>
+					withSessionRpcLock(session.id, async () => {
+						const meta = readMeta(session.id);
+						if (meta?.kind !== "subagent" || !meta.budget || meta.budgetKilled) return;
 
-				let progress: Progress;
-				try {
-					progress = taskProgressOf(session.id).progress;
-				} catch {
-					return;
-				}
-				if (progress.done) return;
-				const now = Date.now();
-				const decision = subagentBudgetAction(
-					progress,
-					meta.budget,
-					meta.budgetExceededAt,
-					now,
-					SUBAGENT_BUDGET_GRACE_MS,
-				);
-				if (decision.action === "none") return;
-				const reason = decision.reason as string;
+						let progress: Progress;
+						try {
+							progress = taskProgressOf(session.id).progress;
+						} catch {
+							return;
+						}
+						if (progress.done) return;
+						const now = Date.now();
+						const hardReason = subagentBudgetViolation(progress, meta.budget);
+						const softReason = subagentBudgetSoftViolation(progress, meta.budget);
 
-				// The poll already supplied a running-session snapshot. Revalidate only
-				// when a limit requires action; checking every healthy worker made each
-				// interval launch N extra `babysit list` subprocesses.
-				const latestStatus = await statusOf(session.id);
-				if (latestStatus?.state !== "running") return;
+						if (hardReason) {
+							if (meta.budgetExceededAt == null) {
+								// The hard grace begins when the violation is observed, even if a
+								// wedged worker never accepts steering. This makes the cap enforceable.
+								meta.budgetExceededAt = now;
+								meta.budgetReason = hardReason;
+								writeMeta(session.id, meta);
+								const latestStatus = await statusOf(session.id);
+								if (latestStatus?.state !== "running") return;
+								const sent = await sendRpc(session.id, {
+									type: "steer",
+									message: `Hard budget reached (${hardReason}). Stop calling tools and return your best answer now.`,
+								});
+								if (!("error" in sent)) await rpcResponse(session.id, sent.offset, "steer", "3s");
+								return;
+							}
+							if (now - meta.budgetExceededAt < SUBAGENT_BUDGET_GRACE_MS) return;
+							const latestStatus = await statusOf(session.id);
+							if (latestStatus?.state !== "running") return;
+							const killed = await bs(["kill", "-s", session.id, "--json"]);
+							if (killed.code !== 0) return;
+							const terminal = await awaitConfirmedTermination(session.id);
+							const current = readMeta(session.id);
+							if (
+								terminal &&
+								isConfirmedTerminalState(terminal.state) &&
+								current?.kind === "subagent" &&
+								current.promptOffset === meta.promptOffset &&
+								current.budgetExceededAt === meta.budgetExceededAt
+							) {
+								current.budgetKilled = true;
+								current.budgetReason = current.budgetReason ?? hardReason;
+								writeMeta(session.id, current);
+							}
+							return;
+						}
 
-				if (decision.action === "steer") {
-					// Start the grace period only after Pi accepts the steering command.
-					const sent = await sendRpc(session.id, {
-						type: "steer",
-						message: `Budget reached (${reason}). Stop calling tools and provide your final answer now.`,
-					});
-					if ("error" in sent) return;
-					const accepted = await rpcResponse(session.id, sent.offset, "steer", "3s");
-					if (!accepted.ok) return;
-					const current = readMeta(session.id);
-					if (
-						current?.kind !== "subagent" ||
-						current.promptOffset !== meta.promptOffset ||
-						current.budgetExceededAt
-					) {
-						return;
-					}
-					current.budgetExceededAt = now;
-					current.budgetReason = reason;
-					writeMeta(session.id, current);
-					return;
-				}
-
-				const killed = await bs(["kill", "-s", session.id, "--json"]);
-				if (killed.code !== 0) return;
-				const terminal = await awaitConfirmedTermination(session.id);
-				const current = readMeta(session.id);
-				if (
-					terminal &&
-					isConfirmedTerminalState(terminal.state) &&
-					current?.kind === "subagent" &&
-					current.promptOffset === meta.promptOffset &&
-					current.budgetExceededAt === meta.budgetExceededAt
-				) {
-					current.budgetKilled = true;
-					current.budgetReason = current.budgetReason ?? reason;
-					writeMeta(session.id, current);
-				}
-			});
-		}
+						if (!softReason || meta.budgetWarnedAt != null) return;
+						const latestStatus = await statusOf(session.id);
+						if (latestStatus?.state !== "running") return;
+						const sent = await sendRpc(session.id, {
+							type: "steer",
+							message: `Budget is approaching its limit (${softReason}). Wrap up now and preserve your best findings.`,
+						});
+						if ("error" in sent) return;
+						const accepted = await rpcResponse(session.id, sent.offset, "steer", "3s");
+						if (!accepted.ok) return;
+						const current = readMeta(session.id);
+						if (
+							current?.kind === "subagent" &&
+							current.promptOffset === meta.promptOffset &&
+							current.budgetWarnedAt == null
+						) {
+							current.budgetWarnedAt = now;
+							current.budgetWarningReason = softReason;
+							writeMeta(session.id, current);
+						}
+					}),
+				),
+		);
 	}
 
 	// Exit notifications for kind=process sessions: the poller detects
@@ -2775,9 +3111,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		taskProgressCache.clear();
+		searchLogCache.clear();
 		pollNeeded = true;
-		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS);
-		if (!automaticGcRan && Number.isFinite(retentionDays) && retentionDays > 0) {
+		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
+		if (
+			!automaticGcRan &&
+			Number.isFinite(retentionDays) &&
+			retentionDays > 0 &&
+			automaticGcDue()
+		) {
 			automaticGcRan = true;
 			const gc = gcBabysitRoots({
 				rootBase: ROOT_BASE,
@@ -2785,6 +3127,7 @@ export default function (pi: ExtensionAPI) {
 				olderThanMs: retentionDays * 86_400_000,
 				dryRun: false,
 			});
+			markAutomaticGc();
 			if (gc.deleted.length > 0 && ctx.hasUI) {
 				ctx.ui.notify(
 					`pi-babysit GC removed ${gc.deleted.length} roots (${gc.bytes} bytes).`,
@@ -2880,35 +3223,18 @@ export default function (pi: ExtensionAPI) {
 		name: "babysit_run",
 		label: "Babysit: run",
 		description:
-			"Run any shell command in a supervised babysit session. Set `foreground: true` when the next step " +
-			"needs the exit result in this tool call. Otherwise commands that finish within a short grace period " +
-			"return completion metadata immediately; longer commands continue in the background and trigger an " +
-			"automatic notification on exit. Sibling background runs in one assistant message are grouped " +
-			"automatically. Complete output is returned inline only when it is small; larger output stays " +
-			"in the log path for bounded inspection with babysit_check. " +
-			"In non-interactive mode (`pi -p`, no UI), process mode blocks until exit because there is no " +
-			"notification loop. Two modes: (1) `command` — run any shell command, including builds, tests, " +
-			"dev servers, watchers, and interactive TUIs; you can type into it with babysit_send and read " +
-			"its screen with babysit_check. If a worker disappears during startup without recording an exit, " +
-			"`retryOnWorkerDeath` can retry one idempotent command once. " +
-			"(2) `profile: \"subagent\"` + `task` — spawn a pi subagent that works on the task in the " +
-			"background; poll with babysit_check, steer with babysit_send, block with babysit_wait, " +
-			"stop with babysit_kill. Subagents cannot recursively spawn more subagents by default; " +
-			"the top-level caller must explicitly raise `maxDepth` when creating the first worker.",
-		promptSnippet:
-			"Run any shell command with context-safe captured output; quick commands return metadata, longer ones continue in background",
+			"Run a supervised shell command, or start a reusable pi subagent with `profile: \"subagent\"`. " +
+			"Use `foreground` for results needed now; otherwise long commands notify on exit. Full logs stay on disk. " +
+			"`returnPattern`/`returnLines` bound foreground output. Sessions support check, wait, send, and kill.",
+		promptSnippet: "Run supervised commands or bounded pi subagents with context-safe logs",
 		promptGuidelines: [
-			"Use babysit_run as the default for shell commands, not only long-running work. Small output is returned directly; large stdout/stderr stays out of model context in the returned log path. Give every meaningful process or subagent a clear stable `name`.",
-			"Use babysit_run { command, foreground: true } when the result is required before the next step; this avoids a separate babysit_wait model turn. Do not use foreground for servers, watchers, or commands of unknown duration without a timeout.",
-			"Bundle closely related tiny observations into one babysit_run command when that reduces tool turns without obscuring lifecycle or failure handling.",
-			"Inspect a babysit log with babysit_check { id, lines, pattern? }; never read or cat a potentially large log file in full. Prefer a targeted `pattern` search over returning a broad tail.",
-			"After babysit_run { command } starts a process, end your response immediately so the automatic process-end notification can resume you; NEVER poll with babysit_check or sleep. Set continueAfterStart: true only when you have immediate, specific, non-polling work to do next. Call babysit_wait when you must consume the result inside the current turn (optionally with `expect` to wait for a readiness line like 'listening on').",
-			"If a babysit worker is killed externally, babysit_run reports it as worker-dead rather than hanging. Set retryOnWorkerDeath: true only for safe, idempotent commands; it retries at most once and may otherwise duplicate side effects.",
-			"babysit_run gives full PTY control: drive interactive programs (installers, wizards, REPLs) with babysit_send (text or named keys) and read the rendered screen with babysit_check { screen: true }.",
-			"Delegate self-contained tasks (codebase recon, a parallelizable subtask, work that would pollute your context) with babysit_run { profile: \"subagent\", task }. Launch several for independent subtasks; they run concurrently.",
-			"Set at least one subagent budget (`maxCost`, `maxTurns`, `maxToolCalls`, or `maxUsageTokens`) for bounded recon and review tasks. Omit budgets only for intentionally open-ended work; the absolute timeout remains a separate safety limit.",
-			"Subagents cannot create further subagents by default (maximum depth 1). Only the top-level caller can explicitly opt in by setting maxDepth when it creates the first worker; nested workers inherit that limit and cannot raise it.",
-			"After spawning subagents, do not idle-wait and do not end your turn to wait for them: keep making progress, then call babysit_wait (ids + mode any/all) when you need their results. Steer or send follow-up tasks with babysit_send; kill runaways with babysit_kill.",
+			"Use babysit_run for shell commands and give meaningful sessions a stable name; bundle tiny related observations.",
+			"Use babysit_run foreground mode when the next step needs the result; use returnPattern/returnLines for noisy commands. Do not foreground unbounded servers.",
+			"After a background process starts, stop the turn for its automatic notification; never poll or sleep. Use continueAfterStart only for specific non-polling work.",
+			"Inspect large logs with a narrow babysit_check pattern and maxBytes rather than broad tails.",
+			"Use retryOnWorkerDeath only once and only for idempotent commands; retries may duplicate side effects.",
+			"Delegate independent work with bounded babysit_run subagents; set at least one cost/turn/tool/token budget and keep making progress before babysit_wait.",
+			"Subagent recursion defaults to depth 1; only a top-level caller may explicitly raise maxDepth.",
 		],
 		parameters: Type.Object({
 			command: Type.Optional(
@@ -2995,9 +3321,17 @@ export default function (pi: ExtensionAPI) {
 			),
 			foreground: Type.Optional(
 				Type.Boolean({
-					description:
-						"Process mode: wait for exit and return the result in this tool call. Use when the next step needs the result; avoid for servers/watchers unless bounded by timeout.",
+					description: "Process: wait for exit and return the result now.",
 				}),
+			),
+			returnPattern: Type.Optional(
+				Type.String({ description: "Foreground/quick process: return only latest regex matches." }),
+			),
+			returnLines: Type.Optional(
+				Type.Integer({ minimum: 1, maximum: 200, description: "Lines retained by returnPattern/tail (default 30)." }),
+			),
+			maxBytes: Type.Optional(
+				Type.Integer({ minimum: 1_000, maximum: ANSWER_MAX_BYTES, description: "Returned process-output cap (default 8 KB)." }),
 			),
 			notificationGroup: Type.Optional(
 				Type.String({
@@ -3069,6 +3403,13 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			if (isSubagent && (params.returnPattern || params.returnLines != null || params.maxBytes != null)) {
+				return {
+					content: [{ type: "text", text: "`returnPattern`, `returnLines`, and `maxBytes` are process-output options." }],
+					isError: true,
+					details: {},
+				};
+			}
 			if (!isSubagent && params.foreground && params.continueAfterStart) {
 				return {
 					content: [{ type: "text", text: "`foreground` and `continueAfterStart` are mutually exclusive." }],
@@ -3092,6 +3433,21 @@ export default function (pi: ExtensionAPI) {
 
 			// --- process mode ---
 			if (!isSubagent) {
+				if (params.returnPattern) {
+					try {
+						new RegExp(params.returnPattern);
+					} catch (error) {
+						return {
+							content: [{ type: "text", text: `Invalid returnPattern: ${String(error)}` }],
+							isError: true,
+							details: {},
+						};
+					}
+				}
+				const outputSelection: ProcessOutputSelection | undefined =
+					params.returnPattern || params.returnLines != null || params.maxBytes != null
+						? { pattern: params.returnPattern, lines: params.returnLines, maxBytes: params.maxBytes }
+						: undefined;
 				const spawnOpts: ProcOpts = {
 					name: params.name,
 					command: params.command as string,
@@ -3122,14 +3478,14 @@ export default function (pi: ExtensionAPI) {
 					// the same deadline here races its terminal-state write and can return a
 					// false "still running" result at the boundary, so wait for the
 					// supervisor's definitive exit instead.
-					let outcome = await waitForExit(res.id, null, _signal);
+					let outcome = await waitForExit(res.id, null, _signal, undefined, outputSelection);
 					let retried = false;
 					if (params.retryOnWorkerDeath && outcome.status?.state === "dead" && outcome.status.exit_code == null) {
 						const retry = await spawnProcess(spawnOpts);
 						if (!("error" in retry)) {
 							res = retry;
 							retried = true;
-							outcome = await waitForExit(res.id, null, _signal);
+							outcome = await waitForExit(res.id, null, _signal, undefined, outputSelection);
 						}
 					}
 					if (ctx.hasUI) await refreshWidget(ctx);
@@ -3167,7 +3523,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				if (quickStatus && quickStatus.state !== "running") {
-					const outcome = await waitForExit(res.id, null, _signal);
+					const outcome = await waitForExit(res.id, null, _signal, undefined, outputSelection);
 					await refreshWidget(ctx);
 					return {
 						content: [{ type: "text", text: `${retried ? "Retried once after external worker death.\n" : ""}${outcome.text}` }],
@@ -3369,6 +3725,13 @@ export default function (pi: ExtensionAPI) {
 			lines: Type.Optional(
 				Type.Number({ description: "How many tail lines or latest matches to show (default 30, max 200)." }),
 			),
+			maxBytes: Type.Optional(
+				Type.Integer({
+					minimum: 1_000,
+					maximum: ANSWER_MAX_BYTES,
+					description: "Maximum returned bytes for this check (default 4 KB).",
+				}),
+			),
 			pattern: Type.Optional(
 				Type.String({
 					description:
@@ -3456,6 +3819,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const meta = readMeta(params.id);
 			const nLines = Math.min(Math.max(1, Math.floor(params.lines ?? 30)), 200);
+			const checkMaxBytes = params.maxBytes ?? TAIL_MAX_BYTES;
 			if (params.pattern !== undefined) {
 				if (params.screen) {
 					return {
@@ -3471,7 +3835,7 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				const result = await searchLog(params.id, params.pattern, nLines, signal);
+				const result = await searchLog(params.id, params.pattern, nLines, signal, checkMaxBytes);
 				if (result.error) {
 					return {
 						content: [{ type: "text", text: result.error }],
@@ -3485,7 +3849,7 @@ export default function (pi: ExtensionAPI) {
 					? `--- latest matches /${params.pattern}/ ---\n${result.text}`
 					: `(no output matching /${params.pattern}/)`;
 				return {
-					content: [{ type: "text", text: clip(`${header}\n${body}`) }],
+					content: [{ type: "text", text: clip(`${header}\n${body}`, checkMaxBytes) }],
 					details: { status: st, kind, logPath: logPath(params.id), pattern: params.pattern },
 				};
 			}
@@ -3505,15 +3869,16 @@ export default function (pi: ExtensionAPI) {
 				parts.push(header);
 				if (params.screen) {
 					const sc = await bs(["screenshot", "-s", params.id, "--trim"]);
-					parts.push(`--- screen ---\n${clip(sc.stdout.trimEnd()) || "(blank screen)"}`);
+					parts.push(`--- screen ---\n${clip(sc.stdout.trimEnd(), checkMaxBytes) || "(blank screen)"}`);
 				} else {
 					const tail = clip(
 						(await bs(["log", "-s", params.id, "--tail", String(nLines)])).stdout.trimEnd(),
+						checkMaxBytes,
 					);
 					parts.push(tail ? `--- recent output ---\n${tail}` : "(no output yet)");
 				}
 				return {
-					content: [{ type: "text", text: clip(parts.join("\n")) }],
+					content: [{ type: "text", text: clip(parts.join("\n"), checkMaxBytes) }],
 					details: { status: st, kind: "process", logPath: logPath(params.id) },
 				};
 			}
@@ -3536,7 +3901,7 @@ export default function (pi: ExtensionAPI) {
 						: " · working";
 			}
 			if (st.exit_code != null) header += ` exit_code=${st.exit_code}`;
-			header += ` turns=${prog.turns} calls=${prog.modelCalls} tools=${prog.toolCalls.length}`;
+			header += ` turns=${prog.turns} calls=${prog.modelCalls} tools=${prog.toolCallCount}`;
 			if (prog.tokens != null) header += ` ctx=${prog.tokens}`;
 			if (prog.modelCalls > 0) header += ` usage=${prog.usageTokens} $${prog.cost.toFixed(4)}`;
 			if (st.note) header += ` ⚑ ${st.note}`;
@@ -3545,7 +3910,7 @@ export default function (pi: ExtensionAPI) {
 			if (prog.errorMsg) parts.push(`⚠ error: ${clip(prog.errorMsg, ANSWER_MAX_BYTES)}`);
 
 			if (recent.length > 0) {
-				const skipped = prog.toolCalls.length - recent.length;
+				const skipped = Math.max(0, prog.toolCallCount - recent.length);
 				parts.push(
 					`--- recent tool calls${skipped > 0 ? ` (+${skipped} earlier)` : ""} ---\n` +
 						recent.map((t) => `  ${t.summary}`).join("\n"),
@@ -3554,16 +3919,16 @@ export default function (pi: ExtensionAPI) {
 
 			if (prog.finalText.trim()) {
 				parts.push(`--- answer so far ---\n${clip(prog.finalText.trim(), ANSWER_MAX_BYTES)}`);
-			} else if (prog.toolCalls.length === 0 && st.state !== "running") {
+			} else if (prog.toolCallCount === 0 && st.state !== "running") {
 				parts.push(buildSubagentExitDiagnostic(prog, logPath(params.id)));
-			} else if (prog.toolCalls.length === 0) {
+			} else if (prog.toolCallCount === 0) {
 				parts.push("(starting up… no events yet)");
 			} else {
 				parts.push("(working… no answer text yet)");
 			}
 
 			return {
-				content: [{ type: "text", text: clip(parts.join("\n")) }],
+				content: [{ type: "text", text: clip(parts.join("\n"), checkMaxBytes) }],
 				details: { status: st, progress: prog, kind: "subagent" },
 			};
 		},
@@ -3577,7 +3942,7 @@ export default function (pi: ExtensionAPI) {
 			"Send input to a babysit session. Process: `text` types a line into its stdin (PTY), " +
 			"`keys` presses named keys (Enter, Tab, Esc, Up/Down/Left/Right, C-c, F1…) — use with " +
 			"babysit_check { screen: true } to drive interactive programs. Subagent: `text` is " +
-			"STEERING while it works, or a NEW TASK when it is idle (mode: auto/steer/task) — this " +
+			"STEERING while it works, or a NEW TASK after the current task settles (mode: auto/steer/task) — this " +
 			"is how you resume a finished subagent with full context.",
 		promptSnippet: "Send text/keys to a process, or steering/follow-up tasks to a subagent",
 		parameters: Type.Object({
@@ -3593,7 +3958,7 @@ export default function (pi: ExtensionAPI) {
 			mode: Type.Optional(
 				StringEnum(["auto", "steer", "task"] as const, {
 					description:
-						"Subagent only. auto (default): steer if mid-run, otherwise start a new task. steer/task force one behavior.",
+						"Subagent only. auto (default): steer unless the current task is settled. task requires confirmed settlement; steer always sends guidance.",
 				}),
 			),
 			noNewline: Type.Optional(
@@ -3693,15 +4058,39 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			let mode = params.mode ?? "auto";
-			if (mode === "auto") {
-				// isStreaming tells us whether an agent run is in flight right now.
+			if (mode === "auto" || mode === "task") {
+				// A prompt sent while the current run is streaming can queue behind that
+				// run while immediately replacing our per-task offsets and budget state.
+				// Establish idleness before every new task; auto safely falls back to
+				// steering when state is unknown, while an explicit task fails closed.
 				const gs = await sendRpc(params.id, { type: "get_state" });
-				let streaming = true; // assume busy when unsure — steering is the safe default
+				let streaming: boolean | undefined;
 				if (!("error" in gs)) {
 					const r = await rpcResponse(params.id, gs.offset, "get_state", "10s");
 					if (r.ok) streaming = Boolean((r.data as { isStreaming?: boolean })?.isStreaming);
 				}
-				mode = streaming ? "steer" : "task";
+				let currentTaskDone: boolean | undefined;
+				try {
+					currentTaskDone = taskProgressOf(params.id).progress.done;
+				} catch {
+					/* fail closed below rather than replacing unknown task state */
+				}
+				const resolved = resolveSubagentSendMode(mode, streaming, currentTaskDone);
+				if ("error" in resolved) {
+					return {
+						content: [{
+							type: "text",
+							text: resolved.error === "busy"
+								? `Subagent ${params.id} is still streaming; use mode \"steer\" or wait for the current task to settle before starting another task.`
+								: resolved.error === "unsettled"
+									? `Subagent ${params.id} has not settled its current task (it may be parked on a background process); wait for completion before starting another task.`
+									: `Could not verify that subagent ${params.id} is idle and settled; retry with mode \"task\" after checking its state.`,
+						}],
+						isError: true,
+						details: { mode: "task" },
+					};
+				}
+				mode = resolved.mode;
 			}
 			const deliveryCleanupAfter =
 				mode === "steer"
@@ -3755,10 +4144,13 @@ export default function (pi: ExtensionAPI) {
 					depth: meta?.depth,
 					maxDepth: meta?.maxDepth,
 					budget: meta?.budget,
-					// Each follow-up task receives a fresh budget window.
+					// Each follow-up task receives fresh budget and usage-accounting windows.
+					budgetWarnedAt: undefined,
+					budgetWarningReason: undefined,
 					budgetExceededAt: undefined,
 					budgetReason: undefined,
 					budgetKilled: undefined,
+					usageReportedOffset: undefined,
 				});
 			} else if (delivery.tempDir && meta) {
 				writeMeta(params.id, {
@@ -3793,7 +4185,7 @@ export default function (pi: ExtensionAPI) {
 			"Block until babysit session(s) finish, then return the result. A process finishes " +
 			"when it EXITS (or, with `expect`, as soon as a regex appears in its output — e.g. wait " +
 			"for 'listening on' before hitting a dev server). A subagent finishes when its current " +
-			"TASK completes (the session stays alive for follow-ups). Pass `id` for one session, or " +
+			"TASK completes (the worker remains reusable only during its configured idle grace). Pass `id` for one session, or " +
 			"`ids` + `mode`: 'all' (default) waits for every one, 'any' returns on the FIRST finisher. " +
 			"Multi-session results are capped at the inline-output limit (8 KB by default); use `maxBytes` " +
 			"to opt into a larger result up to 24 KB. " +
@@ -3865,9 +4257,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (ids.length === 1) {
 				const r = await waitFor(ids[0], limitMs, signal, params.expect);
+				const usage = claimOutcomeUsage(r);
 				return {
 					content: [{ type: "text", text: r.text }],
 					isError: !r.ok,
+					usage,
 					details: {
 						status: r.status,
 						progress: r.progress,
@@ -3883,6 +4277,7 @@ export default function (pi: ExtensionAPI) {
 					ids.map((i) => waitFor(i, limitMs, signal, params.expect)),
 				);
 				const ok = results.every((r) => r.ok);
+				const usage = sumNestedUsage(results.map(claimOutcomeUsage));
 				return {
 					content: [
 						{
@@ -3894,6 +4289,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					isError: !ok,
+					usage,
 					details: {
 						results: results.map((r) => ({ id: r.id, kind: r.kind, ok: r.ok })),
 					},
@@ -3910,6 +4306,7 @@ export default function (pi: ExtensionAPI) {
 					ids.map((i) => waitFor(i, limitMs, ctrl.signal, params.expect)),
 				);
 				const others = ids.filter((i) => i !== first.id);
+				const usage = claimOutcomeUsage(first);
 				return {
 					content: [
 						{
@@ -3923,6 +4320,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					isError: !first.ok,
+					usage,
 					details: { first: { id: first.id, kind: first.kind, ok: first.ok }, remaining: others },
 				};
 			} finally {
@@ -4073,7 +4471,7 @@ export default function (pi: ExtensionAPI) {
 				// Parse the RPC event stream and show the final answer, not raw JSONL.
 				const prog = taskProgressOf(picked.id).progress;
 				const stats =
-					`turns=${prog.turns} calls=${prog.modelCalls} tools=${prog.toolCalls.length}` +
+					`turns=${prog.turns} calls=${prog.modelCalls} tools=${prog.toolCallCount}` +
 					(prog.tokens != null ? ` ctx=${prog.tokens}` : "") +
 					(prog.modelCalls > 0 ? ` usage=${prog.usageTokens} $${prog.cost.toFixed(4)}` : "");
 				const body =
