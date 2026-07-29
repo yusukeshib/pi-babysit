@@ -418,6 +418,13 @@ interface Meta {
 	budgetKilled?: boolean;
 	/** Prompt offset whose nested usage has already been charged to the parent session. */
 	usageReportedOffset?: number;
+	/** Prompt offset explicitly collected by foreground mode or babysit_wait. */
+	subagentCollectedOffset?: number;
+	/** Prompt offset whose ready-to-collect reminder was sent to the parent. */
+	subagentNotifiedOffset?: number;
+	/** Current task completion first observed by the reminder poller. */
+	subagentCompletionObservedOffset?: number;
+	subagentCompletionObservedAt?: number;
 }
 
 const metaDir = () => path.join(ROOT, "meta");
@@ -731,6 +738,16 @@ export function shouldDeliverProcessCompletion(
 	return meta?.kind === "process" && !meta.notified && !meta.notificationPaused;
 }
 
+export function shouldDeliverSubagentCompletion(meta: Meta | null): meta is Meta & { kind: "subagent" } {
+	if (meta?.kind !== "subagent") return false;
+	const offset = meta.promptOffset ?? 0;
+	return (
+		meta.usageReportedOffset !== offset &&
+		meta.subagentCollectedOffset !== offset &&
+		meta.subagentNotifiedOffset !== offset
+	);
+}
+
 export function isNotificationGroupReady(
 	meta: Meta,
 	sessions: BsSession[],
@@ -752,10 +769,14 @@ export function shouldKeepPolling(
 	sessions: Array<{ id: string; state: string }>,
 	metaFor: (id: string) => Meta | null,
 ): boolean {
-	return sessions.some(
-		(session) =>
-			session.state === "running" || shouldDeliverProcessCompletion(metaFor(session.id)),
-	);
+	return sessions.some((session) => {
+		const meta = metaFor(session.id);
+		return (
+			session.state === "running" ||
+			shouldDeliverProcessCompletion(meta) ||
+			(session.state !== "running" && shouldDeliverSubagentCompletion(meta))
+		);
+	});
 }
 
 export function shouldKeepPollingAfterList(
@@ -2457,16 +2478,27 @@ async function waitForTask(
 	}
 }
 
-// Mark a process session as already-reported so the exit-notification poller
-// doesn't send a duplicate message for something the agent just observed.
+// Mark a session as already reported so completion pollers do not send a
+// duplicate message for something the agent just observed.
 function suppressNotify(id: string, reason: "observed" | "kill" = "observed"): void {
 	const meta = readMeta(id);
-	if (meta && meta.kind === "process") {
+	if (!meta) return;
+	if (meta.kind === "process") {
 		meta.notified = true;
 		if (reason === "kill") meta.killNotificationSuppressed = true;
 		delete meta.notificationPaused;
-		writeMeta(id, meta);
+	} else {
+		meta.subagentCollectedOffset = meta.promptOffset ?? 0;
 	}
+	writeMeta(id, meta);
+}
+
+function collectSubagentOutcome(outcome: WaitOutcome): void {
+	if (outcome.kind !== "done" && outcome.kind !== "exited") return;
+	const meta = readMeta(outcome.id);
+	if (!meta || meta.kind !== "subagent") return;
+	meta.subagentCollectedOffset = meta.promptOffset ?? 0;
+	writeMeta(outcome.id, meta);
 }
 
 export interface WaitReservationState {
@@ -2574,10 +2606,23 @@ async function waitForExit(
 		// one concurrent wait timing out cannot re-enable notifications underneath
 		// another wait that is still pending.
 		updateWaitReservation(id, "reserve");
-		const w = await bs(["wait", "-s", id, "--timeout", t], { signal });
-		if (signal?.aborted) {
-			updateWaitReservation(id, "abandon");
-			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
+		let w: Awaited<ReturnType<typeof bs>>;
+		let attempt = 0;
+		for (;;) {
+			w = await bs(["wait", "-s", id, "--timeout", t], { signal });
+			if (signal?.aborted) {
+				updateWaitReservation(id, "abandon");
+				return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
+			}
+			if (w.code === 0 || w.code === 124 || w.code === 130) break;
+
+			// A freshly spawned session can be visible in `list` before the backend's
+			// wait endpoint is ready, especially when sibling foreground tools start
+			// concurrently. Retry that transient startup race instead of reporting the
+			// still-running child as "exited with code ?".
+			const retryStatus = await statusOf(id);
+			if (retryStatus?.state !== "running" || attempt++ >= 3) break;
+			await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
 		}
 		if (w.code === 130) {
 			const interruptedStatus = await statusOf(id);
@@ -2618,6 +2663,18 @@ async function waitForExit(
 	if (!st) {
 		if (!expectPattern) updateWaitReservation(id, "claim");
 		return { id, kind: "exited", ok: false, text: `No such session: ${id}` };
+	}
+	if (st.state === "running") {
+		if (!expectPattern) updateWaitReservation(id, "abandon");
+		return {
+			id,
+			kind: "interrupted",
+			ok: false,
+			text:
+				`The wait backend returned before process ${id} exited; the process is still running. ` +
+				`Use babysit_wait to continue waiting.\nLog: ${logPath(id)}`,
+			status: st,
+		};
 	}
 	if (expectPattern) suppressNotify(id);
 	else updateWaitReservation(id, "claim"); // the agent sees the exit here; don't notify again
@@ -2964,6 +3021,64 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	async function notifySettledSubagents(
+		ctx: ExtensionContext,
+		snapshot?: BsSession[],
+	): Promise<void> {
+		if (shouldDeferCompletionNotification(ctx.isIdle())) return;
+		const sessions = snapshot ?? (await listSessions()).sessions;
+		const ready: Array<{ id: string; offset: number; state: string; summary: string }> = [];
+		for (const session of sessions) {
+			const meta = readMeta(session.id);
+			if (!shouldDeliverSubagentCompletion(meta)) continue;
+			let progress: Progress;
+			try {
+				progress = taskProgressOf(session.id).progress;
+			} catch {
+				progress = emptyProgress();
+			}
+			if (session.state === "running" && !progress.done) continue;
+
+			const offset = meta.promptOffset ?? 0;
+			if (meta.subagentCompletionObservedOffset !== offset) {
+				meta.subagentCompletionObservedOffset = offset;
+				meta.subagentCompletionObservedAt = Date.now();
+				writeMeta(session.id, meta);
+				continue;
+			}
+			if (Date.now() - (meta.subagentCompletionObservedAt ?? 0) < POLL_MS) continue;
+			const summary = progress.done
+				? `task settled; ${progress.turns} turns, ${progress.toolCallCount} tools, $${progress.cost.toFixed(4)}`
+				: `worker ${session.state} with exit code ${session.exit_code ?? "?"}; partial usage $${progress.cost.toFixed(4)}`;
+			ready.push({ id: session.id, offset, state: session.state, summary });
+		}
+		if (ready.length === 0 || shouldDeferCompletionNotification(ctx.isIdle())) return;
+
+		const deliverable = ready.filter(({ id, offset }) => {
+			const meta = readMeta(id);
+			return shouldDeliverSubagentCompletion(meta) && (meta.promptOffset ?? 0) === offset;
+		});
+		if (deliverable.length === 0) return;
+		pi.sendMessage(
+			{
+				customType: "pi-babysit-subagent-ready",
+				content:
+					`${deliverable.length === 1 ? "A background subagent is" : `${deliverable.length} background subagents are`} ready to collect:\n` +
+					deliverable.map(({ id, summary }) => `- ${id}: ${summary}`).join("\n") +
+					"\nCall babysit_wait now to retrieve the answer and charge nested usage before finishing the parent task.",
+				display: true,
+				details: { subagents: deliverable.map(({ id, state }) => ({ id, state })) },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+		for (const { id, offset } of deliverable) {
+			const meta = readMeta(id);
+			if (!meta || meta.kind !== "subagent" || (meta.promptOffset ?? 0) !== offset) continue;
+			meta.subagentNotifiedOffset = offset;
+			writeMeta(id, meta);
+		}
+	}
+
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
 		const active = (snapshot ?? (await listSessions()).sessions).filter(
@@ -3157,6 +3272,7 @@ export default function (pi: ExtensionAPI) {
 				await enforceSubagentBudgets(snapshot);
 				await Promise.all([
 					notifyEndedProcesses(ctx, snapshot),
+					notifySettledSubagents(ctx, snapshot),
 					refreshWidget(ctx, snapshot),
 				]);
 				pruneTerminalSessionCache(taskProgressCache, snapshot);
@@ -3228,12 +3344,13 @@ export default function (pi: ExtensionAPI) {
 			"`returnPattern`/`returnLines` bound foreground output. Sessions support check, wait, send, and kill.",
 		promptSnippet: "Run supervised commands or bounded pi subagents with context-safe logs",
 		promptGuidelines: [
-			"Use babysit_run for shell commands and give meaningful sessions a stable name; bundle tiny related observations.",
-			"Use babysit_run foreground mode when the next step needs the result; use returnPattern/returnLines for noisy commands. Do not foreground unbounded servers.",
+			"Use babysit_run for shell commands and give meaningful sessions a stable name; bundle tiny related read-only observations into one command.",
+			"Use babysit_run foreground mode for one process or subagent whose result is needed now; never issue sibling foreground runs in parallel. For parallel checks, start background runs with continueAfterStart and collect them with one multi-session babysit_wait.",
+			"Use returnPattern/returnLines for noisy commands. During edit/fix loops run targeted checks first and one full validation suite at the end instead of repeating every full gate.",
 			"After a background process starts, stop the turn for its automatic notification; never poll or sleep. Use continueAfterStart only for specific non-polling work.",
 			"Inspect large logs with a narrow babysit_check pattern and maxBytes rather than broad tails.",
 			"Use retryOnWorkerDeath only once and only for idempotent commands; retries may duplicate side effects.",
-			"Delegate independent work with bounded babysit_run subagents; set at least one cost/turn/tool/token budget and keep making progress before babysit_wait.",
+			"Delegate independent work with bounded babysit_run subagents. Prefer foreground for one result needed now; every background subagent must be collected with babysit_wait before the parent task finishes. Size budgets above the worker's initial context and expected tool count.",
 			"Subagent recursion defaults to depth 1; only a top-level caller may explicitly raise maxDepth.",
 		],
 		parameters: Type.Object({
@@ -3321,7 +3438,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			foreground: Type.Optional(
 				Type.Boolean({
-					description: "Process: wait for exit and return the result now.",
+					description: "Process or subagent: wait for completion and return the result in this tool call.",
 				}),
 			),
 			returnPattern: Type.Optional(
@@ -3396,16 +3513,16 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
-			if (isSubagent && params.foreground) {
+			if (isSubagent && (params.returnPattern || params.returnLines != null || params.maxBytes != null)) {
 				return {
-					content: [{ type: "text", text: "`foreground` is available only in process mode; use babysit_wait for subagent task completion." }],
+					content: [{ type: "text", text: "`returnPattern`, `returnLines`, and `maxBytes` are process-output options." }],
 					isError: true,
 					details: {},
 				};
 			}
-			if (isSubagent && (params.returnPattern || params.returnLines != null || params.maxBytes != null)) {
+			if (isSubagent && params.continueAfterStart != null) {
 				return {
-					content: [{ type: "text", text: "`returnPattern`, `returnLines`, and `maxBytes` are process-output options." }],
+					content: [{ type: "text", text: "`continueAfterStart` is available only in process mode." }],
 					isError: true,
 					details: {},
 				};
@@ -3625,15 +3742,37 @@ export default function (pi: ExtensionAPI) {
 
 			pollNeeded = true;
 			await refreshWidget(ctx);
+			if (params.foreground || !ctx.hasUI) {
+				const outcome = await waitForTask(res.id, null, _signal);
+				collectSubagentOutcome(outcome);
+				const usage = claimOutcomeUsage(outcome);
+				if (ctx.hasUI) await refreshWidget(ctx);
+				return {
+					content: [{ type: "text", text: outcome.text }],
+					isError: !outcome.ok,
+					usage,
+					details: {
+						id: res.id,
+						kind: "subagent",
+						name: params.name ?? res.id,
+						agent: agent?.name,
+						model: res.model,
+						task: params.task,
+						depth: subagentNesting.childDepth,
+						maxDepth: subagentNesting.maxDepth,
+						status: outcomeStatus(outcome),
+					},
+				};
+			}
 			return {
 				content: [
 					{
 						type: "text",
 						text:
 							`Subagent started (id: ${res.id})${agent ? ` [agent: ${agent.name}]` : ""}${res.model ? ` [model: ${res.model}]` : ""} [depth: ${subagentNesting.childDepth}/${subagentNesting.maxDepth}].\n` +
-							`Task accepted — running in the background; keep working (do NOT end your turn just to wait for it).\n` +
-							`Poll:  babysit_check { id: "${res.id}" }\n` +
-							`Wait:  babysit_wait  { id: "${res.id}" }\n` +
+							`Task accepted — running in the background. You MUST collect it with babysit_wait before finishing the parent task; use foreground: true next time when no independent work is available.\n` +
+							`Progress: babysit_check { id: "${res.id}" } (only when inspection is needed)\n` +
+							`Collect:  babysit_wait  { id: "${res.id}" }\n` +
 							`Human can watch/steer: /babysit (pick ${res.id})`,
 					},
 				],
@@ -4257,6 +4396,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (ids.length === 1) {
 				const r = await waitFor(ids[0], limitMs, signal, params.expect);
+				collectSubagentOutcome(r);
 				const usage = claimOutcomeUsage(r);
 				return {
 					content: [{ type: "text", text: r.text }],
@@ -4277,6 +4417,7 @@ export default function (pi: ExtensionAPI) {
 					ids.map((i) => waitFor(i, limitMs, signal, params.expect)),
 				);
 				const ok = results.every((r) => r.ok);
+				results.forEach(collectSubagentOutcome);
 				const usage = sumNestedUsage(results.map(claimOutcomeUsage));
 				return {
 					content: [
@@ -4306,6 +4447,7 @@ export default function (pi: ExtensionAPI) {
 					ids.map((i) => waitFor(i, limitMs, ctrl.signal, params.expect)),
 				);
 				const others = ids.filter((i) => i !== first.id);
+				collectSubagentOutcome(first);
 				const usage = claimOutcomeUsage(first);
 				return {
 					content: [

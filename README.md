@@ -33,7 +33,7 @@ reachable from anywhere (`~/.pi-babysit/<pi-session-id>/`). Two kinds:
 | kind | started by | completion | on completion |
 | ---- | ---------- | ---------- | ------------- |
 | **process** | `babysit_run { command }` | process **exit** | automatic notification message (`triggerTurn`), batched for all exits observed in the same poll — the agent may end its turn after starting and is resumed on exit, same contract as the old `process` tool |
-| **subagent** | `babysit_run { profile: "subagent", task }` | `agent_settled` in the RPC event stream (worker remains reusable during its idle grace) | none — the agent polls `babysit_check` or blocks on `babysit_wait`; the idle session accepts follow-up tasks until self-reap |
+| **subagent** | `babysit_run { profile: "subagent", task }` | `agent_settled` in the RPC event stream (worker remains reusable during its idle grace) | `foreground: true` returns the answer and nested usage in the same tool call; background workers must be collected with `babysit_wait` before the parent finishes, and remain reusable until self-reap |
 
 The **profile is a tool parameter, not a separate tool set**: domain knowledge
 (RPC bookkeeping, per-task byte offsets, parked-turn detection, PTY-safe
@@ -56,7 +56,7 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` when the next step needs the result in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy output bounded without a second check turn. Or start a named subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields). `maxDepth` defaults to 1. Quick commands return inline; longer ones notify in the background |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` for one process or subagent whose result is needed in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy process output bounded. Or start a named background subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields), then always collect it with `babysit_wait`. `maxDepth` defaults to 1. Quick commands return inline; longer process runs notify in the background |
 | `babysit_check` | Without an id, list sessions with state/kind filters. With an id, inspect bounded output, search with `pattern`, or capture a TUI with `screen: true`; `maxBytes` overrides the 4 KB default up to 24 KB |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when confirmed settled (`mode: auto/steer/task`); explicit task mode rejects busy, parked, or unknown state |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: up to 32 unique `ids` + `mode: "any"\|"all"` |
@@ -117,7 +117,12 @@ Set `PI_BABYSIT_RPC_LOG_MODE=standard` only when legacy lifecycle payloads are
 needed for debugging. Live `/babysit` and attach views render either format.
 
 All shell commands, including `pwd` and Git, go through `babysit_run`. Bundle
-closely related tiny observations when doing so safely reduces tool turns.
+closely related tiny observations when doing so safely reduces tool turns. For
+parallel checks, do not issue sibling `foreground: true` calls: start them with
+`continueAfterStart: true` and collect them in one multi-session `babysit_wait`.
+During fix loops, prefer targeted checks after each edit and one full validation
+suite at the end. Background subagents must likewise be collected before the
+parent task finishes so their answer and nested usage are not lost.
 Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 
 ## Unexpected worker loss
@@ -143,7 +148,10 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   their exits span multiple polls.
   `babysit_kill` and an exit already reported by `babysit_wait` suppress the
   notification.
-- **Subagent**: `babysit_wait` blocks on `babysit expect '"type":"agent_settled"'`.
+- **Subagent**: `foreground: true` or `babysit_wait` blocks on
+  `babysit expect '"type":"agent_settled"'`. A background task that settles or
+  exits before it is collected emits one ready-to-collect reminder; the parent
+  must still call `babysit_wait` so the answer and nested usage are persisted.
   Unlike `agent_end`, `agent_settled` cannot precede an automatic retry,
   compaction retry, or queued continuation. A settled run containing a
   **parked** toolResult — a `babysit_run { command }` result carrying the

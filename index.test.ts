@@ -41,6 +41,7 @@ import extension, {
 	type ProcessCompletionNotice,
 	shouldDeferCompletionNotification,
 	shouldDeliverProcessCompletion,
+	shouldDeliverSubagentCompletion,
 	shouldInlineCompleteOutput,
 	shouldKeepPolling,
 	shouldKeepPollingAfterList,
@@ -1027,15 +1028,15 @@ test("mode-specific notification and budget parameters reject misuse", async () 
 	expect(subagentGroup.isError).toBe(true);
 	expect(subagentGroup.content[0]?.text).toContain("process mode");
 
-	const subagentForeground = await tools.get("babysit_run").execute(
-		"subagent-foreground",
-		{ profile: "subagent", task: "do nothing", foreground: true },
+	const subagentContinueAfter = await tools.get("babysit_run").execute(
+		"subagent-continue-after",
+		{ profile: "subagent", task: "do nothing", continueAfterStart: true },
 		undefined,
 		undefined,
 		ctx,
 	);
-	expect(subagentForeground.isError).toBe(true);
-	expect(subagentForeground.content[0]?.text).toContain("process mode");
+	expect(subagentContinueAfter.isError).toBe(true);
+	expect(subagentContinueAfter.content[0]?.text).toContain("process mode");
 
 	const conflictingProcessModes = await tools.get("babysit_run").execute(
 		"foreground-continue",
@@ -1203,6 +1204,11 @@ test("idle polling stops unless a worker or completion still needs attention", (
 	const metadata = new Map([
 		["pending", { kind: "process" as const, notified: false }],
 		["done", { kind: "process" as const, notified: true }],
+		["subagent-ready", { kind: "subagent" as const, promptOffset: 42 }],
+		[
+			"subagent-collected",
+			{ kind: "subagent" as const, promptOffset: 42, subagentCollectedOffset: 42 },
+		],
 	]);
 	const metaFor = (id: string) => metadata.get(id) ?? null;
 
@@ -1210,6 +1216,8 @@ test("idle polling stops unless a worker or completion still needs attention", (
 	expect(shouldKeepPolling([{ id: "worker", state: "running" }], metaFor)).toBe(true);
 	expect(shouldKeepPolling([{ id: "pending", state: "exited" }], metaFor)).toBe(true);
 	expect(shouldKeepPolling([{ id: "done", state: "exited" }], metaFor)).toBe(false);
+	expect(shouldKeepPolling([{ id: "subagent-ready", state: "killed" }], metaFor)).toBe(true);
+	expect(shouldKeepPolling([{ id: "subagent-collected", state: "killed" }], metaFor)).toBe(false);
 	expect(shouldKeepPollingAfterList({ sessions: [], error: "temporary failure" }, metaFor)).toBe(
 		true,
 	);
@@ -1256,7 +1264,7 @@ test("notification groups wait for every running member", () => {
 	expect(isNotificationGroupReady({ kind: "process" } as any, sessions, metaFor)).toBe(true);
 });
 
-test("completion notification eligibility excludes wait, kill, and subagent sessions", () => {
+test("completion notification eligibility separates process exits and uncollected subagent tasks", () => {
 	expect(shouldDeliverProcessCompletion({ kind: "process" })).toBe(true);
 	expect(shouldDeliverProcessCompletion({ kind: "process", notified: true })).toBe(false);
 	expect(shouldDeliverProcessCompletion({ kind: "process", notificationPaused: true })).toBe(
@@ -1264,6 +1272,32 @@ test("completion notification eligibility excludes wait, kill, and subagent sess
 	);
 	expect(shouldDeliverProcessCompletion({ kind: "subagent" })).toBe(false);
 	expect(shouldDeliverProcessCompletion(null)).toBe(false);
+
+	expect(shouldDeliverSubagentCompletion({ kind: "subagent", promptOffset: 7 })).toBe(true);
+	expect(
+		shouldDeliverSubagentCompletion({
+			kind: "subagent",
+			promptOffset: 7,
+			subagentCollectedOffset: 7,
+		}),
+	).toBe(false);
+	expect(
+		shouldDeliverSubagentCompletion({
+			kind: "subagent",
+			promptOffset: 7,
+			subagentNotifiedOffset: 7,
+		}),
+	).toBe(false);
+	// Metadata written by pre-reminder releases already proves an explicit wait
+	// returned both the answer and nested usage; do not notify those old tasks.
+	expect(
+		shouldDeliverSubagentCompletion({
+			kind: "subagent",
+			promptOffset: 7,
+			usageReportedOffset: 7,
+		}),
+	).toBe(false);
+	expect(shouldDeliverSubagentCompletion({ kind: "process" })).toBe(false);
 });
 
 test("GC removes only old roots without live supervisors", () => {
@@ -1594,6 +1628,35 @@ test("foreground process mode returns a long command result in one tool call", a
 	expect(text).toContain("completed successfully");
 	expect(text).toContain("foreground-done");
 	expect(text).not.toContain("[notify-on-exit]");
+});
+
+test("parallel foreground processes never report a running child as terminated", async () => {
+	const prefix = `parallel-foreground-${Date.now()}-${sequence++}`;
+	const results = await Promise.all(
+		Array.from({ length: 4 }, (_, index) =>
+			tools.get("babysit_run").execute(
+				`${prefix}-${index}`,
+				{
+					name: `${prefix}-${index}`,
+					command: `sleep 0.${index + 2}; printf 'parallel-${index}-done\\n'`,
+					pty: false,
+					foreground: true,
+					timeout: "10s",
+				},
+				undefined,
+				undefined,
+				interactiveCtx,
+			),
+		),
+	);
+
+	for (const [index, result] of results.entries()) {
+		const text = result.content[0]?.text ?? "";
+		expect(result.isError).not.toBe(true);
+		expect(result.details.status).toBe("success");
+		expect(text).toContain(`parallel-${index}-done`);
+		expect(text).not.toContain("exited with code ?");
+	}
 });
 
 test("foreground mode filters noisy output without a second check turn", async () => {
