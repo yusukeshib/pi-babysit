@@ -53,6 +53,8 @@ import extension, {
 	transitionWaitReservation,
 	usageFromProgress,
 	validateKillResponse,
+	widgetSessionHeader,
+	widgetSummaryText,
 } from "./index.ts";
 
 const tools = new Map<string, any>();
@@ -84,7 +86,14 @@ const ctx = { hasUI: false, cwd: process.cwd() };
 const interactiveCtx = {
 	hasUI: true,
 	cwd: process.cwd(),
-	ui: { setWidget() {} },
+	ui: {
+		setWidget() {},
+		theme: {
+			fg: (_color: string, text: string) => text,
+			bg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		},
+	},
 };
 let sequence = 0;
 
@@ -102,6 +111,20 @@ async function run(command: string, extras: Record<string, unknown> = {}) {
 		isError?: boolean;
 	}>;
 }
+
+test("widget labels make session kind and state explicit", () => {
+	expect(widgetSummaryText(2, 0, 8)).toBe("RUNNING  2 processes  │  IDLE  8 agents");
+	expect(widgetSummaryText(1, 2, 0)).toBe("RUNNING  1 process · 2 agents");
+	expect(widgetSessionHeader("watch-ci", "process", "running", "3m01s")).toBe(
+		"  ▶ watch-ci  [PROCESS] [RUNNING] · age 3m01s",
+	);
+	expect(widgetSessionHeader("review", "agent", "running")).toBe(
+		"  ▶ review  [AGENT] [RUNNING]",
+	);
+	expect(widgetSessionHeader("review", "agent", "idle")).toBe(
+		"  ○ review  [AGENT] [IDLE]",
+	);
+});
 
 test("process completion messages render semantic colored labels", () => {
 	const renderer = renderers.get("pi-babysit-process-end");
@@ -669,6 +692,23 @@ test("self-reaper parked detection cannot be spoofed by command output", () => {
 			{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" },
 		]),
 	).toBe(false);
+});
+
+test("self-reaper exits an already-idle RPC worker when its grace elapses", () => {
+	const script = `
+		process.env.PI_BABYSIT_REAP_AFTER = "10ms";
+		const { default: installReaper } = await import("./self-reap.ts");
+		const handlers = new Map();
+		installReaper({ on: (name, handler) => handlers.set(name, handler) });
+		handlers.get("agent_end")({ messages: [] });
+		handlers.get("agent_settled")();
+		setTimeout(() => process.exit(42), 200);
+	`;
+	const child = spawnSync("bun", ["--eval", script], {
+		cwd: path.dirname(import.meta.path),
+		encoding: "utf8",
+	});
+	expect(child.status, child.stderr).toBe(0);
 });
 
 test("RPC stream compaction preserves parked, resumed, and failed RPC state", () => {

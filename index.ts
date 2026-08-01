@@ -2188,13 +2188,56 @@ async function spawnSubagent(
 // A subagent whose task is done stays alive as an idle RPC worker (for
 // follow-ups), so "running" in babysit does NOT mean "working" — count
 // processes / busy subagents / idle subagents separately.
-function renderWidgetLines(procs: number, busy: number, idle: number): string[] {
+export type WidgetSessionKind = "process" | "agent";
+export type WidgetSessionState = "running" | "idle";
+
+export function widgetSummaryText(procs: number, busy: number, idle: number): string {
+	const sections: string[] = [];
+	const running: string[] = [];
+	if (procs > 0) running.push(`${procs} process${procs > 1 ? "es" : ""}`);
+	if (busy > 0) running.push(`${busy} agent${busy > 1 ? "s" : ""}`);
+	if (running.length > 0) sections.push(`RUNNING  ${running.join(" · ")}`);
+	if (idle > 0) sections.push(`IDLE  ${idle} agent${idle > 1 ? "s" : ""}`);
+	return sections.join("  │  ");
+}
+
+export function widgetSessionHeader(
+	id: string,
+	kind: WidgetSessionKind,
+	state: WidgetSessionState,
+	elapsed?: string,
+): string {
+	const icon = state === "running" ? "▶" : "○";
+	return `  ${icon} ${id}  [${kind.toUpperCase()}] [${state.toUpperCase()}]${elapsed ? ` · age ${elapsed}` : ""}`;
+}
+
+function renderWidgetLines(procs: number, busy: number, idle: number, theme: Theme): string[] {
 	if (procs === 0 && busy === 0 && idle === 0) return [];
-	const parts: string[] = [];
-	if (procs > 0) parts.push(`${procs} process${procs > 1 ? "es" : ""}`);
-	if (busy > 0) parts.push(`${busy} subagent${busy > 1 ? "s" : ""} working`);
-	if (idle > 0) parts.push(`${idle} idle`);
-	return [`\x1b[44;97m ${parts.join(" \u00b7 ")} \x1b[0m`];
+	const sections: string[] = [];
+	const running: string[] = [];
+	if (procs > 0) running.push(`${procs} process${procs > 1 ? "es" : ""}`);
+	if (busy > 0) running.push(`${busy} agent${busy > 1 ? "s" : ""}`);
+	if (running.length > 0) {
+		sections.push(`${theme.fg("success", theme.bold("RUNNING"))}  ${running.join(" · ")}`);
+	}
+	if (idle > 0) {
+		sections.push(`${theme.fg("muted", theme.bold("IDLE"))}  ${idle} agent${idle > 1 ? "s" : ""}`);
+	}
+	return [theme.bg("toolPendingBg", ` ${sections.join("  │  ")} `)];
+}
+
+function renderWidgetSessionHeader(
+	id: string,
+	kind: WidgetSessionKind,
+	state: WidgetSessionState,
+	elapsed: string,
+	theme: Theme,
+): string {
+	const running = state === "running";
+	const icon = theme.fg(running ? "success" : "muted", running ? "▶" : "○");
+	const kindLabel = theme.fg(kind === "process" ? "accent" : "warning", theme.bold(`[${kind.toUpperCase()}]`));
+	const stateLabel = theme.fg(running ? "success" : "muted", theme.bold(`[${state.toUpperCase()}]`));
+	return `  ${icon} ${id}  ${kindLabel} ${stateLabel}${elapsed ? theme.fg("dim", ` · age ${elapsed}`) : ""}`;
 }
 
 // How many trailing output lines to show per running session in the widget.
@@ -3095,7 +3138,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const idle = subs.filter((session) => progressById.get(session.id)?.done).length;
-		const lines = renderWidgetLines(procs, subs.length - idle, idle);
+		const theme = ctx.ui.theme;
+		const lines = renderWidgetLines(procs, subs.length - idle, idle, theme);
 		const tails = await Promise.all(
 			active.map((session) => {
 				const isSubagent = kindOf(session.id) === "subagent";
@@ -3108,11 +3152,17 @@ export default function (pi: ExtensionAPI) {
 		);
 		active.forEach((session, index) => {
 			const isSubagent = kindOf(session.id) === "subagent";
-			const tag = isSubagent
-				? progressById.get(session.id)?.done ? "sub idle" : "sub"
-				: "proc";
+			const state: WidgetSessionState = isSubagent && progressById.get(session.id)?.done
+				? "idle"
+				: "running";
 			const elapsed = elapsedOf(session.id);
-			const header = `  ⏳ ${session.id} [${tag}]${elapsed ? ` ${elapsed}` : ""}`;
+			const header = renderWidgetSessionHeader(
+				session.id,
+				isSubagent ? "agent" : "process",
+				state,
+				elapsed,
+				theme,
+			);
 			if (tails[index].length === 1) {
 				lines.push(`${header}  │ ${tails[index][0]}`);
 			} else {

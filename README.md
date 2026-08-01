@@ -75,8 +75,10 @@ re-enables `bash`, including shell backgrounding (`… &`, `nohup`, `setsid`,
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
 | `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; deletion uses a GC lock and atomic rename |
 
-A minimal widget above the editor shows live counts
-(`N processes · M subagents working · K idle`).
+A widget below the editor separates session **kind** from task **state** at a glance:
+summary counts use `RUNNING` / `IDLE`, and every row is labeled
+`[PROCESS] [RUNNING]`, `[AGENT] [RUNNING]`, or `[AGENT] [IDLE]`. The displayed
+`age` is total session age, not time spent in the current state.
 
 ## Logs without context flooding
 

@@ -100,12 +100,15 @@ export default function (pi: ExtensionAPI) {
 
 	// agent_end can precede automatic retries, compaction retries, and queued
 	// continuations. Start the grace timer only once Pi is truly settled.
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("agent_settled", () => {
 		cancel();
 		if (lastEndWasParked) return;
 		timer = setTimeout(() => {
-			// Graceful shutdown emits session_shutdown for every loaded extension.
-			ctx.shutdown();
+			// In RPC mode ctx.shutdown() only sets a flag that is checked on the next
+			// command or agent_settled event. An already-idle worker receives neither,
+			// so it would remain alive indefinitely. At this point the grace elapsed,
+			// the task is settled, and parked turns were excluded above; exit cleanly.
+			process.exit(0);
 		}, graceMs);
 		timer.unref?.();
 	});
