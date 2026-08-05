@@ -45,6 +45,7 @@ import extension, {
 	shouldInlineCompleteOutput,
 	shouldKeepPolling,
 	shouldKeepPollingAfterList,
+	shouldTerminateSessionsOnShutdown,
 	subagentBudgetAction,
 	subagentBudgetSoftViolation,
 	subagentBudgetViolation,
@@ -1515,6 +1516,70 @@ test("completion batch acknowledgement happens only after one successful send", 
 	expect(retried).toBe(true);
 	expect(sends).toBe(2);
 	expect(acknowledged).toEqual(["build", "test"]);
+});
+
+test("only a real Pi quit terminates babysit sessions", () => {
+	expect(shouldTerminateSessionsOnShutdown("quit")).toBe(true);
+	for (const reason of ["reload", "new", "resume", "fork", undefined]) {
+		expect(shouldTerminateSessionsOnShutdown(reason)).toBe(false);
+	}
+});
+
+test("Pi reload preserves workers and Pi quit terminates all workers", async () => {
+	const binary = process.env.PI_BABYSIT_CLI ?? "babysit";
+	const rootBase = process.env.PI_BABYSIT_DIR ?? path.join(os.homedir(), ".pi-babysit");
+	const sessionId = `shutdown-test-${Date.now()}-${sequence++}`;
+	const root = path.join(rootBase, sessionId);
+	const lifecycleCtx = {
+		hasUI: false,
+		cwd: process.cwd(),
+		isIdle: () => true,
+		sessionManager: { getSessionId: () => sessionId },
+	};
+	const ids: string[] = [];
+	const invoke = (args: string[]) =>
+		spawnSync(binary, args, {
+			encoding: "utf8",
+			env: { ...process.env, BABYSIT_DIR: root },
+		});
+
+	try {
+		await hooks.get("session_start")({ reason: "startup" }, lifecycleCtx);
+		for (let index = 0; index < 2; index++) {
+			const started = invoke([
+				"run",
+				"-d",
+				"--json",
+				"--no-tty",
+				"--",
+				"sh",
+				"-c",
+				"sleep 60",
+			]);
+			expect(started.status).toBe(0);
+			ids.push(JSON.parse(started.stdout).id as string);
+		}
+
+		await hooks.get("session_shutdown")({ reason: "reload" });
+		for (const id of ids) {
+			const status = invoke(["status", "-s", id, "--json"]);
+			expect(status.status).toBe(0);
+			expect(JSON.parse(status.stdout).status.state).toBe("running");
+		}
+
+		await hooks.get("session_start")({ reason: "reload" }, lifecycleCtx);
+		await hooks.get("session_shutdown")({ reason: "quit" });
+		for (const id of ids) {
+			const status = invoke(["status", "-s", id, "--json"]);
+			expect(status.status).toBe(0);
+			const persisted = JSON.parse(status.stdout).status;
+			expect(["killed", "exited"]).toContain(persisted.state);
+			expect(persisted.child_pid).toBeNull();
+		}
+	} finally {
+		for (const id of ids) invoke(["kill", "-s", id, "--json"]);
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("babysit_kill returns success only after terminal state is persisted", async () => {

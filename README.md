@@ -127,6 +127,14 @@ suite at the end. Background subagents must likewise be collected before the
 parent task finishes so their answer and nested usage are not lost.
 Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 
+## Pi shutdown and reload
+
+A real Pi quit terminates every running process and subagent in the current Pi
+session namespace. The workers are killed concurrently, so shutdown time does
+not grow linearly when many sessions are active. Lifecycle transitions that keep
+Pi running—`/reload`, `/new`, `/resume`, and `/fork`—leave detached workers
+alone. Reloading or resuming the same Pi session reconnects to its namespace.
+
 ## Unexpected worker loss
 
 If the babysit supervisor disappears without recording an exit, pi-babysit

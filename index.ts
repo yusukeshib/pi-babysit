@@ -367,6 +367,35 @@ async function awaitConfirmedTermination(id: string): Promise<BsSession | null> 
 	return statusOf(id);
 }
 
+export function shouldTerminateSessionsOnShutdown(reason: string | undefined): boolean {
+	return reason === "quit";
+}
+
+async function terminateRunningSessions(): Promise<void> {
+	let listed: Awaited<ReturnType<typeof listSessions>>;
+	try {
+		listed = await listSessions();
+	} catch {
+		return;
+	}
+	if (listed.error) return;
+
+	// A namespace may contain many independent commands and agents. Terminate
+	// them concurrently so quitting Pi does not wait for serial kill timeouts.
+	// allSettled ensures one unreachable worker cannot skip cleanup for others.
+	await Promise.allSettled(
+		listed.sessions
+			.filter((session) => session.state === "running")
+			.map(async (session) => {
+				const result = await bs(["kill", "-s", session.id, "--json"]);
+				if (result.code !== 0 || validateKillResponse(result.stdout)) return;
+				// A later resume of this Pi session must not turn intentional shutdown
+				// cleanup into a process-completion notification.
+				suppressNotify(session.id, "kill");
+			}),
+	);
+}
+
 // ---------------------------------------------------------------------------
 // per-session metadata
 // ---------------------------------------------------------------------------
@@ -3338,9 +3367,15 @@ export default function (pi: ExtensionAPI) {
 		}, POLL_MS);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = undefined;
+		// Pi also emits session_shutdown while hot-reloading and switching sessions.
+		// Preserve detached work for those lifecycle transitions; only a real Pi
+		// quit owns and terminates every worker in the current session namespace.
+		if (shouldTerminateSessionsOnShutdown(event?.reason)) {
+			await terminateRunningSessions();
+		}
 		releaseRootLease(rootLeasePath);
 		rootLeasePath = undefined;
 	});
