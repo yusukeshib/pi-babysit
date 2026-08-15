@@ -220,9 +220,15 @@ function bs(
 			resolve({ stdout: "", stderr: "aborted", code: 130 });
 			return;
 		}
+		const env: NodeJS.ProcessEnv = { ...process.env };
+		for (const [name, value] of Object.entries(opts.env ?? {})) {
+			if (value === undefined) delete env[name];
+			else env[name] = value;
+		}
+		env.BABYSIT_DIR = ROOT;
 		const child = spawn(BABYSIT_BIN, args, {
 			cwd: opts.cwd,
-			env: { ...process.env, ...opts.env, BABYSIT_DIR: ROOT },
+			env,
 		});
 		let stdout = "";
 		let stderr = "";
@@ -236,7 +242,12 @@ function bs(
 		});
 		child.on("error", (e) => {
 			opts.signal?.removeEventListener("abort", onAbort);
-			resolve({ stdout, stderr: stderr + String(e), code: 1 });
+			const installHint = babysitSpawnInstallHint(e);
+			if (installHint) {
+				babysitPreflightError = installHint;
+				babysitPreflightCheckedAt = Date.now();
+			}
+			resolve({ stdout, stderr: installHint ?? stderr + String(e), code: 1 });
 		});
 		child.on("close", (code) => {
 			opts.signal?.removeEventListener("abort", onAbort);
@@ -261,6 +272,10 @@ const INSTALL_HINT =
 	`The \`babysit\` binary was not found (tried "${BABYSIT_BIN}").\n` + INSTALL_STEPS;
 const MIN_BABYSIT_VERSION = [0, 13, 0] as const;
 
+export function babysitSpawnInstallHint(error: unknown): string | null {
+	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" ? INSTALL_HINT : null;
+}
+
 export function isSupportedBabysitVersion(output: string): boolean {
 	const match = /\b(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\b/.exec(output);
 	if (!match) return false;
@@ -271,7 +286,8 @@ export function isSupportedBabysitVersion(output: string): boolean {
 	return match[4] === undefined;
 }
 
-// Cached preflight — probe `babysit --version` exactly once per process.
+// Cached preflight. A supported binary stays cached until a later spawn reports
+// ENOENT; failures are retried after a short delay so installation can recover.
 // undefined = not probed, null = supported, string = actionable error.
 let babysitPreflightError: string | null | undefined;
 let babysitPreflightCheckedAt = 0;
@@ -353,6 +369,22 @@ export function validateKillResponse(stdout: string): string | null {
 	} catch {
 		return `Invalid kill response from babysit: ${stdout.trim() || "(empty)"}`;
 	}
+}
+
+export function resolveKillConfirmation(
+	id: string,
+	backendError: string | null,
+	state: string | undefined,
+): { confirmed: true; warning?: string } | { confirmed: false; error: string } {
+	if (state && isConfirmedTerminalState(state)) {
+		return backendError ? { confirmed: true, warning: backendError } : { confirmed: true };
+	}
+	if (backendError) return { confirmed: false, error: backendError };
+	if (!state) return { confirmed: false, error: `Kill could not be verified: session ${id} disappeared.` };
+	return {
+		confirmed: false,
+		error: `Kill was acknowledged but ${id} is still ${state}; completion notifications were restored.`,
+	};
 }
 
 async function awaitConfirmedTermination(id: string): Promise<BsSession | null> {
@@ -591,9 +623,12 @@ function gcRootIsSafe(root: string): boolean {
 	let sessionDirs: fs.Dirent[];
 	try {
 		sessionDirs = fs.readdirSync(sessionsDir, { withFileTypes: true });
-	} catch {
-		return false;
+	} catch (error) {
+		// session_start acquires a lease before the first worker exists. Once that
+		// lease is gone, an old root with no sessions is safe to collect.
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
 	}
+	if (!sessionDirs.some((entry) => entry.isDirectory())) return true;
 	let sawStatus = false;
 	for (const sessionEntry of sessionDirs) {
 		if (!sessionEntry.isDirectory()) continue;
@@ -1893,10 +1928,24 @@ interface ProcOpts {
 	name?: string;
 	command: string;
 	cwd: string;
+	env?: Record<string, string | undefined>;
 	timeout?: string; // default: none — dev servers may run indefinitely
 	idleTimeout?: string;
 	pty: boolean;
 	notificationGroup?: string;
+}
+
+export function processSessionEnvironment(
+	ctx: ExtensionContext,
+	reasoningLevel = (ctx as ExtensionContext & { thinkingLevel?: string }).thinkingLevel,
+): Record<string, string | undefined> {
+	return {
+		PI_SESSION_ID: ctx.sessionManager.getSessionId(),
+		PI_SESSION_FILE: ctx.sessionManager.getSessionFile(),
+		PI_PROVIDER: ctx.model?.provider,
+		PI_MODEL: ctx.model?.id,
+		PI_REASONING_LEVEL: reasoningLevel,
+	};
 }
 
 async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: string }> {
@@ -1911,7 +1960,7 @@ async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: s
 
 	let r: Awaited<ReturnType<typeof bs>>;
 	try {
-		r = await bs(bsArgs, { cwd: opts.cwd });
+		r = await bs(bsArgs, { cwd: opts.cwd, env: opts.env });
 	} finally {
 		if (reservedId) reservedSessionIds.delete(reservedId);
 	}
@@ -2843,6 +2892,21 @@ export function automaticNotificationGroup(entry: unknown): string | undefined {
 	return runs.length >= 2 ? group : undefined;
 }
 
+export function prepareBabysitRunArguments(args: unknown): unknown {
+	if (!args || typeof args !== "object") return args;
+	const input = args as Record<string, unknown>;
+	if (
+		input.profile === "subagent" &&
+		input.continueAfterStart === true &&
+		input.foreground !== true
+	) {
+		const prepared = { ...input };
+		delete prepared.continueAfterStart;
+		return prepared;
+	}
+	return args;
+}
+
 export function resolveSubagentSendMode(
 	requested: "auto" | "steer" | "task",
 	streaming?: boolean,
@@ -3430,14 +3494,18 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run supervised commands or bounded pi subagents with context-safe logs",
 		promptGuidelines: [
 			"Use babysit_run for shell commands and give meaningful sessions a stable name; bundle tiny related read-only observations into one command.",
-			"Use babysit_run foreground mode for one process or subagent whose result is needed now; never issue sibling foreground runs in parallel. For parallel checks, start background runs with continueAfterStart and collect them with one multi-session babysit_wait.",
+			"Use babysit_run foreground mode for one process or subagent whose result is needed now; never issue sibling foreground runs in parallel. For parallel process checks, start background runs with continueAfterStart and collect them with one multi-session babysit_wait.",
 			"Use returnPattern/returnLines for noisy commands. During edit/fix loops run targeted checks first and one full validation suite at the end instead of repeating every full gate.",
-			"After a background process starts, stop the turn for its automatic notification; never poll or sleep. Use continueAfterStart only for specific non-polling work.",
+			"After a background process starts, stop the turn for its automatic notification; never poll or sleep. Use continueAfterStart only for specific non-polling process work.",
 			"Inspect large logs with a narrow babysit_check pattern and maxBytes rather than broad tails.",
 			"Use retryOnWorkerDeath only once and only for idempotent commands; retries may duplicate side effects.",
-			"Delegate independent work with bounded babysit_run subagents. Prefer foreground for one result needed now; every background subagent must be collected with babysit_wait before the parent task finishes. Size budgets above the worker's initial context and expected tool count.",
+			"Delegate independent work with bounded babysit_run subagents. Prefer foreground for one result needed now; every background subagent must be collected with babysit_wait before the parent task finishes. Size budgets above the worker's initial context and expected tool count; maxUsageTokens counts cumulative input/cache tokens and can overshoot by one in-flight model call.",
+			"Omit babysit_run.agent unless you know a named agent definition exists in the selected agentScope.",
 			"Subagent recursion defaults to depth 1; only a top-level caller may explicitly raise maxDepth.",
 		],
+		prepareArguments(args) {
+			return prepareBabysitRunArguments(args) as never;
+		},
 		parameters: Type.Object({
 			command: Type.Optional(
 				Type.String({
@@ -3544,7 +3612,7 @@ export default function (pi: ExtensionAPI) {
 			continueAfterStart: Type.Optional(
 				Type.Boolean({
 					description:
-						"Process mode only. Default false: starting a process ENDS the current turn (you are resumed by the exit notification). Set true only when you have immediate, specific, non-polling work to do after starting.",
+						"Process mode. Default false: starting a process ENDS the current turn (you are resumed by the exit notification). Set true only for immediate, specific, non-polling process work. In subagent mode true is accepted as a compatibility alias for the default background behavior.",
 				}),
 			),
 			retryOnWorkerDeath: Type.Optional(
@@ -3605,14 +3673,7 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
-			if (isSubagent && params.continueAfterStart != null) {
-				return {
-					content: [{ type: "text", text: "`continueAfterStart` is available only in process mode." }],
-					isError: true,
-					details: {},
-				};
-			}
-			if (!isSubagent && params.foreground && params.continueAfterStart) {
+			if (params.foreground && params.continueAfterStart) {
 				return {
 					content: [{ type: "text", text: "`foreground` and `continueAfterStart` are mutually exclusive." }],
 					isError: true,
@@ -3657,6 +3718,7 @@ export default function (pi: ExtensionAPI) {
 					timeout: params.timeout,
 					idleTimeout: params.idleTimeout,
 					pty: params.pty ?? true,
+					env: processSessionEnvironment(ctx, pi.getThinkingLevel()),
 					notificationGroup: params.notificationGroup?.trim() || undefined,
 				};
 				let res = await spawnProcess(spawnOpts);
@@ -3785,7 +3847,7 @@ export default function (pi: ExtensionAPI) {
 					const avail = agents.map((a) => a.name).join(", ") || "none";
 					return {
 						content: [
-							{ type: "text", text: `Unknown agent "${params.agent}". Available: ${avail}.` },
+							{ type: "text", text: `Unknown agent "${params.agent}". Available: ${avail}. Omit \`agent\` to use the default subagent configuration.` },
 						],
 						isError: true,
 						details: {},
@@ -4581,29 +4643,34 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const r = await bs(["kill", "-s", params.id, "--json"]);
-			if (r.code !== 0) return fail((r.stderr || r.stdout || "kill failed").trim());
-
-			const responseError = validateKillResponse(r.stdout);
-			if (responseError) return fail(responseError);
-
+			const backendError = r.code !== 0
+				? (r.stderr || r.stdout || "kill failed").trim()
+				: validateKillResponse(r.stdout);
+			// A backend can report an escalation error after the child has already
+			// reached a persisted terminal state. Reconcile against authoritative
+			// state before deciding whether to restore completion notifications.
 			const status = await awaitConfirmedTermination(params.id);
+			const confirmation = resolveKillConfirmation(params.id, backendError, status?.state);
+			if (!confirmation.confirmed) return fail(confirmation.error, status);
 			if (!status) return fail(`Kill could not be verified: session ${params.id} disappeared.`);
-			if (!isConfirmedTerminalState(status.state)) {
-				return fail(
-					`Kill was acknowledged but ${params.id} is still ${status.state}; completion notifications were restored.`,
-					status,
-				);
-			}
 
 			suppressNotify(params.id, "kill");
 			await refreshWidget(ctx);
 			return {
-				content: [{ type: "text", text: `Killed ${params.id} (confirmed ${status.state}).` }],
+				content: [
+					{
+						type: "text",
+						text:
+							`Killed ${params.id} (confirmed ${status.state}).` +
+							(confirmation.warning ? ` Backend warning after termination: ${confirmation.warning}` : ""),
+					},
+				],
 				details: {
 					id: params.id,
 					status: status.state,
 					exitCode: status.exit_code,
 					logPath: logPath(params.id),
+					backendWarning: confirmation.warning,
 				},
 			};
 		},

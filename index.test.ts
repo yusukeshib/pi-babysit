@@ -18,6 +18,7 @@ import { discoverAgents } from "./agents.ts";
 import extension, {
 	activeToolsWithoutDirectBash,
 	automaticNotificationGroup,
+	babysitSpawnInstallHint,
 	buildProcessCompletionMessage,
 	buildSubagentDoneResult,
 	buildSubagentExitDiagnostic,
@@ -34,8 +35,11 @@ import extension, {
 	parseEvents,
 	parseRpcResponseBytes,
 	planSubagentSpawn,
+	prepareBabysitRunArguments,
+	processSessionEnvironment,
 	pruneTerminalSessionCache,
 	readLogBytesFrom,
+	resolveKillConfirmation,
 	resolveSubagentSendMode,
 	rpcResponsePattern,
 	type ProcessCompletionNotice,
@@ -78,15 +82,27 @@ extension({
 	getActiveTools() {
 		return [...activeToolNames];
 	},
+	getThinkingLevel() {
+		return "high";
+	},
 	setActiveTools(names: string[]) {
 		activeToolNames = [...names];
 	},
 } as any);
 
-const ctx = { hasUI: false, cwd: process.cwd() };
-const interactiveCtx = {
-	hasUI: true,
+const ctx = {
+	hasUI: false,
 	cwd: process.cwd(),
+	sessionManager: {
+		getSessionId: () => "test-session-id",
+		getSessionFile: () => "/tmp/test-session.jsonl",
+	},
+	model: { provider: "test-provider", id: "test-model" },
+	thinkingLevel: "high",
+};
+const interactiveCtx = {
+	...ctx,
+	hasUI: true,
 	ui: {
 		setWidget() {},
 		theme: {
@@ -212,6 +228,35 @@ test("babysit version policy requires 0.13.0 or newer", () => {
 	expect(isSupportedBabysitVersion("babysit 0.14.0-beta.1")).toBe(true);
 	expect(isSupportedBabysitVersion("babysit 1.0.0")).toBe(true);
 	expect(isSupportedBabysitVersion("unknown")).toBe(false);
+});
+
+test("a missing babysit executable returns the actionable install hint", () => {
+	const hint = babysitSpawnInstallHint(
+		Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+	);
+	expect(hint).toContain("binary was not found");
+	expect(hint).toContain("cargo install");
+	expect(
+		babysitSpawnInstallHint(Object.assign(new Error("denied"), { code: "EPERM" })),
+	).toBeNull();
+});
+
+test("process commands receive current Pi session metadata", () => {
+	expect(processSessionEnvironment(ctx as any)).toEqual({
+		PI_SESSION_ID: "test-session-id",
+		PI_SESSION_FILE: "/tmp/test-session.jsonl",
+		PI_PROVIDER: "test-provider",
+		PI_MODEL: "test-model",
+		PI_REASONING_LEVEL: "high",
+	});
+	const ephemeral = processSessionEnvironment({
+		...ctx,
+		sessionManager: { ...ctx.sessionManager, getSessionFile: () => undefined },
+		model: undefined,
+	} as any);
+	expect(ephemeral.PI_SESSION_FILE).toBeUndefined();
+	expect(ephemeral.PI_PROVIDER).toBeUndefined();
+	expect(ephemeral.PI_MODEL).toBeUndefined();
 });
 
 test("compact RPC logging is the default while standard remains an opt-out", () => {
@@ -1069,15 +1114,25 @@ test("mode-specific notification and budget parameters reject misuse", async () 
 	expect(subagentGroup.isError).toBe(true);
 	expect(subagentGroup.content[0]?.text).toContain("process mode");
 
-	const subagentContinueAfter = await tools.get("babysit_run").execute(
-		"subagent-continue-after",
-		{ profile: "subagent", task: "do nothing", continueAfterStart: true },
-		undefined,
-		undefined,
-		ctx,
-	);
-	expect(subagentContinueAfter.isError).toBe(true);
-	expect(subagentContinueAfter.content[0]?.text).toContain("process mode");
+	const subagentContinueAfter = prepareBabysitRunArguments({
+		profile: "subagent",
+		task: "do nothing",
+		continueAfterStart: true,
+	});
+	expect(subagentContinueAfter).toEqual({ profile: "subagent", task: "do nothing" });
+	expect(
+		prepareBabysitRunArguments({
+			profile: "subagent",
+			task: "do nothing",
+			foreground: true,
+			continueAfterStart: true,
+		}),
+	).toEqual({
+		profile: "subagent",
+		task: "do nothing",
+		foreground: true,
+		continueAfterStart: true,
+	});
 
 	const conflictingProcessModes = await tools.get("babysit_run").execute(
 		"foreground-continue",
@@ -1160,6 +1215,23 @@ test("kill confirmation validates both backend acknowledgement and terminal stat
 	expect(isConfirmedTerminalState("exited")).toBe(true);
 	expect(isConfirmedTerminalState("running")).toBe(false);
 	expect(isConfirmedTerminalState("dead")).toBe(false);
+
+	expect(resolveKillConfirmation("job", "EPERM", "killed")).toEqual({
+		confirmed: true,
+		warning: "EPERM",
+	});
+	expect(resolveKillConfirmation("job", "already finished", "exited")).toEqual({
+		confirmed: true,
+		warning: "already finished",
+	});
+	expect(resolveKillConfirmation("job", "EPERM", "running")).toEqual({
+		confirmed: false,
+		error: "EPERM",
+	});
+	expect(resolveKillConfirmation("job", null, undefined)).toEqual({
+		confirmed: false,
+		error: "Kill could not be verified: session job disappeared.",
+	});
 });
 
 test("clip enforces the complete byte limit at zero, exact, and overflow boundaries", () => {
@@ -1373,6 +1445,27 @@ test("GC removes only old roots without live supervisors", () => {
 		return root;
 	};
 	const old = createRoot("old", "exited", 0, 30);
+	const createEmptyRoot = (name: string, ageDays: number, leased = false) => {
+		const root = path.join(rootBase, name);
+		mkdirSync(root, { recursive: true });
+		if (leased) {
+			writeFileSync(
+				path.join(root, `.pi-babysit-active-${process.pid}-test.json`),
+				JSON.stringify({ pid: process.pid, startedAt: now }),
+			);
+		}
+		const at = new Date(now - ageDays * 86_400_000);
+		for (const target of [
+			...readdirSync(root).map((entry) => path.join(root, entry)),
+			root,
+		]) {
+			utimesSync(target, at, at);
+		}
+		return root;
+	};
+	const emptyOld = createEmptyRoot("empty-old", 30);
+	createEmptyRoot("empty-fresh", 1);
+	createEmptyRoot("empty-leased", 30, true);
 	createRoot("stale-running", "running", 99_999_999, 30);
 	const locked = createRoot("locked", "exited", 0, 30);
 	writeFileSync(path.join(locked, ".pi-babysit-gc.lock"), "busy");
@@ -1393,9 +1486,10 @@ test("GC removes only old roots without live supervisors", () => {
 			dryRun: true,
 			now,
 		});
-		expect(preview.candidates.sort()).toEqual(["locked", "old", "stale-running"]);
+		expect(preview.candidates.sort()).toEqual(["empty-old", "locked", "old", "stale-running"]);
 		expect(preview.skippedLive.sort()).toEqual([
 			"child-live",
+			"empty-leased",
 			"leased",
 			"live",
 			"unknown-state",
@@ -1408,9 +1502,10 @@ test("GC removes only old roots without live supervisors", () => {
 			dryRun: false,
 			now,
 		});
-		expect(removed.deleted.sort()).toEqual(["old", "stale-running"]);
+		expect(removed.deleted.sort()).toEqual(["empty-old", "old", "stale-running"]);
 		expect(readFileSync(path.join(locked, "sessions", "job", "output.log"), "utf8")).toBe("payload");
 		expect(() => readFileSync(path.join(old, "sessions", "job", "output.log"), "utf8")).toThrow();
+		expect(() => readdirSync(emptyOld)).toThrow();
 		expect(readFileSync(path.join(rootBase, "live", "sessions", "job", "output.log"), "utf8")).toBe("payload");
 		expect(readdirSync(rootBase).some((name) => name.startsWith(".pi-babysit-gc-"))).toBe(false);
 	} finally {

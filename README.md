@@ -56,24 +56,27 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` for one process or subagent whose result is needed in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy process output bounded. Or start a named background subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields), then always collect it with `babysit_wait`. `maxDepth` defaults to 1. Quick commands return inline; longer process runs notify in the background |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` for one process or subagent whose result is needed in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy process output bounded. Or start a named background subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields), then always collect it with `babysit_wait`. `maxDepth` defaults to 1. Subagent `continueAfterStart: true` is accepted as a compatibility alias for this default background behavior. Quick commands return inline; longer process runs notify in the background |
 | `babysit_check` | Without an id, list sessions with state/kind filters. With an id, inspect bounded output, search with `pattern`, or capture a TUI with `screen: true`; `maxBytes` overrides the 4 KB default up to 24 KB |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when confirmed settled (`mode: auto/steer/task`); explicit task mode rejects busy, parked, or unknown state |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: up to 32 unique `ids` + `mode: "any"\|"all"` |
 | `babysit_kill` | Terminate a session, verify terminal state, then suppress the exit notification |
 
 The built-in `bash` tool is removed from the active tool set so the model does
-not waste a failed tool turn before choosing `babysit_run`. A fallback
-`tool_call` hook still blocks direct shell calls if another extension or preset
-re-enables `bash`, including shell backgrounding (`… &`, `nohup`, `setsid`,
-`disown`). Set `PI_BABYSIT_ALLOW_BASH=1` to retain direct `bash` explicitly.
+not waste a failed tool turn before choosing `babysit_run`. Process commands
+retain the built-in Bash tool's dynamic Pi metadata environment:
+`PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and
+`PI_REASONING_LEVEL`. A fallback `tool_call` hook still blocks direct shell
+calls if another extension or preset re-enables `bash`, including shell
+backgrounding (`… &`, `nohup`, `setsid`, `disown`). Set
+`PI_BABYSIT_ALLOW_BASH=1` to retain direct `bash` explicitly.
 
 ## Commands (human)
 
 | Command | What it does |
 | ------- | ------------ |
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
-| `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; deletion uses a GC lock and atomic rename |
+| `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; old empty roots are eligible once their lease is gone. Deletion uses a GC lock and atomic rename |
 
 A widget below the editor separates session **kind** from task **state** at a glance:
 summary counts use `RUNNING` / `IDLE`, and every row is labeled
@@ -157,7 +160,9 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   currently running member to stop and then share one notification even when
   their exits span multiple polls.
   `babysit_kill` and an exit already reported by `babysit_wait` suppress the
-  notification.
+  notification. Kill results are reconciled with persisted terminal state, so
+  a backend escalation warning that arrives after the child has already exited
+  does not produce a false failure followed by a redundant notification.
 - **Subagent**: `foreground: true` or `babysit_wait` blocks on
   `babysit expect '"type":"agent_settled"'`. A background task that settles or
   exits before it is collected emits one ready-to-collect reminder; the parent
@@ -177,10 +182,12 @@ grace window (`PI_BABYSIT_REAP_AFTER`, default 120s) using the same parked-turn
 rule, so a subagent waiting on a long build is never false-killed. Give bounded
 recon/review tasks at least one cost, turn, tool-call, or token budget; omit
 budgets only for intentionally open-ended work. Optional task budgets are
-observed by the parent poller. At 80% of a limit the worker is steered to wrap
-up; reaching the configured limit starts the hard grace immediately, even if a
-wedged worker cannot accept steering. An in-flight model call or parallel tool
-batch can still overshoot before the next poll. If the worker remains active
+observed by the parent poller. `maxUsageTokens` counts cumulative input, output,
+and cache-token usage, so size it above the worker's initial context and
+expected calls. At 80% of a limit the worker is steered to wrap up; reaching the
+configured limit starts the hard grace immediately, even if a wedged worker
+cannot accept steering. An in-flight model call or parallel tool batch can
+still overshoot before the next poll. If the worker remains active
 after `PI_BABYSIT_BUDGET_GRACE`, termination is verified before it is marked
 budget-killed. Usage shown by check/wait is cumulative, and the first terminal
 wait for each task charges that nested usage exactly once to the parent Pi
