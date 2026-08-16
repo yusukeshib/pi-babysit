@@ -2274,9 +2274,9 @@ export function widgetSummaryText(procs: number, busy: number, idle: number): st
 	const running: string[] = [];
 	if (procs > 0) running.push(`${procs} process${procs > 1 ? "es" : ""}`);
 	if (busy > 0) running.push(`${busy} agent${busy > 1 ? "s" : ""}`);
-	if (running.length > 0) sections.push(`RUNNING  ${running.join(" · ")}`);
-	if (idle > 0) sections.push(`IDLE  ${idle} agent${idle > 1 ? "s" : ""}`);
-	return sections.join("  │  ");
+	if (running.length > 0) sections.push(`RUNNING ${running.join(" ")}`);
+	if (idle > 0) sections.push(`IDLE ${idle} agent${idle > 1 ? "s" : ""}`);
+	return sections.join(" ");
 }
 
 export function widgetSessionHeader(
@@ -2286,7 +2286,7 @@ export function widgetSessionHeader(
 	elapsed?: string,
 ): string {
 	const icon = state === "running" ? "▶" : "○";
-	return `  ${icon} ${id}  [${kind.toUpperCase()}] [${state.toUpperCase()}]${elapsed ? ` · age ${elapsed}` : ""}`;
+	return `  ${icon} ${id} ${kind.toUpperCase()} ${state.toUpperCase()}${elapsed ? ` age ${elapsed}` : ""}`;
 }
 
 function renderWidgetLines(procs: number, busy: number, idle: number, theme: Theme): string[] {
@@ -2296,12 +2296,12 @@ function renderWidgetLines(procs: number, busy: number, idle: number, theme: The
 	if (procs > 0) running.push(`${procs} process${procs > 1 ? "es" : ""}`);
 	if (busy > 0) running.push(`${busy} agent${busy > 1 ? "s" : ""}`);
 	if (running.length > 0) {
-		sections.push(`${theme.fg("success", theme.bold("RUNNING"))}  ${running.join(" · ")}`);
+		sections.push(`${theme.fg("success", theme.bold("RUNNING"))} ${running.join(" ")}`);
 	}
 	if (idle > 0) {
-		sections.push(`${theme.fg("muted", theme.bold("IDLE"))}  ${idle} agent${idle > 1 ? "s" : ""}`);
+		sections.push(`${theme.fg("muted", theme.bold("IDLE"))} ${idle} agent${idle > 1 ? "s" : ""}`);
 	}
-	return [theme.bg("toolPendingBg", ` ${sections.join("  │  ")} `)];
+	return [theme.bg("toolPendingBg", ` ${sections.join(" ")} `)];
 }
 
 function renderWidgetSessionHeader(
@@ -2313,9 +2313,9 @@ function renderWidgetSessionHeader(
 ): string {
 	const running = state === "running";
 	const icon = theme.fg(running ? "success" : "muted", running ? "▶" : "○");
-	const kindLabel = theme.fg(kind === "process" ? "accent" : "warning", theme.bold(`[${kind.toUpperCase()}]`));
-	const stateLabel = theme.fg(running ? "success" : "muted", theme.bold(`[${state.toUpperCase()}]`));
-	return `  ${icon} ${id}  ${kindLabel} ${stateLabel}${elapsed ? theme.fg("dim", ` · age ${elapsed}`) : ""}`;
+	const kindLabel = theme.fg(kind === "process" ? "accent" : "warning", theme.bold(kind.toUpperCase()));
+	const stateLabel = theme.fg(running ? "success" : "muted", theme.bold(state.toUpperCase()));
+	return `  ${icon} ${id} ${kindLabel} ${stateLabel}${elapsed ? theme.fg("dim", ` age ${elapsed}`) : ""}`;
 }
 
 // How many trailing output lines to show per running session in the widget.
@@ -3257,10 +3257,10 @@ export default function (pi: ExtensionAPI) {
 				theme,
 			);
 			if (tails[index].length === 1) {
-				lines.push(`${header}  │ ${tails[index][0]}`);
+				lines.push(`${header} ${tails[index][0]}`);
 			} else {
 				lines.push(header);
-				for (const tail of tails[index]) lines.push(`     │ ${tail}`);
+				for (const tail of tails[index]) lines.push(`      ${tail}`);
 			}
 		});
 		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });

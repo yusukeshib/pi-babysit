@@ -80,8 +80,8 @@ backgrounding (`… &`, `nohup`, `setsid`, `disown`). Set
 
 A widget below the editor separates session **kind** from task **state** at a glance:
 summary counts use `RUNNING` / `IDLE`, and every row is labeled
-`[PROCESS] [RUNNING]`, `[AGENT] [RUNNING]`, or `[AGENT] [IDLE]`. The displayed
-`age` is total session age, not time spent in the current state.
+`PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`. The displayed `age`
+is total session age, not time spent in the current state.
 
 ## Logs without context flooding
 

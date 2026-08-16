@@ -129,17 +129,17 @@ async function run(command: string, extras: Record<string, unknown> = {}) {
 	}>;
 }
 
-test("widget labels make session kind and state explicit", () => {
-	expect(widgetSummaryText(2, 0, 8)).toBe("RUNNING  2 processes  │  IDLE  8 agents");
-	expect(widgetSummaryText(1, 2, 0)).toBe("RUNNING  1 process · 2 agents");
+test("widget labels make session kind and state explicit without visual clutter", () => {
+	expect(widgetSummaryText(2, 0, 8)).toBe("RUNNING 2 processes IDLE 8 agents");
+	expect(widgetSummaryText(1, 2, 0)).toBe("RUNNING 1 process 2 agents");
 	expect(widgetSessionHeader("watch-ci", "process", "running", "3m01s")).toBe(
-		"  ▶ watch-ci  [PROCESS] [RUNNING] · age 3m01s",
+		"  ▶ watch-ci PROCESS RUNNING age 3m01s",
 	);
 	expect(widgetSessionHeader("review", "agent", "running")).toBe(
-		"  ▶ review  [AGENT] [RUNNING]",
+		"  ▶ review AGENT RUNNING",
 	);
 	expect(widgetSessionHeader("review", "agent", "idle")).toBe(
-		"  ○ review  [AGENT] [IDLE]",
+		"  ○ review AGENT IDLE",
 	);
 });
 
