@@ -143,15 +143,35 @@ test("widget labels make session kind and state explicit without visual clutter"
 	);
 });
 
-test("process completion messages render semantic colored labels", () => {
-	const renderer = renderers.get("pi-babysit-process-end");
+test("pi-babysit message renderers follow the tool expansion toggle", () => {
 	const theme = {
 		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
 		bg: (color: string, text: string) => `<bg-${color}>${text}</bg-${color}>`,
 		bold: (text: string) => text,
 	};
-	const renderLines = (details: Record<string, unknown>) =>
-		renderer({ content: "process details", details }, {}, theme).render(100) as string[];
+	const resultRenderer = renderers.get("pi-babysit-result");
+	const resultMessage = {
+		content: "snapshot details",
+		details: { title: "snapshot", status: "running" },
+	};
+	const collapsedResult = resultRenderer(resultMessage, { expanded: false }, theme)
+		.render(100)
+		.join("\n");
+	const expandedResult = resultRenderer(resultMessage, { expanded: true }, theme)
+		.render(100)
+		.join("\n");
+	expect(collapsedResult).toContain("<accent>RUNNING</accent>");
+	expect(collapsedResult).toContain("<accent>snapshot</accent>");
+	expect(collapsedResult).not.toContain("snapshot details");
+	expect(expandedResult).toContain("snapshot details");
+
+	const completionRenderer = renderers.get("pi-babysit-process-end");
+	const renderLines = (details: Record<string, unknown>, expanded = true) =>
+		completionRenderer(
+			{ content: "process details", details },
+			{ expanded },
+			theme,
+		).render(100) as string[];
 	const render = (details: Record<string, unknown>) => renderLines(details).join("\n");
 
 	expect(render({ status: "success", command: "npm test" })).toContain(
@@ -167,6 +187,9 @@ test("process completion messages render semantic colored labels", () => {
 	expect(render({ status: "success", count: 3 })).toContain(
 		"<warning>babysit_run COMMAND  ×3</warning>",
 	);
+	expect(renderLines({ status: "success" }, false).join("\n")).not.toContain(
+		"process details",
+	);
 	const lines = renderLines({ status: "success" });
 	expect(lines[0]).not.toContain("babysit_run");
 	expect(lines.at(-1)).not.toContain("process details");
@@ -179,10 +202,15 @@ test("babysit_run renders a status label for quick and background results", () =
 		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
 		bold: (text: string) => text,
 	};
-	const render = (status: string, isError = false, content = "result details") =>
+	const render = (
+		status: string,
+		isError = false,
+		content = "result details",
+		expanded = true,
+	) =>
 		renderResult(
 			{ content: [{ type: "text", text: content }], details: { status } },
-			{ isPartial: false },
+			{ expanded, isPartial: false },
 			theme,
 			{ isError },
 		).render(100).join("\n");
@@ -212,6 +240,9 @@ test("babysit_run renders a status label for quick and background results", () =
 	expect(render("success")).not.toContain("babysit_run SUCCESS");
 	expect(render("started")).toContain("<accent>STARTED</accent>");
 	expect(render("failed", true)).toContain("<error>FAILED</error>");
+	expect(render("success", false, "result details", false)).not.toContain(
+		"result details",
+	);
 	expect(
 		render(
 			"success",

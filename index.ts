@@ -3294,7 +3294,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Render snapshots and subagent answers INLINE in the transcript as formatted
 	// markdown, with a semantic status label that remains readable on any theme.
-	pi.registerMessageRenderer("pi-babysit-result", (message, _opts, theme) => {
+	pi.registerMessageRenderer("pi-babysit-result", (message, { expanded }, theme) => {
 		const d = (message.details ?? {}) as {
 			title?: string;
 			body?: string;
@@ -3305,35 +3305,44 @@ export default function (pi: ExtensionAPI) {
 		const box = new Box(1, 0, (t) => theme.bg("toolSuccessBg", t));
 		if (d.status) box.addChild(new Text(renderStatus(d.status, theme), 0, 0));
 		if (d.title) box.addChild(new Text(theme.fg("accent", d.title), 0, 0));
-		box.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
+		if (expanded && body) box.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
 		return box;
 	});
 
 	// Process-end notification rendering with a colored lifecycle label. Keep the
 	// box background subtle: coloring a potentially large log excerpt is noisy.
-	pi.registerMessageRenderer("pi-babysit-process-end", (message, _opts, theme) => {
-		const content = typeof message.content === "string" ? message.content : "";
-		const d = (message.details ?? {}) as {
-			status?: DisplayStatus;
-			success?: boolean;
-			exitCode?: number | null;
-			command?: string;
-			count?: number;
-		};
-		const status =
-			d.status ?? (d.success ? "success" : d.exitCode == null ? "terminated" : "failed");
-		const payload = d.command
-			? `  ${summarizeNotificationCommand(d.command)}`
-			: d.count && d.count > 1
-				? `  ×${d.count}`
-				: "";
-		const header = theme.fg("warning", theme.bold(`babysit_run COMMAND${payload}`));
-		const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
-		box.addChild(new Text(header, 0, 0));
-		box.addChild(new Text(renderStatus(status, theme), 0, 0));
-		box.addChild(new Text(theme.fg("toolOutput", content), 0, 0));
-		return box;
-	});
+	pi.registerMessageRenderer(
+		"pi-babysit-process-end",
+		(message, { expanded }, theme) => {
+			const content = typeof message.content === "string" ? message.content : "";
+			const d = (message.details ?? {}) as {
+				status?: DisplayStatus;
+				success?: boolean;
+				exitCode?: number | null;
+				command?: string;
+				count?: number;
+			};
+			const status =
+				d.status ??
+				(d.success ? "success" : d.exitCode == null ? "terminated" : "failed");
+			const payload = d.command
+				? `  ${summarizeNotificationCommand(d.command)}`
+				: d.count && d.count > 1
+					? `  ×${d.count}`
+					: "";
+			const header = theme.fg(
+				"warning",
+				theme.bold(`babysit_run COMMAND${payload}`),
+			);
+			const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
+			box.addChild(new Text(header, 0, 0));
+			box.addChild(new Text(renderStatus(status, theme), 0, 0));
+			if (expanded && content) {
+				box.addChild(new Text(theme.fg("toolOutput", content), 0, 0));
+			}
+			return box;
+		},
+	);
 
 	let polling = false;
 	pi.on("session_start", async (_event, ctx) => {
@@ -3950,7 +3959,7 @@ export default function (pi: ExtensionAPI) {
 					: "";
 			return new Text(theme.fg("warning", `${title}${agent}${detail}`), 0, 0);
 		},
-		renderResult(result, { isPartial }, theme, context) {
+		renderResult(result, { expanded, isPartial }, theme, context) {
 			const details = (result.details ?? {}) as {
 				kind?: "process" | "subagent";
 				status?: DisplayStatus;
@@ -3977,7 +3986,11 @@ export default function (pi: ExtensionAPI) {
 								? "started"
 								: "success");
 			const label = renderStatus(status, theme);
-			return new Text(content ? `${label}\n${theme.fg("toolOutput", content)}` : label, 0, 0);
+			return new Text(
+				expanded && content ? `${label}\n${theme.fg("toolOutput", content)}` : label,
+				0,
+				0,
+			);
 		},
 	});
 
