@@ -1449,36 +1449,63 @@ export function deliverProcessCompletionMessage(
 // parked-turn detection (shared rule with self-reap.ts)
 // ---------------------------------------------------------------------------
 
-// A turn that ends right after `babysit_run { command }` only means "parked
-// awaiting the process-exit notification" — pi resumes it on its own; that is
-// NOT task completion. Such runs stamp NOTIFY_MARKER into their tool result,
-// so the marker in the LAST message's toolResult identifies a parked turn.
-// (A subagent-profile run does NOT carry the marker: ending a turn to "wait"
-// for a subagent is a guidance violation, and treating it as completion keeps
-// the parent from hanging forever.) `process` is the legacy pi-processes tool.
-function isParkedMessages(
-	messages:
-		| {
-				role?: string;
-				toolName?: string;
-				content?: unknown;
-				details?: { kind?: string; status?: string };
-			}[]
-		| undefined,
-): boolean {
+// A turn that ends after `babysit_run { command }` can be parked awaiting an
+// automatic process-exit notification. A later terminal babysit_wait/kill for
+// that same id consumes the start, however, so it must not make a completed
+// subagent task look parked. (A subagent-profile run does not carry the marker.)
+// `process` is the legacy pi-processes tool and remains conservative because it
+// does not expose equivalent structured collection metadata.
+type ParkedMessage = {
+	role?: string;
+	toolName?: string;
+	content?: unknown;
+	details?: {
+		id?: string;
+		kind?: string;
+		status?: string | { id?: string; state?: string };
+		results?: Array<{ id?: string; kind?: string }>;
+		first?: { id?: string; kind?: string };
+	};
+};
+
+function isParkedMessages(messages: ParkedMessage[] | undefined): boolean {
 	if (!messages) return false;
-	// Models sometimes add a short assistant note after starting a process. Scan
-	// the run rather than requiring the marker-bearing tool result to be the last
-	// message, otherwise that harmless note turns a parked build into false task
-	// completion (and lets the self-reaper kill it).
+	const terminalCounts = new Map<string, number>();
+	const addTerminal = (id: string) => terminalCounts.set(id, (terminalCounts.get(id) ?? 0) + 1);
+
+	// Walk backwards so only a terminal collection that occurred after a start
+	// can consume it. Counts preserve repeated starts that reuse the same id.
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
 		if (message?.role !== "toolResult") continue;
+		if (message.toolName === "babysit_wait") {
+			const status = message.details?.status;
+			if (
+				status &&
+				typeof status === "object" &&
+				typeof status.id === "string" &&
+				typeof status.state === "string" &&
+				status.state !== "running"
+			) {
+				addTerminal(status.id);
+			}
+			for (const result of message.details?.results ?? []) {
+				if (result.kind === "exited" && typeof result.id === "string") addTerminal(result.id);
+			}
+			const first = message.details?.first;
+			if (first?.kind === "exited" && typeof first.id === "string") addTerminal(first.id);
+			continue;
+		}
+		if (
+			message.toolName === "babysit_kill" &&
+			typeof message.details?.id === "string" &&
+			["exited", "killed", "dead"].includes(String(message.details.status))
+		) {
+			addTerminal(message.details.id);
+			continue;
+		}
 		if (message.toolName === "process") return true; // legacy pi-processes
 		if (message.toolName !== "babysit_run") continue;
-		if (message.details?.kind === "process" && message.details.status === "started") {
-			return true;
-		}
 		const text = Array.isArray(message.content)
 			? message.content
 					.filter((part): part is { type: "text"; text: string } =>
@@ -1489,7 +1516,16 @@ function isParkedMessages(
 			: typeof message.content === "string"
 				? message.content
 				: "";
-		if (/^Process started \(id: [^)]+\)\. \[notify-on-exit\]\nLog: /.test(text)) return true;
+		const textMatch = /^Process started \(id: ([^)]+)\)\. \[notify-on-exit\]\nLog: /.exec(text);
+		const structuredStart =
+			message.details?.kind === "process" && message.details.status === "started";
+		if (!structuredStart && !textMatch) continue;
+		const id = typeof message.details?.id === "string" ? message.details.id : textMatch?.[1];
+		if (!id) return true;
+		const count = terminalCounts.get(id) ?? 0;
+		if (count === 0) return true;
+		if (count === 1) terminalCounts.delete(id);
+		else terminalCounts.set(id, count - 1);
 	}
 	return false;
 }
@@ -1764,16 +1800,7 @@ function parseEventLine(progress: Progress, raw: string): void {
 			progress.lastEndWasProcessWait =
 				typeof event.piBabysitParked === "boolean"
 					? event.piBabysitParked
-					: isParkedMessages(
-							event.messages as
-								| {
-										role?: string;
-										toolName?: string;
-										content?: unknown;
-										details?: { kind?: string; status?: string };
-									}[]
-								| undefined,
-						);
+					: isParkedMessages(event.messages as ParkedMessage[] | undefined);
 			break;
 		}
 		case "agent_settled":

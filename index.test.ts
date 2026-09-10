@@ -760,7 +760,7 @@ test("self-reaper parked detection cannot be spoofed by command output", () => {
 				role: "toolResult",
 				toolName: "babysit_run",
 				content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
-				details: { kind: "process", status: "started" },
+				details: { id: "build", kind: "process", status: "started" },
 			},
 		]),
 	).toBe(true);
@@ -769,6 +769,77 @@ test("self-reaper parked detection cannot be spoofed by command output", () => {
 			{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" },
 		]),
 	).toBe(false);
+});
+
+test("a process explicitly collected in the same subagent run is not left parked", () => {
+	const messages = [
+		{
+			role: "toolResult",
+			toolName: "babysit_run",
+			content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
+			details: { id: "build", kind: "process", status: "started" },
+		},
+		{
+			role: "toolResult",
+			toolName: "babysit_wait",
+			content: "Process build completed successfully.",
+			details: { status: { id: "build", state: "exited", exit_code: 0 } },
+		},
+		{ role: "assistant", content: [{ type: "text", text: "finished" }] },
+	];
+	expect(selfReaperIsParked(messages)).toBe(false);
+	const compactedEnd = compactRpcLine(JSON.stringify({ type: "agent_end", messages }), "compact");
+	expect(JSON.parse(compactedEnd).piBabysitParked).toBe(false);
+	expect(
+		parseEvents(
+			`${JSON.stringify({ type: "agent_start" })}\n${compactedEnd}\n${JSON.stringify({ type: "agent_settled" })}\n`,
+		),
+	).toMatchObject({ done: true, waitingOnProcess: false });
+});
+
+test("parked reconciliation is ordered and consumes matching process ids once", () => {
+	const start = (id: string) => ({
+		role: "toolResult",
+		toolName: "babysit_run",
+		content: `Process started (id: ${id}). [notify-on-exit]\nLog: /tmp/${id}.log`,
+		details: { id, kind: "process", status: "started" },
+	});
+	const wait = (id: string, state = "exited") => ({
+		role: "toolResult",
+		toolName: "babysit_wait",
+		content: "wait result",
+		details: { status: { id, state } },
+	});
+
+	expect(selfReaperIsParked([wait("build"), start("build")])).toBe(true);
+	expect(selfReaperIsParked([start("build"), start("build"), wait("build")])).toBe(true);
+	expect(
+		selfReaperIsParked([start("a"), start("b"), {
+			role: "toolResult",
+			toolName: "babysit_wait",
+			content: "all finished",
+			details: { results: [{ id: "a", kind: "exited" }, { id: "b", kind: "exited" }] },
+		}]),
+	).toBe(false);
+	expect(selfReaperIsParked([start("build"), wait("build", "running")])).toBe(true);
+	expect(selfReaperIsParked([start("build"), {
+		role: "toolResult",
+		toolName: "babysit_wait",
+		content: "malformed",
+		details: { status: { id: "build" } },
+	}])).toBe(true);
+	expect(selfReaperIsParked([start("build"), {
+		role: "toolResult",
+		toolName: "babysit_kill",
+		content: "killed",
+		details: { id: "build", status: "killed" },
+	}])).toBe(false);
+	expect(selfReaperIsParked([start("build"), {
+		role: "toolResult",
+		toolName: "babysit_wait",
+		content: "first finished",
+		details: { first: { id: "build", kind: "exited" }, remaining: ["other"] },
+	}])).toBe(false);
 });
 
 test("self-reaper exits an already-idle RPC worker when its grace elapses", () => {
