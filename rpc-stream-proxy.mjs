@@ -19,14 +19,40 @@ import { pathToFileURL } from "node:url";
 
 function isParkedMessages(messages) {
 	if (!Array.isArray(messages)) return false;
+	const terminalCounts = new Map();
+	const addTerminal = (id) => terminalCounts.set(id, (terminalCounts.get(id) ?? 0) + 1);
+
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message?.role !== "toolResult") continue;
+		if (message.toolName === "babysit_wait") {
+			const status = message.details?.status;
+			if (
+				status &&
+				typeof status === "object" &&
+				typeof status.id === "string" &&
+				typeof status.state === "string" &&
+				status.state !== "running"
+			) {
+				addTerminal(status.id);
+			}
+			for (const result of message.details?.results ?? []) {
+				if (result.kind === "exited" && typeof result.id === "string") addTerminal(result.id);
+			}
+			const first = message.details?.first;
+			if (first?.kind === "exited" && typeof first.id === "string") addTerminal(first.id);
+			continue;
+		}
+		if (
+			message.toolName === "babysit_kill" &&
+			typeof message.details?.id === "string" &&
+			["exited", "killed", "dead"].includes(String(message.details.status))
+		) {
+			addTerminal(message.details.id);
+			continue;
+		}
 		if (message.toolName === "process") return true;
 		if (message.toolName !== "babysit_run") continue;
-		if (message.details?.kind === "process" && message.details.status === "started") {
-			return true;
-		}
 		const text = Array.isArray(message.content)
 			? message.content
 					.filter((part) => part?.type === "text" && typeof part.text === "string")
@@ -35,9 +61,16 @@ function isParkedMessages(messages) {
 			: typeof message.content === "string"
 				? message.content
 				: "";
-		if (/^Process started \(id: [^)]+\)\. \[notify-on-exit\]\nLog: /.test(text)) {
-			return true;
-		}
+		const textMatch = /^Process started \(id: ([^)]+)\)\. \[notify-on-exit\]\nLog: /.exec(text);
+		const structuredStart =
+			message.details?.kind === "process" && message.details.status === "started";
+		if (!structuredStart && !textMatch) continue;
+		const id = typeof message.details?.id === "string" ? message.details.id : textMatch?.[1];
+		if (!id) return true;
+		const count = terminalCounts.get(id) ?? 0;
+		if (count === 0) return true;
+		if (count === 1) terminalCounts.delete(id);
+		else terminalCounts.set(id, count - 1);
 	}
 	return false;
 }
