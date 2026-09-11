@@ -40,6 +40,7 @@ import extension, {
 	pruneTerminalSessionCache,
 	readLogBytesFrom,
 	resolveKillConfirmation,
+	resolveProcessLifecycle,
 	resolveSubagentSendMode,
 	rpcResponsePattern,
 	type ProcessCompletionNotice,
@@ -1195,6 +1196,13 @@ test("exclusive claim files elect exactly one caller across processes", async ()
 	}
 });
 
+test("process lifecycle defaults follow ownership and explicit overrides win", () => {
+	expect(resolveProcessLifecycle(undefined, true)).toBe("attached");
+	expect(resolveProcessLifecycle(undefined, false)).toBe("detached");
+	expect(resolveProcessLifecycle("detached", true)).toBe("detached");
+	expect(resolveProcessLifecycle("attached", false)).toBe("attached");
+});
+
 test("mode-specific notification and budget parameters reject misuse", async () => {
 	const processBudget = await tools.get("babysit_run").execute(
 		"process-budget",
@@ -1215,6 +1223,26 @@ test("mode-specific notification and budget parameters reject misuse", async () 
 	);
 	expect(subagentGroup.isError).toBe(true);
 	expect(subagentGroup.content[0]?.text).toContain("process mode");
+
+	const subagentLifecycle = await tools.get("babysit_run").execute(
+		"subagent-lifecycle",
+		{ profile: "subagent", task: "do nothing", lifecycle: "attached" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(subagentLifecycle.isError).toBe(true);
+	expect(subagentLifecycle.content[0]?.text).toContain("process mode");
+
+	const backgroundAttached = await tools.get("babysit_run").execute(
+		"background-attached",
+		{ command: "sleep 1", lifecycle: "attached" },
+		undefined,
+		undefined,
+		interactiveCtx,
+	);
+	expect(backgroundAttached.isError).toBe(true);
+	expect(backgroundAttached.content[0]?.text).toContain("requires `foreground: true`");
 
 	const subagentContinueAfter = prepareBabysitRunArguments({
 		profile: "subagent",
@@ -1776,6 +1804,66 @@ test("Pi reload preserves workers and Pi quit terminates all workers", async () 
 	} finally {
 		for (const id of ids) invoke(["kill", "-s", id, "--json"]);
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("attached foreground abort terminates while detached foreground abort preserves the process", async () => {
+	const runWithAbort = async (lifecycle?: "attached" | "detached") => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 200);
+		const label = lifecycle ?? "default";
+		try {
+			return await tools.get("babysit_run").execute(
+				`abort-${label}-${Date.now()}-${sequence++}`,
+				{
+					name: `abort-${label}-${Date.now()}-${sequence++}`,
+					command: "sleep 60",
+					pty: false,
+					foreground: true,
+					...(lifecycle ? { lifecycle } : {}),
+				},
+				controller.signal,
+				undefined,
+				interactiveCtx,
+			);
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+
+	const attached = await runWithAbort();
+	expect(attached.isError).toBe(true);
+	expect(attached.content[0]?.text).toContain("attached lifecycle cleanup confirmed terminal state");
+	const attachedStatus = await tools.get("babysit_check").execute(
+		"check-attached-abort",
+		{ id: attached.details.id },
+		undefined,
+		undefined,
+		ctx,
+	);
+	expect(attachedStatus.details.status.state).not.toBe("running");
+	expect(attachedStatus.details.status.child_pid).toBeNull();
+
+	const detached = await runWithAbort("detached");
+	try {
+		expect(detached.isError).toBe(true);
+		expect(detached.content[0]?.text).toContain("was interrupted");
+		const detachedStatus = await tools.get("babysit_check").execute(
+			"check-detached-abort",
+			{ id: detached.details.id },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(detachedStatus.details.status.state).toBe("running");
+	} finally {
+		await tools.get("babysit_kill").execute(
+			"cleanup-detached-abort",
+			{ id: detached.details.id },
+			undefined,
+			undefined,
+			ctx,
+		);
 	}
 });
 

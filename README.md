@@ -56,7 +56,7 @@ programs** (installers, wizards, REPLs): type with `babysit_send`
 
 | Tool | What it does |
 | ---- | ------------ |
-| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`). Set `foreground: true` for one process or subagent whose result is needed in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy process output bounded. Or start a named background subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields), then always collect it with `babysit_wait`. `maxDepth` defaults to 1. Subagent `continueAfterStart: true` is accepted as a compatibility alias for this default background behavior. Quick commands return inline; longer process runs notify in the background |
+| `babysit_run` | Run any command (`command`, optional `name`/`pty`/`timeout`/`idleTimeout`/`retryOnWorkerDeath`/`notificationGroup`/`lifecycle`). Set `foreground: true` for one process or subagent whose result is needed in the same tool call; use `returnPattern`/`returnLines`/`maxBytes` to keep noisy process output bounded. Foreground and non-interactive process waits default to lifecycle `attached`, which terminates the process tree if that owning tool call is interrupted; background starts default to `detached`. Or start a named background subagent (`profile: "subagent"`, `task`, optional `name`/`agent`/`model`/`tools`/`maxDepth` and budget fields), then always collect it with `babysit_wait`. `maxDepth` defaults to 1. Subagent `continueAfterStart: true` is accepted as a compatibility alias for this default background behavior. Quick commands return inline; longer process runs notify in the background |
 | `babysit_check` | Without an id, list sessions with state/kind filters. With an id, inspect bounded output, search with `pattern`, or capture a TUI with `screen: true`; `maxBytes` overrides the 4 KB default up to 24 KB |
 | `babysit_send` | Process: type `text` / press `keys` into the PTY. Subagent: steer mid-run, or send a follow-up task when confirmed settled (`mode: auto/steer/task`); explicit task mode rejects busy, parked, or unknown state |
 | `babysit_wait` | Block until done: process exit (or `expect: "regex"` readiness marker), subagent task completion. Multi-wait: up to 32 unique `ids` + `mode: "any"\|"all"` |
@@ -132,7 +132,20 @@ suite at the end. Background subagents must likewise be collected before the
 parent task finishes so their answer and nested usage are not lost.
 Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 
-## Pi shutdown and reload
+## Process ownership, interruption, shutdown, and reload
+
+An inline process wait (`foreground: true`, or process execution in a non-UI
+mode) defaults to `lifecycle: "attached"`. If its owning `babysit_run` tool call
+is interrupted through Pi's AbortSignal, pi-babysit terminates the supervised
+process tree through the babysit session API and verifies persisted terminal
+state before returning. Set `lifecycle: "detached"` explicitly only when a
+foreground wait may be interrupted but the process must continue. Interactive
+background starts are detached; `lifecycle: "attached"` therefore requires
+`foreground: true` in interactive mode.
+
+An explicit `babysit_wait` is only a waiter, not the process owner. Interrupting
+it never terminates the process; call `babysit_kill` when termination is wanted.
+This cooperative policy does not claim to detect an abrupt host `SIGKILL`.
 
 A real Pi quit terminates every running process and subagent in the current Pi
 session namespace. The workers are killed concurrently, so shutdown time does

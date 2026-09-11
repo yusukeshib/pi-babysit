@@ -2440,6 +2440,63 @@ interface WaitOutcome {
 	progress?: Progress;
 }
 
+export type ProcessLifecycle = "attached" | "detached";
+
+export function resolveProcessLifecycle(
+	requested: ProcessLifecycle | undefined,
+	waitsInline: boolean,
+): ProcessLifecycle {
+	return requested ?? (waitsInline ? "attached" : "detached");
+}
+
+async function terminateAttachedProcessAfterInterrupt(id: string): Promise<WaitOutcome> {
+	const killed = await bs(["kill", "-s", id, "--json"]);
+	const backendError =
+		killed.code === 0
+			? validateKillResponse(killed.stdout)
+			: killed.stderr.trim() || killed.stdout.trim() || `babysit kill exited ${killed.code}`;
+	const status = await awaitConfirmedTermination(id);
+	const confirmation = resolveKillConfirmation(id, backendError, status?.state);
+	if (!confirmation.confirmed) {
+		return {
+			id,
+			kind: "interrupted",
+			ok: false,
+			text:
+				`Foreground process ${id} was interrupted, but attached lifecycle termination could not be verified: ${confirmation.error}\n` +
+				`Log: ${logPath(id)}`,
+			status,
+		};
+	}
+
+	// The interrupted owning call reports the termination, so the background
+	// poller must not emit a second completion notification.
+	suppressNotify(id, "kill");
+	return {
+		id,
+		kind: "interrupted",
+		ok: false,
+		text:
+			`Foreground process ${id} was interrupted; attached lifecycle cleanup confirmed terminal state.` +
+			(confirmation.warning ? ` Backend warning: ${confirmation.warning}` : "") +
+			`\nLog: ${logPath(id)}`,
+		status,
+	};
+}
+
+async function waitForProcessWithLifecycle(
+	id: string,
+	signal: AbortSignal | undefined,
+	lifecycle: ProcessLifecycle,
+	outputSelection?: ProcessOutputSelection,
+): Promise<WaitOutcome> {
+	const outcome = await waitForExit(id, null, signal, undefined, outputSelection);
+	if (lifecycle !== "attached" || !signal?.aborted || outcome.kind !== "interrupted") {
+		return outcome;
+	}
+	return terminateAttachedProcessAfterInterrupt(id);
+}
+
 export interface NestedUsage {
 	input: number;
 	output: number;
@@ -3630,6 +3687,12 @@ export default function (pi: ExtensionAPI) {
 					description: "Process or subagent: wait for completion and return the result in this tool call.",
 				}),
 			),
+			lifecycle: Type.Optional(
+				StringEnum(["attached", "detached"] as const, {
+					description:
+						"Process mode only. attached terminates the process tree if the owning inline babysit_run wait is interrupted; detached leaves it running. Defaults to attached for foreground/non-interactive waits and detached for background starts.",
+				}),
+			),
 			returnPattern: Type.Optional(
 				Type.String({ description: "Foreground/quick process: return only latest regex matches." }),
 			),
@@ -3702,6 +3765,20 @@ export default function (pi: ExtensionAPI) {
 					details: {},
 				};
 			}
+			if (isSubagent && params.lifecycle) {
+				return {
+					content: [{ type: "text", text: "`lifecycle` is available only in process mode." }],
+					isError: true,
+					details: {},
+				};
+			}
+			if (!isSubagent && params.lifecycle === "attached" && ctx.hasUI && !params.foreground) {
+				return {
+					content: [{ type: "text", text: "`lifecycle: attached` requires `foreground: true` in interactive process mode." }],
+					isError: true,
+					details: {},
+				};
+			}
 			if (isSubagent && (params.returnPattern || params.returnLines != null || params.maxBytes != null)) {
 				return {
 					content: [{ type: "text", text: "`returnPattern`, `returnLines`, and `maxBytes` are process-output options." }],
@@ -3732,6 +3809,8 @@ export default function (pi: ExtensionAPI) {
 
 			// --- process mode ---
 			if (!isSubagent) {
+				const waitsInline = !ctx.hasUI || params.foreground === true;
+				const lifecycle = resolveProcessLifecycle(params.lifecycle, waitsInline);
 				if (params.returnPattern) {
 					try {
 						new RegExp(params.returnPattern);
@@ -3773,19 +3852,19 @@ export default function (pi: ExtensionAPI) {
 				// result in interactive mode, avoiding a separate babysit_wait model turn.
 				// The command remains supervised, logged, killable, and subject to its
 				// babysit timeout in either case.
-				if (!ctx.hasUI || params.foreground) {
+				if (waitsInline) {
 					// The babysit supervisor owns the absolute command timeout. Waiting with
 					// the same deadline here races its terminal-state write and can return a
 					// false "still running" result at the boundary, so wait for the
 					// supervisor's definitive exit instead.
-					let outcome = await waitForExit(res.id, null, _signal, undefined, outputSelection);
+					let outcome = await waitForProcessWithLifecycle(res.id, _signal, lifecycle, outputSelection);
 					let retried = false;
 					if (params.retryOnWorkerDeath && outcome.status?.state === "dead" && outcome.status.exit_code == null) {
 						const retry = await spawnProcess(spawnOpts);
 						if (!("error" in retry)) {
 							res = retry;
 							retried = true;
-							outcome = await waitForExit(res.id, null, _signal, undefined, outputSelection);
+							outcome = await waitForProcessWithLifecycle(res.id, _signal, lifecycle, outputSelection);
 						}
 					}
 					if (ctx.hasUI) await refreshWidget(ctx);
