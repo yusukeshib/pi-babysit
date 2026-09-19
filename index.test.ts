@@ -25,6 +25,7 @@ import extension, {
 	canRestoreNotificationAfterWait,
 	claimFileOnce,
 	clip,
+	createWidgetComponent,
 	clipMultiWaitResult,
 	deliverProcessCompletionMessage,
 	gcBabysitRoots,
@@ -142,6 +143,85 @@ test("widget labels make session kind and state explicit without visual clutter"
 	expect(widgetSessionHeader("review", "agent", "idle")).toBe(
 		"  ○ review AGENT IDLE",
 	);
+});
+
+test("process widget toggles the latest 20 log lines by click and keeps live state", () => {
+	const expanded = new Set<string>();
+	const tail = Array.from({ length: 25 }, (_, i) => `line-${i + 1}`);
+	const sessions = [
+		{ id: "build", header: "build PROCESS", tail, expandable: true },
+		{ id: "agent", header: "agent AGENT", tail: ["thinking"], expandable: false },
+	];
+	const component = createWidgetComponent(["RUNNING"], sessions, expanded);
+
+	expect(component.render(80)).toEqual([
+		"RUNNING",
+		"build PROCESS line-25",
+		"agent AGENT thinking",
+	]);
+	expect(component.handleMouse({ type: "click", button: "left", y: 0 })).toBeUndefined();
+	expect(component.handleMouse({ type: "click", button: "right", y: 1 })).toBeUndefined();
+	expect(expanded.size).toBe(0);
+
+	expect(component.handleMouse({ type: "click", button: "left", y: 1 })).toEqual({
+		handled: true,
+		render: true,
+	});
+	const expandedLines = component.render(80);
+	expect(expandedLines).toHaveLength(23);
+	expect(expandedLines.slice(2, 22)).toEqual(
+		Array.from({ length: 20 }, (_, i) => `      line-${i + 6}`),
+	);
+	expect(expandedLines.at(-1)).toBe("agent AGENT thinking");
+
+	// Poll refreshes replace the component data but share expansion state.
+	const refreshed = createWidgetComponent(
+		["RUNNING"],
+		[{ ...sessions[0], tail: [...tail, "line-26"] }],
+		expanded,
+	);
+	expect(refreshed.render(80)).toContain("      line-26");
+
+	// Any line belonging to an expanded process can collapse it.
+	expect(refreshed.handleMouse({ type: "click", button: "left", y: 5 })).toEqual({
+		handled: true,
+		render: true,
+	});
+	expect(refreshed.render(80)).toEqual(["RUNNING", "build PROCESS line-26"]);
+});
+
+test("process widget tracks expansion independently by process id", () => {
+	const expanded = new Set<string>();
+	const component = createWidgetComponent(
+		["RUNNING"],
+		[
+			{ id: "one", header: "one", tail: ["one-a", "one-b"], expandable: true },
+			{ id: "two", header: "two", tail: ["two-a", "two-b"], expandable: true },
+		],
+		expanded,
+	);
+	component.render(80);
+	component.handleMouse({ type: "click", button: "left", y: 1 });
+	expect(expanded).toEqual(new Set(["one"]));
+	expect(component.render(80)).toEqual([
+		"RUNNING",
+		"one",
+		"      one-a",
+		"      one-b",
+		"two two-b",
+	]);
+});
+
+test("process widget truncates every rendered line to the available width", () => {
+	const component = createWidgetComponent(
+		["123456789"],
+		[{ id: "build", header: "abcdefgh", tail: ["ijklmnop"], expandable: true }],
+		new Set(),
+	);
+	const rendered = component.render(7).map((line) =>
+		line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""),
+	);
+	expect(rendered).toEqual(["1234567", "abcdefg"]);
 });
 
 test("pi-babysit message renderers follow the tool expansion toggle", () => {

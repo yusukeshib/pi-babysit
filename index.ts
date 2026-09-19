@@ -43,7 +43,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2346,8 +2346,73 @@ function renderWidgetSessionHeader(
 }
 
 // How many trailing output lines to show per running session in the widget.
-const WIDGET_TAIL_LINES = 1;
+const WIDGET_COLLAPSED_TAIL_LINES = 1;
+const WIDGET_EXPANDED_TAIL_LINES = 20;
 const WIDGET_TAIL_WIDTH = 100;
+
+export interface WidgetSessionDisplay {
+	id: string;
+	header: string;
+	tail: string[];
+	expandable: boolean;
+}
+
+interface WidgetMouseEvent {
+	type: string;
+	button: string;
+	y: number;
+}
+
+/**
+ * Build the live widget as a mouse-aware component without depending on newer
+ * pi-tui mouse classes. Older hosts still render it normally; fullscreen hosts
+ * dispatch component-local click coordinates to handleMouse.
+ */
+export function createWidgetComponent(
+	summaryLines: string[],
+	sessions: WidgetSessionDisplay[],
+	expandedProcessIds: Set<string>,
+) {
+	let processIdByLine: Array<string | undefined> = [];
+
+	return {
+		render(width: number): string[] {
+			const lines: string[] = [];
+			processIdByLine = [];
+			const push = (text: string, processId?: string) => {
+				lines.push(truncateToWidth(text, Math.max(0, width), ""));
+				processIdByLine.push(processId);
+			};
+
+			for (const line of summaryLines) push(line);
+			for (const session of sessions) {
+				const expanded = session.expandable && expandedProcessIds.has(session.id);
+				const tail = session.tail.slice(
+					expanded ? -WIDGET_EXPANDED_TAIL_LINES : -WIDGET_COLLAPSED_TAIL_LINES,
+				);
+				const processId = session.expandable ? session.id : undefined;
+				if (!expanded && tail.length === 1) {
+					push(`${session.header} ${tail[0]}`, processId);
+				} else {
+					push(session.header, processId);
+					for (const line of tail) push(`      ${line}`, processId);
+				}
+			}
+			return lines;
+		},
+		handleMouse(event: WidgetMouseEvent) {
+			if (event.type !== "click" || event.button !== "left") return undefined;
+			const id = processIdByLine[event.y];
+			if (!id) return undefined;
+			if (expandedProcessIds.has(id)) expandedProcessIds.delete(id);
+			else expandedProcessIds.add(id);
+			return { handled: true, render: true };
+		},
+		invalidate() {
+			processIdByLine = [];
+		},
+	};
+}
 
 // Strip ANSI/control escapes and clamp width so raw PTY output can't wrap or
 // corrupt the widget area.
@@ -2396,10 +2461,11 @@ async function widgetTail(
 	id: string,
 	isSub: boolean,
 	subagentProgress?: Progress,
+	lines = WIDGET_COLLAPSED_TAIL_LINES,
 ): Promise<string[]> {
 	let raw: string[];
 	if (!isSub) {
-		raw = readTailLines(logPath(id), WIDGET_TAIL_LINES);
+		raw = readTailLines(logPath(id), lines);
 	} else {
 		const progress = subagentProgress ?? taskProgressOf(id).progress;
 		if (progress.finalText.trim()) {
@@ -2413,7 +2479,7 @@ async function widgetTail(
 	return raw
 		.map(sanitizeTailLine)
 		.filter((line) => line.trim().length > 0)
-		.slice(-WIDGET_TAIL_LINES);
+		.slice(-lines);
 }
 
 // ---------------------------------------------------------------------------
@@ -3299,6 +3365,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	const expandedWidgetProcesses = new Set<string>();
+
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
 		const active = (snapshot ?? (await listSessions()).sessions).filter(
@@ -3315,8 +3383,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const idle = subs.filter((session) => progressById.get(session.id)?.done).length;
+		const activeProcessIds = new Set(
+			active.filter((session) => kindOf(session.id) !== "subagent").map((session) => session.id),
+		);
+		for (const id of expandedWidgetProcesses) {
+			if (!activeProcessIds.has(id)) expandedWidgetProcesses.delete(id);
+		}
+
 		const theme = ctx.ui.theme;
-		const lines = renderWidgetLines(procs, subs.length - idle, idle, theme);
+		const summaryLines = renderWidgetLines(procs, subs.length - idle, idle, theme);
 		const tails = await Promise.all(
 			active.map((session) => {
 				const isSubagent = kindOf(session.id) === "subagent";
@@ -3324,30 +3399,41 @@ export default function (pi: ExtensionAPI) {
 					session.id,
 					isSubagent,
 					isSubagent ? progressById.get(session.id) : undefined,
+					isSubagent ? WIDGET_COLLAPSED_TAIL_LINES : WIDGET_EXPANDED_TAIL_LINES,
 				);
 			}),
 		);
-		active.forEach((session, index) => {
+		const displays = active.map((session, index): WidgetSessionDisplay => {
 			const isSubagent = kindOf(session.id) === "subagent";
 			const state: WidgetSessionState = isSubagent && progressById.get(session.id)?.done
 				? "idle"
 				: "running";
-			const elapsed = elapsedOf(session.id);
-			const header = renderWidgetSessionHeader(
-				session.id,
-				isSubagent ? "agent" : "process",
-				state,
-				elapsed,
-				theme,
-			);
-			if (tails[index].length === 1) {
-				lines.push(`${header} ${tails[index][0]}`);
-			} else {
-				lines.push(header);
-				for (const tail of tails[index]) lines.push(`      ${tail}`);
-			}
+			return {
+				id: session.id,
+				header: renderWidgetSessionHeader(
+					session.id,
+					isSubagent ? "agent" : "process",
+					state,
+					elapsedOf(session.id),
+					theme,
+				),
+				tail: tails[index],
+				expandable: !isSubagent,
+			};
 		});
-		ctx.ui.setWidget("pi-babysit", lines, { placement: "belowEditor" });
+
+		if (ctx.mode === "tui") {
+			ctx.ui.setWidget(
+				"pi-babysit",
+				() => createWidgetComponent(summaryLines, displays, expandedWidgetProcesses),
+				{ placement: "belowEditor" },
+			);
+		} else {
+			const component = createWidgetComponent(summaryLines, displays, new Set());
+			ctx.ui.setWidget("pi-babysit", component.render(10_000), {
+				placement: "belowEditor",
+			});
+		}
 	};
 
 	type DisplayStatus = "started" | "running" | "idle" | "success" | "failed" | "terminated";
