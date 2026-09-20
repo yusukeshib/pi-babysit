@@ -163,14 +163,15 @@ test("process widget toggles the latest 20 log lines by click and keeps live sta
 	expect(component.handleMouse({ type: "press", button: "right", y: 1 })).toBeUndefined();
 	expect(expanded.size).toBe(0);
 
-	// Pi needs the press to be handled before it will route release and synthesize click.
+	// Toggle immediately on press, then consume Pi's synthesized click without
+	// toggling a second time.
 	expect(component.handleMouse({ type: "press", button: "left", y: 1 })).toEqual({
 		handled: true,
-		render: false,
+		render: true,
 	});
 	expect(component.handleMouse({ type: "click", button: "left", y: 1 })).toEqual({
 		handled: true,
-		render: true,
+		render: false,
 	});
 	const expandedLines = component.render(80);
 	expect(expandedLines).toHaveLength(23);
@@ -188,7 +189,7 @@ test("process widget toggles the latest 20 log lines by click and keeps live sta
 	expect(refreshed.render(80)).toContain("      line-26");
 
 	// Any line belonging to an expanded process can collapse it.
-	expect(refreshed.handleMouse({ type: "click", button: "left", y: 5 })).toEqual({
+	expect(refreshed.handleMouse({ type: "press", button: "left", y: 5 })).toEqual({
 		handled: true,
 		render: true,
 	});
@@ -207,11 +208,11 @@ test("agent widget toggles the latest 20 parsed progress lines by click", () => 
 	expect(component.render(80)).toEqual(["RUNNING", "review AGENT progress-25"]);
 	expect(component.handleMouse({ type: "press", button: "left", y: 1 })).toEqual({
 		handled: true,
-		render: false,
+		render: true,
 	});
 	expect(component.handleMouse({ type: "click", button: "left", y: 1 })).toEqual({
 		handled: true,
-		render: true,
+		render: false,
 	});
 	expect(component.render(80)).toEqual([
 		"RUNNING",
@@ -234,7 +235,7 @@ test("process widget tracks expansion independently by process id", () => {
 		expanded,
 	);
 	component.render(80);
-	component.handleMouse({ type: "click", button: "left", y: 1 });
+	component.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(expanded).toEqual(new Set(["one"]));
 	expect(component.render(80)).toEqual([
 		"RUNNING",
@@ -242,6 +243,40 @@ test("process widget tracks expansion independently by process id", () => {
 		"      one-a",
 		"      one-b",
 		"two two-b",
+	]);
+});
+
+test("process widget toggles the second process independently", () => {
+	const expanded = new Set<string>();
+	const component = createWidgetComponent(
+		["RUNNING 2 processes"],
+		[
+			{ id: "one", header: "one PROCESS", tail: ["one-a", "one-b"], expandable: true },
+			{ id: "two", header: "two PROCESS", tail: ["two-a", "two-b"], expandable: true },
+		],
+		expanded,
+	);
+
+	expect(component.render(80)).toEqual([
+		"RUNNING 2 processes",
+		"one PROCESS one-b",
+		"two PROCESS two-b",
+	]);
+	component.handleMouse({ type: "press", button: "left", y: 2 });
+	expect(expanded).toEqual(new Set(["two"]));
+	expect(component.render(80)).toEqual([
+		"RUNNING 2 processes",
+		"one PROCESS one-b",
+		"two PROCESS",
+		"      two-a",
+		"      two-b",
+	]);
+	component.handleMouse({ type: "press", button: "left", y: 4 });
+	expect(expanded.size).toBe(0);
+	expect(component.render(80)).toEqual([
+		"RUNNING 2 processes",
+		"one PROCESS one-b",
+		"two PROCESS two-b",
 	]);
 });
 

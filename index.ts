@@ -2404,13 +2404,17 @@ export function createWidgetComponent(
 			if (event.button !== "left") return undefined;
 			const id = sessionIdByLine[event.y];
 			if (!id) return undefined;
-			// Fullscreen Pi only synthesizes a click after a component handles the
-			// initial press, so claim it without rendering before toggling on click.
-			if (event.type === "press") return { handled: true, render: false };
-			if (event.type !== "click") return undefined;
-			if (expandedSessionIds.has(id)) expandedSessionIds.delete(id);
-			else expandedSessionIds.add(id);
-			return { handled: true, render: true };
+			// Toggle on press so the row works even when a terminal or multiplexer
+			// does not deliver the release needed for Pi to synthesize a click.
+			if (event.type === "press") {
+				if (expandedSessionIds.has(id)) expandedSessionIds.delete(id);
+				else expandedSessionIds.add(id);
+				return { handled: true, render: true };
+			}
+			// Pi may synthesize a click after the handled press; consume it without
+			// toggling a second time.
+			if (event.type === "click") return { handled: true, render: false };
+			return undefined;
 		},
 		invalidate() {
 			sessionIdByLine = [];
