@@ -160,9 +160,14 @@ test("process widget toggles the latest 20 log lines by click and keeps live sta
 		"agent AGENT thinking",
 	]);
 	expect(component.handleMouse({ type: "click", button: "left", y: 0 })).toBeUndefined();
-	expect(component.handleMouse({ type: "click", button: "right", y: 1 })).toBeUndefined();
+	expect(component.handleMouse({ type: "press", button: "right", y: 1 })).toBeUndefined();
 	expect(expanded.size).toBe(0);
 
+	// Pi needs the press to be handled before it will route release and synthesize click.
+	expect(component.handleMouse({ type: "press", button: "left", y: 1 })).toEqual({
+		handled: true,
+		render: false,
+	});
 	expect(component.handleMouse({ type: "click", button: "left", y: 1 })).toEqual({
 		handled: true,
 		render: true,
@@ -188,6 +193,34 @@ test("process widget toggles the latest 20 log lines by click and keeps live sta
 		render: true,
 	});
 	expect(refreshed.render(80)).toEqual(["RUNNING", "build PROCESS line-26"]);
+});
+
+test("agent widget toggles the latest 20 parsed progress lines by click", () => {
+	const expanded = new Set<string>();
+	const tail = Array.from({ length: 25 }, (_, i) => `progress-${i + 1}`);
+	const component = createWidgetComponent(
+		["RUNNING"],
+		[{ id: "review", header: "review AGENT", tail, expandable: true }],
+		expanded,
+	);
+
+	expect(component.render(80)).toEqual(["RUNNING", "review AGENT progress-25"]);
+	expect(component.handleMouse({ type: "press", button: "left", y: 1 })).toEqual({
+		handled: true,
+		render: false,
+	});
+	expect(component.handleMouse({ type: "click", button: "left", y: 1 })).toEqual({
+		handled: true,
+		render: true,
+	});
+	expect(component.render(80)).toEqual([
+		"RUNNING",
+		"review AGENT",
+		...Array.from({ length: 20 }, (_, i) => `      progress-${i + 6}`),
+	]);
+	component.handleMouse({ type: "press", button: "left", y: 10 });
+	component.handleMouse({ type: "click", button: "left", y: 10 });
+	expect(component.render(80)).toEqual(["RUNNING", "review AGENT progress-25"]);
 });
 
 test("process widget tracks expansion independently by process id", () => {

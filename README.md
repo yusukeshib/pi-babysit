@@ -80,8 +80,10 @@ backgrounding (`… &`, `nohup`, `setsid`, `disown`). Set
 
 A widget below the editor separates session **kind** from task **state** at a glance:
 summary counts use `RUNNING` / `IDLE`, and every row is labeled
-`PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`. The displayed `age`
-is total session age, not time spent in the current state. Transcript details
+`PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`. In fullscreen mode, click
+any process or agent row to toggle between its latest line and latest 20 buffer
+lines. The displayed `age` is total session age, not time spent in the current
+state. Transcript details
 from tool results, snapshots, and completion notifications collapse or expand
 with Pi's tool-output toggle (`Ctrl+O` by default).
 

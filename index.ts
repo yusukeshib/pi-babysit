@@ -2371,45 +2371,49 @@ interface WidgetMouseEvent {
 export function createWidgetComponent(
 	summaryLines: string[],
 	sessions: WidgetSessionDisplay[],
-	expandedProcessIds: Set<string>,
+	expandedSessionIds: Set<string>,
 ) {
-	let processIdByLine: Array<string | undefined> = [];
+	let sessionIdByLine: Array<string | undefined> = [];
 
 	return {
 		render(width: number): string[] {
 			const lines: string[] = [];
-			processIdByLine = [];
-			const push = (text: string, processId?: string) => {
+			sessionIdByLine = [];
+			const push = (text: string, sessionId?: string) => {
 				lines.push(truncateToWidth(text, Math.max(0, width), ""));
-				processIdByLine.push(processId);
+				sessionIdByLine.push(sessionId);
 			};
 
 			for (const line of summaryLines) push(line);
 			for (const session of sessions) {
-				const expanded = session.expandable && expandedProcessIds.has(session.id);
+				const expanded = session.expandable && expandedSessionIds.has(session.id);
 				const tail = session.tail.slice(
 					expanded ? -WIDGET_EXPANDED_TAIL_LINES : -WIDGET_COLLAPSED_TAIL_LINES,
 				);
-				const processId = session.expandable ? session.id : undefined;
+				const sessionId = session.expandable ? session.id : undefined;
 				if (!expanded && tail.length === 1) {
-					push(`${session.header} ${tail[0]}`, processId);
+					push(`${session.header} ${tail[0]}`, sessionId);
 				} else {
-					push(session.header, processId);
-					for (const line of tail) push(`      ${line}`, processId);
+					push(session.header, sessionId);
+					for (const line of tail) push(`      ${line}`, sessionId);
 				}
 			}
 			return lines;
 		},
 		handleMouse(event: WidgetMouseEvent) {
-			if (event.type !== "click" || event.button !== "left") return undefined;
-			const id = processIdByLine[event.y];
+			if (event.button !== "left") return undefined;
+			const id = sessionIdByLine[event.y];
 			if (!id) return undefined;
-			if (expandedProcessIds.has(id)) expandedProcessIds.delete(id);
-			else expandedProcessIds.add(id);
+			// Fullscreen Pi only synthesizes a click after a component handles the
+			// initial press, so claim it without rendering before toggling on click.
+			if (event.type === "press") return { handled: true, render: false };
+			if (event.type !== "click") return undefined;
+			if (expandedSessionIds.has(id)) expandedSessionIds.delete(id);
+			else expandedSessionIds.add(id);
 			return { handled: true, render: true };
 		},
 		invalidate() {
-			processIdByLine = [];
+			sessionIdByLine = [];
 		},
 	};
 }
@@ -3365,7 +3369,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	const expandedWidgetProcesses = new Set<string>();
+	const expandedWidgetSessions = new Set<string>();
 
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
@@ -3383,11 +3387,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const idle = subs.filter((session) => progressById.get(session.id)?.done).length;
-		const activeProcessIds = new Set(
-			active.filter((session) => kindOf(session.id) !== "subagent").map((session) => session.id),
-		);
-		for (const id of expandedWidgetProcesses) {
-			if (!activeProcessIds.has(id)) expandedWidgetProcesses.delete(id);
+		const activeSessionIds = new Set(active.map((session) => session.id));
+		for (const id of expandedWidgetSessions) {
+			if (!activeSessionIds.has(id)) expandedWidgetSessions.delete(id);
 		}
 
 		const theme = ctx.ui.theme;
@@ -3399,7 +3401,7 @@ export default function (pi: ExtensionAPI) {
 					session.id,
 					isSubagent,
 					isSubagent ? progressById.get(session.id) : undefined,
-					isSubagent ? WIDGET_COLLAPSED_TAIL_LINES : WIDGET_EXPANDED_TAIL_LINES,
+					WIDGET_EXPANDED_TAIL_LINES,
 				);
 			}),
 		);
@@ -3418,14 +3420,14 @@ export default function (pi: ExtensionAPI) {
 					theme,
 				),
 				tail: tails[index],
-				expandable: !isSubagent,
+				expandable: true,
 			};
 		});
 
 		if (ctx.mode === "tui") {
 			ctx.ui.setWidget(
 				"pi-babysit",
-				() => createWidgetComponent(summaryLines, displays, expandedWidgetProcesses),
+				() => createWidgetComponent(summaryLines, displays, expandedWidgetSessions),
 				{ placement: "belowEditor" },
 			);
 		} else {
