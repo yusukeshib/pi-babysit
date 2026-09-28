@@ -2287,14 +2287,23 @@ async function spawnSubagent(
 }
 
 // ---------------------------------------------------------------------------
-// widget (live counts)
+// widget (live counts and browsable finished sessions)
 // ---------------------------------------------------------------------------
+
+export function widgetSessionGroups(sessions: BsSession[], startedAt: (id: string) => number) {
+	const active = sessions.filter((session) => session.state === "running");
+	// Default view stays compact; the finished section pages over every retained session.
+	const finished = sessions.filter((session) => session.state !== "running");
+	const started = new Map(finished.map((session) => [session.id, startedAt(session.id)]));
+	finished.sort((a, b) => (started.get(b.id) ?? 0) - (started.get(a.id) ?? 0) || b.id.localeCompare(a.id));
+	return { active, finished };
+}
 
 // A subagent whose task is done stays alive as an idle RPC worker (for
 // follow-ups), so "running" in babysit does NOT mean "working" — count
 // processes / busy subagents / idle subagents separately.
 export type WidgetSessionKind = "process" | "agent";
-export type WidgetSessionState = "running" | "idle";
+export type WidgetSessionState = "running" | "idle" | "finished" | "failed";
 
 export function widgetSummaryText(procs: number, busy: number, idle: number): string {
 	const sections: string[] = [];
@@ -2312,7 +2321,7 @@ export function widgetSessionHeader(
 	state: WidgetSessionState,
 	elapsed?: string,
 ): string {
-	const icon = state === "running" ? "▶" : "○";
+	const icon = state === "running" ? "▶" : state === "failed" ? "✗" : "○";
 	return `  ${icon} ${id} ${kind.toUpperCase()} ${state.toUpperCase()}${elapsed ? ` age ${elapsed}` : ""}`;
 }
 
@@ -2338,17 +2347,23 @@ function renderWidgetSessionHeader(
 	elapsed: string,
 	theme: Theme,
 ): string {
-	const running = state === "running";
-	const icon = theme.fg(running ? "success" : "muted", running ? "▶" : "○");
+	const color = state === "running" ? "success" : state === "failed" ? "error" : "muted";
+	const icon = theme.fg(color, state === "running" ? "▶" : state === "failed" ? "✗" : "○");
 	const kindLabel = theme.fg(kind === "process" ? "accent" : "warning", theme.bold(kind.toUpperCase()));
-	const stateLabel = theme.fg(running ? "success" : "muted", theme.bold(state.toUpperCase()));
+	const stateLabel = theme.fg(color, theme.bold(state.toUpperCase()));
 	return `  ${icon} ${id} ${kindLabel} ${stateLabel}${elapsed ? theme.fg("dim", ` age ${elapsed}`) : ""}`;
 }
 
-// How many trailing output lines to show per running session in the widget.
+// How many trailing output lines to show per session in the widget.
 const WIDGET_COLLAPSED_TAIL_LINES = 1;
 const WIDGET_EXPANDED_TAIL_LINES = 20;
 const WIDGET_TAIL_WIDTH = 100;
+const WIDGET_FINISHED_PAGE_SIZE = 5;
+
+export interface WidgetFinishedState {
+	open: boolean;
+	page: number;
+}
 
 export interface WidgetSessionDisplay {
 	id: string;
@@ -2372,52 +2387,78 @@ export function createWidgetComponent(
 	summaryLines: string[],
 	sessions: WidgetSessionDisplay[],
 	expandedSessionIds: Set<string>,
+	finished?: { sessions: WidgetSessionDisplay[]; state: WidgetFinishedState },
 ) {
-	let sessionIdByLine: Array<string | undefined> = [];
+	type Target = { type: "session"; id: string } | { type: "finished" | "prev" | "next" };
+	let targetByLine: Array<Target | undefined> = [];
 
 	return {
 		render(width: number): string[] {
 			const lines: string[] = [];
-			sessionIdByLine = [];
-			const push = (text: string, sessionId?: string) => {
+			targetByLine = [];
+			const push = (text: string, target?: Target) => {
 				lines.push(truncateToWidth(text, Math.max(0, width), ""));
-				sessionIdByLine.push(sessionId);
+				targetByLine.push(target);
 			};
-
-			for (const line of summaryLines) push(line);
-			for (const session of sessions) {
+			const pushSession = (session: WidgetSessionDisplay) => {
 				const expanded = session.expandable && expandedSessionIds.has(session.id);
 				const tail = session.tail.slice(
 					expanded ? -WIDGET_EXPANDED_TAIL_LINES : -WIDGET_COLLAPSED_TAIL_LINES,
 				);
-				const sessionId = session.expandable ? session.id : undefined;
+				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
 				if (!expanded && tail.length === 1) {
-					push(`${session.header} ${tail[0]}`, sessionId);
+					push(`${session.header} ${tail[0]}`, target);
 				} else {
-					push(session.header, sessionId);
-					for (const line of tail) push(`      ${line}`, sessionId);
+					push(session.header, target);
+					for (const line of tail) push(`      ${line}`, target);
+					if (expanded && tail.length === 0) push("      (no output available)", target);
+				}
+			};
+
+			for (const line of summaryLines) push(line);
+			if (finished?.sessions.length) {
+				const pageCount = Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
+				finished.state.page = Math.min(Math.max(0, finished.state.page), pageCount - 1);
+				push(
+					` FINISHED ${finished.sessions.length} — ${finished.state.open ? "hide" : "browse"} (click)`,
+					{ type: "finished" },
+				);
+				if (finished.state.open) {
+					if (pageCount > 1) {
+						if (finished.state.page > 0) push("  ← Previous", { type: "prev" });
+						push(`  ${finished.state.page === pageCount - 1 ? "↻ First" : "Next →"} (${finished.state.page + 1}/${pageCount})`, { type: "next" });
+					}
+					const start = finished.state.page * WIDGET_FINISHED_PAGE_SIZE;
+					for (const session of finished.sessions.slice(start, start + WIDGET_FINISHED_PAGE_SIZE)) {
+						pushSession(session);
+					}
 				}
 			}
+			for (const session of sessions) pushSession(session);
 			return lines;
 		},
 		handleMouse(event: WidgetMouseEvent) {
 			if (event.button !== "left") return undefined;
-			const id = sessionIdByLine[event.y];
-			if (!id) return undefined;
-			// Toggle on press so the row works even when a terminal or multiplexer
-			// does not deliver the release needed for Pi to synthesize a click.
+			const target = targetByLine[event.y];
+			if (!target) return undefined;
+			// Toggle on press so a terminal that omits release still works.
 			if (event.type === "press") {
-				if (expandedSessionIds.has(id)) expandedSessionIds.delete(id);
-				else expandedSessionIds.add(id);
+				if (target.type === "session") {
+					if (expandedSessionIds.has(target.id)) expandedSessionIds.delete(target.id);
+					else expandedSessionIds.add(target.id);
+				} else if (finished) {
+					if (target.type === "finished") finished.state.open = !finished.state.open;
+					else if (target.type === "prev") finished.state.page--;
+					else finished.state.page = (finished.state.page + 1) % Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
+				}
 				return { handled: true, render: true };
 			}
-			// Pi may synthesize a click after the handled press; consume it without
-			// toggling a second time.
+			// Consume Pi's synthesized click without toggling a second time.
 			if (event.type === "click") return { handled: true, render: false };
 			return undefined;
 		},
 		invalidate() {
-			sessionIdByLine = [];
+			targetByLine = [];
 		},
 	};
 }
@@ -2462,21 +2503,23 @@ function readTailLines(file: string, lines: number, maxBytes = 64_000): string[]
 	}
 }
 
-// Trailing lines to show for a running session (sanitized, unprefixed).
+// Trailing lines to show for a session (sanitized, unprefixed).
 // Process tails are read directly from the bounded end of output.log, avoiding
-// one `babysit log` subprocess per active process on every poll.
-async function widgetTail(
+// one `babysit log` subprocess per visible process.
+export function widgetTail(
 	id: string,
 	isSub: boolean,
 	subagentProgress?: Progress,
 	lines = WIDGET_COLLAPSED_TAIL_LINES,
-): Promise<string[]> {
+): string[] {
 	let raw: string[];
 	if (!isSub) {
 		raw = readTailLines(logPath(id), lines);
 	} else {
 		const progress = subagentProgress ?? taskProgressOf(id).progress;
-		if (progress.finalText.trim()) {
+		if (progress.streamingText.trim()) {
+			raw = progress.streamingText.trim().split("\n");
+		} else if (progress.finalText.trim()) {
 			raw = progress.finalText.trim().split("\n");
 		} else if (progress.toolCalls.length > 0) {
 			raw = progress.toolCalls.map((tool) => tool.summary);
@@ -3374,12 +3417,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	const expandedWidgetSessions = new Set<string>();
+	const finishedWidgetState: WidgetFinishedState = { open: false, page: 0 };
 
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
-		const active = (snapshot ?? (await listSessions()).sessions).filter(
-			(session) => session.state === "running",
-		);
+		const all = snapshot ?? (await listSessions()).sessions;
+		const { active, finished } = widgetSessionGroups(all, (id) => readMeta(id)?.startedAt ?? 0);
 		const subs = active.filter((session) => kindOf(session.id) === "subagent");
 		const procs = active.length - subs.length;
 		const progressById = new Map<string, Progress>();
@@ -3391,9 +3434,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const idle = subs.filter((session) => progressById.get(session.id)?.done).length;
-		const activeSessionIds = new Set(active.map((session) => session.id));
+		const sessionIds = new Set(all.map((session) => session.id));
 		for (const id of expandedWidgetSessions) {
-			if (!activeSessionIds.has(id)) expandedWidgetSessions.delete(id);
+			if (!sessionIds.has(id)) expandedWidgetSessions.delete(id);
 		}
 
 		const theme = ctx.ui.theme;
@@ -3427,11 +3470,37 @@ export default function (pi: ExtensionAPI) {
 				expandable: true,
 			};
 		});
+		const finishedDisplays = finished.map((session): WidgetSessionDisplay => {
+			const isSubagent = kindOf(session.id) === "subagent";
+			const id = session.id;
+			return {
+				id,
+				header: renderWidgetSessionHeader(
+					id,
+					isSubagent ? "agent" : "process",
+					session.state === "exited" && session.exit_code === 0 ? "finished" : "failed",
+					"",
+					theme,
+				),
+				// Only read/parse the five visible finished sessions on demand.
+				get tail() {
+					try {
+						return widgetTail(id, isSubagent, undefined, WIDGET_EXPANDED_TAIL_LINES);
+					} catch {
+						return [];
+					}
+				},
+				expandable: true,
+			};
+		});
 
 		if (ctx.mode === "tui") {
 			ctx.ui.setWidget(
 				"pi-babysit",
-				() => createWidgetComponent(summaryLines, displays, expandedWidgetSessions),
+				() => createWidgetComponent(summaryLines, displays, expandedWidgetSessions, {
+					sessions: finishedDisplays,
+					state: finishedWidgetState,
+				}),
 				{ placement: "belowEditor" },
 			);
 		} else {

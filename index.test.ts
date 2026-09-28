@@ -60,7 +60,9 @@ import extension, {
 	transitionWaitReservation,
 	usageFromProgress,
 	validateKillResponse,
+	widgetSessionGroups,
 	widgetSessionHeader,
+	widgetTail,
 	widgetSummaryText,
 } from "./index.ts";
 
@@ -143,6 +145,37 @@ test("widget labels make session kind and state explicit without visual clutter"
 	expect(widgetSessionHeader("review", "agent", "idle")).toBe(
 		"  ○ review AGENT IDLE",
 	);
+	expect(widgetSessionHeader("done", "agent", "finished")).toBe(
+		"  ○ done AGENT FINISHED",
+	);
+	expect(widgetSessionHeader("crash", "process", "failed")).toBe(
+		"  ✗ crash PROCESS FAILED",
+	);
+});
+
+test("widget retains running and idle workers while sorting finished sessions newest first", () => {
+	const sessions = [
+		{ id: "success", state: "exited", exit_code: 0 },
+		{ id: "running", state: "running" },
+		{ id: "dead", state: "dead" },
+		{ id: "idle", state: "running" },
+		{ id: "failed", state: "exited", exit_code: 1 },
+	];
+	const { active, finished } = widgetSessionGroups(sessions, (id) =>
+		({ success: 10, dead: 30, failed: 20 } as Record<string, number>)[id] ?? 0
+	);
+	expect(active.map((s) => s.id)).toEqual(["running", "idle"]);
+	expect(finished.map((s) => s.id)).toEqual(["dead", "failed", "success"]);
+});
+
+test("agent widget uses live text before a prior final answer and falls back to empty", () => {
+	const progress = parseEvents([
+		JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "prior task" }] } }),
+		JSON.stringify({ type: "turn_start" }),
+		JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "current task" } }),
+	].join("\n"));
+	expect(widgetTail("agent", true, progress, 20)).toEqual(["current task"]);
+	expect(widgetTail("agent", true, parseEvents(""), 20)).toEqual([]);
 });
 
 test("process widget toggles the latest 20 log lines by click and keeps live state", () => {
@@ -277,6 +310,95 @@ test("process widget toggles the second process independently", () => {
 		"RUNNING 2 processes",
 		"one PROCESS one-b",
 		"two PROCESS two-b",
+	]);
+});
+
+test("finished widget remains compact and pages through every completed or failed session", () => {
+	const expanded = new Set<string>();
+	const state = { open: false, page: 0 };
+	const finished = Array.from({ length: 12 }, (_, i) => ({
+		id: `done-${i}`,
+		header: `done-${i} ${i % 2 ? "FAILED" : "FINISHED"}`,
+		tail: [`output-${i}`],
+		expandable: true,
+	}));
+	const make = (sessions = finished) => createWidgetComponent(
+		["RUNNING 1 process"],
+		[{ id: "live", header: "live PROCESS", tail: ["live output"], expandable: true }],
+		expanded,
+		{ sessions, state },
+	);
+	const widget = make();
+	expect(widget.render(80)).toEqual([
+		"RUNNING 1 process", " FINISHED 12 — browse (click)", "live PROCESS live output",
+	]);
+	widget.handleMouse({ type: "press", button: "left", y: 1 });
+	widget.handleMouse({ type: "click", button: "left", y: 1 });
+	expect(widget.render(80)).toEqual([
+		"RUNNING 1 process", " FINISHED 12 — hide (click)", "  Next → (1/3)",
+		...finished.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
+		"live PROCESS live output",
+	]);
+	widget.handleMouse({ type: "press", button: "left", y: 2 });
+	expect(widget.render(80)).toContain("done-5 FAILED output-5");
+	widget.handleMouse({ type: "press", button: "left", y: 4 });
+	expect(expanded).toEqual(new Set(["done-5"]));
+	expect(widget.render(80)).toContain("done-5 FAILED");
+	const refreshed = make();
+	expect(refreshed.render(80)).toContain("      output-5");
+	refreshed.handleMouse({ type: "press", button: "left", y: 3 });
+	expect(refreshed.render(80)).toContain("done-10 FINISHED output-10");
+	// Shrinking the retained list clamps the current page without losing live rows.
+	const shortened = make(finished.slice(0, 2));
+	expect(shortened.render(80)).toContain("done-0 FINISHED output-0");
+	expect(state.page).toBe(0);
+});
+
+test("widget keeps a session expandable as it moves from running to finished", () => {
+	const expanded = new Set<string>();
+	const state = { open: true, page: 0 };
+	const active = createWidgetComponent(
+		["RUNNING 1 process"],
+		[{ id: "build", header: "build PROCESS RUNNING", tail: ["building"], expandable: true }],
+		expanded,
+	);
+	expect(active.render(80)).toContain("build PROCESS RUNNING building");
+	active.handleMouse({ type: "press", button: "left", y: 1 });
+	expect(expanded.has("build")).toBe(true);
+	const { active: remaining, finished } = widgetSessionGroups(
+		[{ id: "build", state: "exited", exit_code: 0 }], () => 1,
+	);
+	expect(remaining).toHaveLength(0);
+	const completed = createWidgetComponent([], [], expanded, {
+		sessions: finished.map((session) => ({
+			id: session.id, header: "build PROCESS FINISHED", tail: ["built"], expandable: true,
+		})),
+		state,
+	});
+	expect(completed.render(80)).toEqual([
+		" FINISHED 1 — hide (click)", "build PROCESS FINISHED", "      built",
+	]);
+	completed.handleMouse({ type: "press", button: "left", y: 1 });
+	expect(completed.render(80)).toEqual([
+		" FINISHED 1 — hide (click)", "build PROCESS FINISHED built",
+	]);
+});
+
+test("empty agent and process rows visibly expand, including finished sessions without logs", () => {
+	const expanded = new Set<string>();
+	const widget = createWidgetComponent(
+		[],
+		[{ id: "idle", header: "idle AGENT IDLE", tail: [], expandable: true }],
+		expanded,
+		{ sessions: [{ id: "lost", header: "lost PROCESS FAILED", tail: [], expandable: true }], state: { open: true, page: 0 } },
+	);
+	expect(widget.render(80)).toEqual([" FINISHED 1 — hide (click)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
+	widget.handleMouse({ type: "press", button: "left", y: 2 });
+	expect(widget.render(80)).toContain("      (no output available)");
+	widget.handleMouse({ type: "press", button: "left", y: 1 });
+	expect(widget.render(80)).toEqual([
+		" FINISHED 1 — hide (click)", "lost PROCESS FAILED", "      (no output available)",
+		"idle AGENT IDLE", "      (no output available)",
 	]);
 });
 
