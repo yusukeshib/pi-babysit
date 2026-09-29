@@ -82,7 +82,7 @@ A widget below the editor separates session **kind** from task **state** at a gl
 summary counts use `RUNNING` / `IDLE`, and every row is labeled
 `PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`. In fullscreen mode, the
 `SESSIONS(n) < 1/4 >` list combines running, idle, finished, and failed sessions
-(newest first, five per page); the fraction shows the current/total page. Click the arrows to page or the count to collapse
+(newest first, five per page); the fraction shows the current/total page. Click the arrows to page or anywhere else on the header to collapse
 and expand the list. Click a row to toggle between its latest line and latest 20
 available output lines. A session with no available output shows an explicit
 placeholder when expanded. Mouse clicks require fullscreen mode; `/babysit`

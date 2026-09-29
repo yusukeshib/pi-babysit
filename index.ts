@@ -1229,16 +1229,18 @@ async function selectedProcessOutput(
 	return tail ? `\n\nSelected tail (${lines} lines max):\n${clip(tail, maxBytes)}` : "";
 }
 
+function escapeCommandForDisplay(command: string): string {
+	return command
+		.replace(/\r/g, "\\r")
+		.replace(/\n/g, "\\n")
+		.replace(/\t/g, "\\t")
+		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, (char) =>
+			`\\x${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+		);
+}
+
 export function summarizeNotificationCommand(command: string | undefined): string {
-	const preview =
-		(command ?? "?")
-			.trim()
-			.replace(/\r/g, "\\r")
-			.replace(/\n/g, "\\n")
-			.replace(/\t/g, "\\t")
-			.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, (char) =>
-				`\\x${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
-			) || "?";
+	const preview = escapeCommandForDisplay((command ?? "?").trim()) || "?";
 	const bytes = Buffer.from(preview, "utf8");
 	if (bytes.length <= NOTIFY_COMMAND_MAX_BYTES) return preview;
 	if (NOTIFY_COMMAND_MAX_BYTES === 0) return "";
@@ -2390,7 +2392,7 @@ export function createWidgetComponent(
 	expandedSessionIds: Set<string>,
 	listState?: WidgetSessionListState,
 ) {
-	type Target = { type: "session"; id: string } | { type: "sessions"; startX: number; endX: number; prevX?: number; nextX?: number };
+	type Target = { type: "session"; id: string } | { type: "sessions"; endX: number; prevX?: number; nextX?: number };
 	let targetByLine: Array<Target | undefined> = [];
 
 	return {
@@ -2426,15 +2428,16 @@ export function createWidgetComponent(
 				const suffix = `${label}${showArrows ? ` < ${listState.page + 1}/${pageCount} >` : ""}`;
 				// Keep the count clickable on narrow terminals by moving it to its own row.
 				const inline = summary !== undefined && visibleWidth(summary) + visibleWidth(suffix) <= width;
-				if (summary !== undefined && !inline) push(summary);
+				if (summary !== undefined && !inline) {
+					push(summary, { type: "sessions", endX: Math.min(visibleWidth(summary), Math.max(0, width)) });
+				}
 				const prefix = inline ? summary ?? "" : "";
-				const startX = visibleWidth(prefix);
+				const prefixWidth = visibleWidth(prefix);
 				push(`${prefix}${suffix}`, {
 					type: "sessions",
-					startX,
-					endX: Math.min(startX + visibleWidth(suffix), Math.max(0, width)),
-					prevX: showArrows ? startX + suffix.indexOf("<") : undefined,
-					nextX: showArrows ? startX + suffix.indexOf(">") : undefined,
+					endX: Math.min(prefixWidth + visibleWidth(suffix), Math.max(0, width)),
+					prevX: showArrows ? prefixWidth + suffix.indexOf("<") : undefined,
+					nextX: showArrows ? prefixWidth + suffix.indexOf(">") : undefined,
 				});
 				if (listState.open) {
 					const start = listState.page * WIDGET_SESSION_PAGE_SIZE;
@@ -2452,7 +2455,7 @@ export function createWidgetComponent(
 			if (event.button !== "left") return undefined;
 			const target = targetByLine[event.y];
 			if (!target) return undefined;
-			if (target.type === "sessions" && (event.x === undefined || event.x < target.startX || event.x >= target.endX)) return undefined;
+			if (target.type === "sessions" && (event.x === undefined || event.x < 0 || event.x >= target.endX)) return undefined;
 			// Toggle on press so a terminal that omits release still works.
 			if (event.type === "press") {
 				if (target.type === "session") {
@@ -4229,7 +4232,7 @@ export default function (pi: ExtensionAPI) {
 			const title = theme.bold(`babysit_run ${kind}`);
 			const detail =
 				typeof payload === "string" && payload.length > 0
-					? `  ${summarizeNotificationCommand(payload)}`
+					? `  ${escapeCommandForDisplay(payload)}`
 					: "";
 			return new Text(theme.fg("warning", `${title}${agent}${detail}`), 0, 0);
 		},

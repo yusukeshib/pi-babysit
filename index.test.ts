@@ -334,7 +334,11 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 		header,
 		...sessions.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
 	]);
-	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 })).toBeUndefined();
+	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 })).toEqual({ handled: true, render: true });
+	expect(widget.render(80)).toEqual(["RUNNING 1 process SESSIONS(13)"]);
+	widget.handleMouse({ type: "click", button: "left", y: 0, x: 2 });
+	widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 });
+	expect(widget.render(80)[0]).toBe(header);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
 	expect(widget.render(80)[0]).toBe("RUNNING 1 process SESSIONS(13) < 2/3 >");
 	expect(widget.render(80)).toContain("done-4 FINISHED output-4");
@@ -374,11 +378,18 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 	const widget = createWidgetComponent([summary], sessions, new Set(), state);
 	const header = "RUNNING 1 process SESSIONS(6) < 1/2 >";
 	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < 1/2 >`);
-	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 })).toBeUndefined();
+	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 })).toEqual({ handled: true, render: true });
+	expect(widget.render(80)).toEqual([`${summary} SESSIONS(6)`]);
+	widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
+	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < 1/2 >`);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
 	expect(widget.render(80)).toContain("job-5 output");
 	const narrow = createWidgetComponent([summary], sessions, new Set(), state);
 	expect(narrow.render(22).slice(0, 2)).toEqual([summary, " SESSIONS(6) < 2/2 >"]);
+	narrow.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
+	expect(narrow.render(22).slice(0, 2)).toEqual([summary, " SESSIONS(6)"]);
+	narrow.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
+	narrow.render(22);
 	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " SESSIONS(6) < 2/2 >".indexOf(">") });
 	expect(narrow.render(22)).toContain("job-0 output");
 	const many = createWidgetComponent([], Array.from({ length: 51 }, (_, i) => ({
@@ -540,6 +551,8 @@ test("babysit_run renders a status label for quick and background results", () =
 		{ command: `printf 'first\n\x1b[31msecond'${"x".repeat(300)}` },
 		theme,
 	).render(500).join("\n");
+	const longCommand = `  echo begin\n${"x".repeat(4096)}; printf 'END_MARKER'  `;
+	const longCall = tool.renderCall({ command: longCommand }, theme).render(10_000).join("\n");
 	expect(commandCall).toContain("<warning>babysit_run COMMAND  bun test</warning>");
 	expect(agentCall).toContain(
 		"<warning>babysit_run AGENT [reviewer]  Review the diff</warning>",
@@ -547,7 +560,10 @@ test("babysit_run renders a status label for quick and background results", () =
 	expect(incompleteCall).toContain("<warning>babysit_run COMMAND</warning>");
 	expect(unsafeCall).toContain("first\\n\\x1B[31msecond");
 	expect(unsafeCall).not.toContain("\x1b");
-	expect(unsafeCall).toContain("…");
+	expect(unsafeCall).toContain(`second'${"x".repeat(300)}`);
+	expect(unsafeCall).not.toContain("…");
+	expect(longCall).toContain(`  echo begin\\n${"x".repeat(4096)}; printf 'END_MARKER'  </warning>`);
+	expect(longCall).not.toContain("…");
 	expect(render("success")).toContain("<success>SUCCESS</success>");
 	expect(render("success")).not.toContain("babysit_run SUCCESS");
 	expect(render("started")).toContain("<accent>STARTED</accent>");
