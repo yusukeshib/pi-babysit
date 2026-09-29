@@ -329,19 +329,21 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 	];
 	const make = (rows = sessions) => createWidgetComponent(["RUNNING 1 process"], rows, expanded, state);
 	const widget = make();
-	const header = "RUNNING 1 process SESSIONS(13) < >";
+	const header = "RUNNING 1 process SESSIONS(13) < 1/3 >";
 	expect(widget.render(80)).toEqual([
 		header,
 		...sessions.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
 	]);
 	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 })).toBeUndefined();
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
+	expect(widget.render(80)[0]).toBe("RUNNING 1 process SESSIONS(13) < 2/3 >");
 	expect(widget.render(80)).toContain("done-4 FINISHED output-4");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(expanded).toEqual(new Set(["done-4"]));
 	const refreshed = make();
 	expect(refreshed.render(80)).toContain("      output-4");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
+	expect(refreshed.render(80)[0]).toBe("RUNNING 1 process SESSIONS(13) < 3/3 >");
 	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
 	expect(refreshed.render(80)).toContain("done-4 FINISHED");
@@ -370,15 +372,23 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 	}));
 	const state = { open: true, page: 0 };
 	const widget = createWidgetComponent([summary], sessions, new Set(), state);
-	const header = "RUNNING 1 process SESSIONS(6) < >";
-	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < >`);
+	const header = "RUNNING 1 process SESSIONS(6) < 1/2 >";
+	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < 1/2 >`);
 	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 })).toBeUndefined();
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
 	expect(widget.render(80)).toContain("job-5 output");
 	const narrow = createWidgetComponent([summary], sessions, new Set(), state);
-	expect(narrow.render(19).slice(0, 2)).toEqual([summary, " SESSIONS(6) < >"]);
-	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " SESSIONS(6) < >".indexOf(">") });
-	expect(narrow.render(19)).toContain("job-0 output");
+	expect(narrow.render(22).slice(0, 2)).toEqual([summary, " SESSIONS(6) < 2/2 >"]);
+	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " SESSIONS(6) < 2/2 >".indexOf(">") });
+	expect(narrow.render(22)).toContain("job-0 output");
+	const many = createWidgetComponent([], Array.from({ length: 51 }, (_, i) => ({
+		id: `many-${i}`, header: `many-${i}`, tail: [], expandable: true,
+	})), new Set(), { open: true, page: 8 });
+	expect(many.render(80)[0]).toBe(" SESSIONS(51) < 9/11 >");
+	many.handleMouse({ type: "press", button: "left", y: 0, x: many.render(80)[0].indexOf(">") });
+	expect(many.render(80)[0]).toBe(" SESSIONS(51) < 10/11 >");
+	many.handleMouse({ type: "press", button: "left", y: 0, x: many.render(80)[0].indexOf(">") });
+	expect(many.render(80)[0]).toBe(" SESSIONS(51) < 11/11 >");
 	const empty = createWidgetComponent([summary], [], new Set(), { open: true, page: 0 });
 	expect(empty.render(80)).toEqual([summary]);
 });

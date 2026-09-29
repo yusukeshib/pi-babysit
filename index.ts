@@ -2423,7 +2423,7 @@ export function createWidgetComponent(
 				listState.page = Math.min(Math.max(0, listState.page), pageCount - 1);
 				const label = ` SESSIONS(${sessions.length})`;
 				const showArrows = listState.open && pageCount > 1;
-				const suffix = `${label}${showArrows ? " < >" : ""}`;
+				const suffix = `${label}${showArrows ? ` < ${listState.page + 1}/${pageCount} >` : ""}`;
 				// Keep the count clickable on narrow terminals by moving it to its own row.
 				const inline = summary !== undefined && visibleWidth(summary) + visibleWidth(suffix) <= width;
 				if (summary !== undefined && !inline) push(summary);
@@ -2433,8 +2433,8 @@ export function createWidgetComponent(
 					type: "sessions",
 					startX,
 					endX: Math.min(startX + visibleWidth(suffix), Math.max(0, width)),
-					prevX: showArrows ? startX + label.length + 1 : undefined,
-					nextX: showArrows ? startX + label.length + 3 : undefined,
+					prevX: showArrows ? startX + suffix.indexOf("<") : undefined,
+					nextX: showArrows ? startX + suffix.indexOf(">") : undefined,
 				});
 				if (listState.open) {
 					const start = listState.page * WIDGET_SESSION_PAGE_SIZE;

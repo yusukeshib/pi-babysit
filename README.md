@@ -81,8 +81,8 @@ backgrounding (`… &`, `nohup`, `setsid`, `disown`). Set
 A widget below the editor separates session **kind** from task **state** at a glance:
 summary counts use `RUNNING` / `IDLE`, and every row is labeled
 `PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`. In fullscreen mode, the
-`SESSIONS(n) < >` list combines running, idle, finished, and failed sessions
-(newest first, five per page); click the arrows to page or the count to collapse
+`SESSIONS(n) < 1/4 >` list combines running, idle, finished, and failed sessions
+(newest first, five per page); the fraction shows the current/total page. Click the arrows to page or the count to collapse
 and expand the list. Click a row to toggle between its latest line and latest 20
 available output lines. A session with no available output shows an explicit
 placeholder when expanded. Mouse clicks require fullscreen mode; `/babysit`
