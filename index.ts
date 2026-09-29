@@ -43,7 +43,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2287,16 +2287,16 @@ async function spawnSubagent(
 }
 
 // ---------------------------------------------------------------------------
-// widget (live counts and browsable finished sessions)
+// widget (live counts and browsable sessions)
 // ---------------------------------------------------------------------------
 
 export function widgetSessionGroups(sessions: BsSession[], startedAt: (id: string) => number) {
 	const active = sessions.filter((session) => session.state === "running");
-	// Default view stays compact; the finished section pages over every retained session.
-	const finished = sessions.filter((session) => session.state !== "running");
-	const started = new Map(finished.map((session) => [session.id, startedAt(session.id)]));
-	finished.sort((a, b) => (started.get(b.id) ?? 0) - (started.get(a.id) ?? 0) || b.id.localeCompare(a.id));
-	return { active, finished };
+	const started = new Map(sessions.map((session) => [session.id, startedAt(session.id)]));
+	const newestFirst = (a: BsSession, b: BsSession) =>
+		(started.get(b.id) ?? 0) - (started.get(a.id) ?? 0) || b.id.localeCompare(a.id);
+	const finished = sessions.filter((session) => session.state !== "running").sort(newestFirst);
+	return { active, finished, all: [...sessions].sort(newestFirst) };
 }
 
 // A subagent whose task is done stays alive as an idle RPC worker (for
@@ -2358,9 +2358,9 @@ function renderWidgetSessionHeader(
 const WIDGET_COLLAPSED_TAIL_LINES = 1;
 const WIDGET_EXPANDED_TAIL_LINES = 20;
 const WIDGET_TAIL_WIDTH = 100;
-const WIDGET_FINISHED_PAGE_SIZE = 5;
+const WIDGET_SESSION_PAGE_SIZE = 5;
 
-export interface WidgetFinishedState {
+export interface WidgetSessionListState {
 	open: boolean;
 	page: number;
 }
@@ -2388,9 +2388,9 @@ export function createWidgetComponent(
 	summaryLines: string[],
 	sessions: WidgetSessionDisplay[],
 	expandedSessionIds: Set<string>,
-	finished?: { sessions: WidgetSessionDisplay[]; state: WidgetFinishedState },
+	listState?: WidgetSessionListState,
 ) {
-	type Target = { type: "session"; id: string } | { type: "finished"; prevX?: number; nextX?: number };
+	type Target = { type: "session"; id: string } | { type: "sessions"; startX: number; endX: number; prevX?: number; nextX?: number };
 	let targetByLine: Array<Target | undefined> = [];
 
 	return {
@@ -2416,43 +2416,56 @@ export function createWidgetComponent(
 				}
 			};
 
-			for (const line of summaryLines) push(line);
-			if (finished?.sessions.length) {
-				const pageCount = Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
-				finished.state.page = Math.min(Math.max(0, finished.state.page), pageCount - 1);
-				const label = ` FINISHED(${finished.sessions.length})`;
-				const showArrows = finished.state.open && pageCount > 1;
-				push(
-					`${label}${showArrows ? " < >" : ""}`,
-					{ type: "finished", prevX: showArrows ? label.length + 1 : undefined, nextX: showArrows ? label.length + 3 : undefined },
-				);
-				if (finished.state.open) {
-					const start = finished.state.page * WIDGET_FINISHED_PAGE_SIZE;
-					for (const session of finished.sessions.slice(start, start + WIDGET_FINISHED_PAGE_SIZE)) {
+			for (const line of summaryLines.slice(0, -1)) push(line);
+			const summary = summaryLines.at(-1);
+			if (listState && sessions.length) {
+				const pageCount = Math.ceil(sessions.length / WIDGET_SESSION_PAGE_SIZE);
+				listState.page = Math.min(Math.max(0, listState.page), pageCount - 1);
+				const label = ` SESSIONS(${sessions.length})`;
+				const showArrows = listState.open && pageCount > 1;
+				const suffix = `${label}${showArrows ? " < >" : ""}`;
+				// Keep the count clickable on narrow terminals by moving it to its own row.
+				const inline = summary !== undefined && visibleWidth(summary) + visibleWidth(suffix) <= width;
+				if (summary !== undefined && !inline) push(summary);
+				const prefix = inline ? summary ?? "" : "";
+				const startX = visibleWidth(prefix);
+				push(`${prefix}${suffix}`, {
+					type: "sessions",
+					startX,
+					endX: Math.min(startX + visibleWidth(suffix), Math.max(0, width)),
+					prevX: showArrows ? startX + label.length + 1 : undefined,
+					nextX: showArrows ? startX + label.length + 3 : undefined,
+				});
+				if (listState.open) {
+					const start = listState.page * WIDGET_SESSION_PAGE_SIZE;
+					for (const session of sessions.slice(start, start + WIDGET_SESSION_PAGE_SIZE)) {
 						pushSession(session);
 					}
 				}
+			} else {
+				if (summary !== undefined) push(summary);
+				for (const session of sessions) pushSession(session);
 			}
-			for (const session of sessions) pushSession(session);
 			return lines;
 		},
 		handleMouse(event: WidgetMouseEvent) {
 			if (event.button !== "left") return undefined;
 			const target = targetByLine[event.y];
 			if (!target) return undefined;
+			if (target.type === "sessions" && (event.x === undefined || event.x < target.startX || event.x >= target.endX)) return undefined;
 			// Toggle on press so a terminal that omits release still works.
 			if (event.type === "press") {
 				if (target.type === "session") {
 					if (expandedSessionIds.has(target.id)) expandedSessionIds.delete(target.id);
 					else expandedSessionIds.add(target.id);
-				} else if (finished) {
-					const pageCount = Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
+				} else if (listState) {
+					const pageCount = Math.ceil(sessions.length / WIDGET_SESSION_PAGE_SIZE);
 					if (event.x === target.prevX && target.prevX !== undefined) {
-						finished.state.page = (finished.state.page - 1 + pageCount) % pageCount;
+						listState.page = (listState.page - 1 + pageCount) % pageCount;
 					} else if (event.x === target.nextX && target.nextX !== undefined) {
-						finished.state.page = (finished.state.page + 1) % pageCount;
+						listState.page = (listState.page + 1) % pageCount;
 					} else {
-						finished.state.open = !finished.state.open;
+						listState.open = !listState.open;
 					}
 				}
 				return { handled: true, render: true };
@@ -3421,12 +3434,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	const expandedWidgetSessions = new Set<string>();
-	const finishedWidgetState: WidgetFinishedState = { open: false, page: 0 };
+	const widgetListState: WidgetSessionListState = { open: true, page: 0 };
 
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
 		const all = snapshot ?? (await listSessions()).sessions;
-		const { active, finished } = widgetSessionGroups(all, (id) => readMeta(id)?.startedAt ?? 0);
+		const { active, all: ordered } = widgetSessionGroups(all, (id) => readMeta(id)?.startedAt ?? 0);
 		const subs = active.filter((session) => kindOf(session.id) === "subagent");
 		const procs = active.length - subs.length;
 		const progressById = new Map<string, Progress>();
@@ -3456,27 +3469,19 @@ export default function (pi: ExtensionAPI) {
 				);
 			}),
 		);
-		const displays = active.map((session, index): WidgetSessionDisplay => {
-			const isSubagent = kindOf(session.id) === "subagent";
-			const state: WidgetSessionState = isSubagent && progressById.get(session.id)?.done
-				? "idle"
-				: "running";
-			return {
-				id: session.id,
-				header: renderWidgetSessionHeader(
-					session.id,
-					isSubagent ? "agent" : "process",
-					state,
-					elapsedOf(session.id),
-					theme,
-				),
-				tail: tails[index],
-				expandable: true,
-			};
-		});
-		const finishedDisplays = finished.map((session): WidgetSessionDisplay => {
-			const isSubagent = kindOf(session.id) === "subagent";
+		const activeTails = new Map(active.map((session, index) => [session.id, tails[index]]));
+		const displays = ordered.map((session): WidgetSessionDisplay => {
 			const id = session.id;
+			const isSubagent = kindOf(id) === "subagent";
+			if (session.state === "running") {
+				const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
+				return {
+					id,
+					header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme),
+					tail: activeTails.get(id) ?? [],
+					expandable: true,
+				};
+			}
 			return {
 				id,
 				header: renderWidgetSessionHeader(
@@ -3486,7 +3491,7 @@ export default function (pi: ExtensionAPI) {
 					"",
 					theme,
 				),
-				// Only read/parse the five visible finished sessions on demand.
+				// Only read/parse the five visible sessions on demand.
 				get tail() {
 					try {
 						return widgetTail(id, isSubagent, undefined, WIDGET_EXPANDED_TAIL_LINES);
@@ -3501,14 +3506,12 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.mode === "tui") {
 			ctx.ui.setWidget(
 				"pi-babysit",
-				() => createWidgetComponent(summaryLines, displays, expandedWidgetSessions, {
-					sessions: finishedDisplays,
-					state: finishedWidgetState,
-				}),
+				() => createWidgetComponent(summaryLines, displays, expandedWidgetSessions, widgetListState),
 				{ placement: "belowEditor" },
 			);
 		} else {
-			const component = createWidgetComponent(summaryLines, displays, new Set());
+			const activeIds = new Set(active.map((session) => session.id));
+			const component = createWidgetComponent(summaryLines, displays.filter((session) => activeIds.has(session.id)), new Set());
 			ctx.ui.setWidget("pi-babysit", component.render(10_000), {
 				placement: "belowEditor",
 			});

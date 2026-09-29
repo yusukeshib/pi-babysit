@@ -160,12 +160,14 @@ test("widget retains running and idle workers while sorting finished sessions ne
 		{ id: "dead", state: "dead" },
 		{ id: "idle", state: "running" },
 		{ id: "failed", state: "exited", exit_code: 1 },
+		{ id: "killed", state: "killed" },
 	];
-	const { active, finished } = widgetSessionGroups(sessions, (id) =>
-		({ success: 10, dead: 30, failed: 20 } as Record<string, number>)[id] ?? 0
+	const { active, finished, all } = widgetSessionGroups(sessions, (id) =>
+		({ success: 10, dead: 30, failed: 20, killed: 25, running: 40, idle: 15 } as Record<string, number>)[id] ?? 0
 	);
 	expect(active.map((s) => s.id)).toEqual(["running", "idle"]);
-	expect(finished.map((s) => s.id)).toEqual(["dead", "failed", "success"]);
+	expect(finished.map((s) => s.id)).toEqual(["dead", "killed", "failed", "success"]);
+	expect(all.map((s) => s.id)).toEqual(["running", "dead", "killed", "failed", "idle", "success"]);
 });
 
 test("agent widget uses live text before a prior final answer and falls back to empty", () => {
@@ -313,59 +315,72 @@ test("process widget toggles the second process independently", () => {
 	]);
 });
 
-test("finished widget remains compact and pages through every completed or failed session", () => {
+test("widget pages running, failed, and completed sessions in one list", () => {
 	const expanded = new Set<string>();
-	const state = { open: false, page: 0 };
-	const finished = Array.from({ length: 12 }, (_, i) => ({
-		id: `done-${i}`,
-		header: `done-${i} ${i % 2 ? "FAILED" : "FINISHED"}`,
-		tail: [`output-${i}`],
-		expandable: true,
-	}));
-	const make = (sessions = finished) => createWidgetComponent(
-		["RUNNING 1 process"],
-		[{ id: "live", header: "live PROCESS", tail: ["live output"], expandable: true }],
-		expanded,
-		{ sessions, state },
-	);
+	const state = { open: true, page: 0 };
+	const sessions = [
+		{ id: "live", header: "live PROCESS RUNNING", tail: ["live output"], expandable: true },
+		...Array.from({ length: 12 }, (_, i) => ({
+			id: `done-${i}`,
+			header: `done-${i} ${i % 2 ? "FAILED" : "FINISHED"}`,
+			tail: [`output-${i}`],
+			expandable: true,
+		})),
+	];
+	const make = (rows = sessions) => createWidgetComponent(["RUNNING 1 process"], rows, expanded, state);
 	const widget = make();
+	const header = "RUNNING 1 process SESSIONS(13) < >";
 	expect(widget.render(80)).toEqual([
-		"RUNNING 1 process", " FINISHED(12)", "live PROCESS live output",
+		header,
+		...sessions.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
 	]);
+	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 })).toBeUndefined();
+	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
+	expect(widget.render(80)).toContain("done-4 FINISHED output-4");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
-	widget.handleMouse({ type: "click", button: "left", y: 1 });
-	expect(widget.render(80)).toEqual([
-		"RUNNING 1 process", " FINISHED(12) < >",
-		...finished.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
-		"live PROCESS live output",
-	]);
-	const header = widget.render(80)[1];
-	widget.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf(">") });
-	expect(widget.render(80)).toContain("done-5 FAILED output-5");
-	widget.handleMouse({ type: "press", button: "left", y: 2 });
-	expect(expanded).toEqual(new Set(["done-5"]));
-	expect(widget.render(80)).toContain("done-5 FAILED");
+	expect(expanded).toEqual(new Set(["done-4"]));
 	const refreshed = make();
-	expect(refreshed.render(80)).toContain("      output-5");
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf(">") });
-	expect(refreshed.render(80)).toContain("done-10 FINISHED output-10");
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
-	expect(refreshed.render(80)).toContain("done-5 FAILED");
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
-	expect(refreshed.render(80)).toContain("done-10 FINISHED output-10");
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf(">") });
-	expect(refreshed.render(80)).toContain("done-0 FINISHED output-0");
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
-	expect(refreshed.render(80)).toContain(" FINISHED(12)");
-	expect(refreshed.render(80)).not.toContain("done-0 FINISHED output-0");
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+	expect(refreshed.render(80)).toContain("      output-4");
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
+	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
+	expect(refreshed.render(80)).toContain("done-4 FINISHED");
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
+	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
+	expect(refreshed.render(80)).toContain("live PROCESS RUNNING live output");
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("SESSIONS") });
+	expect(refreshed.render(80)).toEqual(["RUNNING 1 process SESSIONS(13)"]);
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("SESSIONS") });
 	refreshed.render(80);
-	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
-	// Shrinking the retained list clamps the current page without losing live rows.
-	const shortened = make(finished.slice(0, 2));
-	expect(shortened.render(80)).toContain("done-0 FINISHED output-0");
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
+	// Shrinking the list clamps the current page without dropping the running session.
+	const shortened = make(sessions.slice(0, 2));
+	expect(shortened.render(80)).toEqual([
+		"RUNNING 1 process SESSIONS(2)", "live PROCESS RUNNING live output", "done-0 FINISHED output-0",
+	]);
 	expect(state.page).toBe(0);
+});
+
+test("sessions header keeps click targets correct with ANSI colors and narrow widths", () => {
+	const summary = "\x1b[32mRUNNING 1 process\x1b[0m";
+	const sessions = Array.from({ length: 6 }, (_, i) => ({
+		id: `job-${i}`, header: `job-${i}`, tail: ["output"], expandable: true,
+	}));
+	const state = { open: true, page: 0 };
+	const widget = createWidgetComponent([summary], sessions, new Set(), state);
+	const header = "RUNNING 1 process SESSIONS(6) < >";
+	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < >`);
+	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 })).toBeUndefined();
+	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
+	expect(widget.render(80)).toContain("job-5 output");
+	const narrow = createWidgetComponent([summary], sessions, new Set(), state);
+	expect(narrow.render(19).slice(0, 2)).toEqual([summary, " SESSIONS(6) < >"]);
+	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " SESSIONS(6) < >".indexOf(">") });
+	expect(narrow.render(19)).toContain("job-0 output");
+	const empty = createWidgetComponent([summary], [], new Set(), { open: true, page: 0 });
+	expect(empty.render(80)).toEqual([summary]);
 });
 
 test("widget keeps a session expandable as it moves from running to finished", () => {
@@ -375,7 +390,9 @@ test("widget keeps a session expandable as it moves from running to finished", (
 		["RUNNING 1 process"],
 		[{ id: "build", header: "build PROCESS RUNNING", tail: ["building"], expandable: true }],
 		expanded,
+		state,
 	);
+	expect(active.render(80)[0]).toBe("RUNNING 1 process SESSIONS(1)");
 	expect(active.render(80)).toContain("build PROCESS RUNNING building");
 	active.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(expanded.has("build")).toBe(true);
@@ -383,35 +400,35 @@ test("widget keeps a session expandable as it moves from running to finished", (
 		[{ id: "build", state: "exited", exit_code: 0 }], () => 1,
 	);
 	expect(remaining).toHaveLength(0);
-	const completed = createWidgetComponent([], [], expanded, {
-		sessions: finished.map((session) => ({
-			id: session.id, header: "build PROCESS FINISHED", tail: ["built"], expandable: true,
-		})),
-		state,
-	});
+	const completed = createWidgetComponent([], finished.map((session) => ({
+		id: session.id, header: "build PROCESS FINISHED", tail: ["built"], expandable: true,
+	})), expanded, state);
 	expect(completed.render(80)).toEqual([
-		" FINISHED(1)", "build PROCESS FINISHED", "      built",
+		" SESSIONS(1)", "build PROCESS FINISHED", "      built",
 	]);
 	completed.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(completed.render(80)).toEqual([
-		" FINISHED(1)", "build PROCESS FINISHED built",
+		" SESSIONS(1)", "build PROCESS FINISHED built",
 	]);
 });
 
 test("empty agent and process rows visibly expand, including finished sessions without logs", () => {
 	const expanded = new Set<string>();
 	const widget = createWidgetComponent(
-		[],
-		[{ id: "idle", header: "idle AGENT IDLE", tail: [], expandable: true }],
+		["IDLE 1 agent"],
+		[
+			{ id: "lost", header: "lost PROCESS FAILED", tail: [], expandable: true },
+			{ id: "idle", header: "idle AGENT IDLE", tail: [], expandable: true },
+		],
 		expanded,
-		{ sessions: [{ id: "lost", header: "lost PROCESS FAILED", tail: [], expandable: true }], state: { open: true, page: 0 } },
+		{ open: true, page: 0 },
 	);
-	expect(widget.render(80)).toEqual([" FINISHED(1)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
+	expect(widget.render(80)).toEqual(["IDLE 1 agent SESSIONS(2)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
 	widget.handleMouse({ type: "press", button: "left", y: 2 });
 	expect(widget.render(80)).toContain("      (no output available)");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(widget.render(80)).toEqual([
-		" FINISHED(1)", "lost PROCESS FAILED", "      (no output available)",
+		"IDLE 1 agent SESSIONS(2)", "lost PROCESS FAILED", "      (no output available)",
 		"idle AGENT IDLE", "      (no output available)",
 	]);
 });
