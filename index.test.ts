@@ -330,24 +330,38 @@ test("finished widget remains compact and pages through every completed or faile
 	);
 	const widget = make();
 	expect(widget.render(80)).toEqual([
-		"RUNNING 1 process", " FINISHED 12 — browse (click)", "live PROCESS live output",
+		"RUNNING 1 process", " FINISHED(12)", "live PROCESS live output",
 	]);
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	widget.handleMouse({ type: "click", button: "left", y: 1 });
 	expect(widget.render(80)).toEqual([
-		"RUNNING 1 process", " FINISHED 12 — hide (click)", "  Next → (1/3)",
+		"RUNNING 1 process", " FINISHED(12) < >",
 		...finished.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
 		"live PROCESS live output",
 	]);
-	widget.handleMouse({ type: "press", button: "left", y: 2 });
+	const header = widget.render(80)[1];
+	widget.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf(">") });
 	expect(widget.render(80)).toContain("done-5 FAILED output-5");
-	widget.handleMouse({ type: "press", button: "left", y: 4 });
+	widget.handleMouse({ type: "press", button: "left", y: 2 });
 	expect(expanded).toEqual(new Set(["done-5"]));
 	expect(widget.render(80)).toContain("done-5 FAILED");
 	const refreshed = make();
 	expect(refreshed.render(80)).toContain("      output-5");
-	refreshed.handleMouse({ type: "press", button: "left", y: 3 });
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf(">") });
 	expect(refreshed.render(80)).toContain("done-10 FINISHED output-10");
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
+	expect(refreshed.render(80)).toContain("done-5 FAILED");
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
+	expect(refreshed.render(80)).toContain("done-10 FINISHED output-10");
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf(">") });
+	expect(refreshed.render(80)).toContain("done-0 FINISHED output-0");
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+	expect(refreshed.render(80)).toContain(" FINISHED(12)");
+	expect(refreshed.render(80)).not.toContain("done-0 FINISHED output-0");
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+	refreshed.render(80);
+	refreshed.handleMouse({ type: "press", button: "left", y: 1, x: header.indexOf("<") });
 	// Shrinking the retained list clamps the current page without losing live rows.
 	const shortened = make(finished.slice(0, 2));
 	expect(shortened.render(80)).toContain("done-0 FINISHED output-0");
@@ -376,11 +390,11 @@ test("widget keeps a session expandable as it moves from running to finished", (
 		state,
 	});
 	expect(completed.render(80)).toEqual([
-		" FINISHED 1 — hide (click)", "build PROCESS FINISHED", "      built",
+		" FINISHED(1)", "build PROCESS FINISHED", "      built",
 	]);
 	completed.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(completed.render(80)).toEqual([
-		" FINISHED 1 — hide (click)", "build PROCESS FINISHED built",
+		" FINISHED(1)", "build PROCESS FINISHED built",
 	]);
 });
 
@@ -392,12 +406,12 @@ test("empty agent and process rows visibly expand, including finished sessions w
 		expanded,
 		{ sessions: [{ id: "lost", header: "lost PROCESS FAILED", tail: [], expandable: true }], state: { open: true, page: 0 } },
 	);
-	expect(widget.render(80)).toEqual([" FINISHED 1 — hide (click)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
+	expect(widget.render(80)).toEqual([" FINISHED(1)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
 	widget.handleMouse({ type: "press", button: "left", y: 2 });
 	expect(widget.render(80)).toContain("      (no output available)");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(widget.render(80)).toEqual([
-		" FINISHED 1 — hide (click)", "lost PROCESS FAILED", "      (no output available)",
+		" FINISHED(1)", "lost PROCESS FAILED", "      (no output available)",
 		"idle AGENT IDLE", "      (no output available)",
 	]);
 });

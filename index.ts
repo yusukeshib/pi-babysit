@@ -2376,6 +2376,7 @@ interface WidgetMouseEvent {
 	type: string;
 	button: string;
 	y: number;
+	x?: number;
 }
 
 /**
@@ -2389,7 +2390,7 @@ export function createWidgetComponent(
 	expandedSessionIds: Set<string>,
 	finished?: { sessions: WidgetSessionDisplay[]; state: WidgetFinishedState },
 ) {
-	type Target = { type: "session"; id: string } | { type: "finished" | "prev" | "next" };
+	type Target = { type: "session"; id: string } | { type: "finished"; prevX?: number; nextX?: number };
 	let targetByLine: Array<Target | undefined> = [];
 
 	return {
@@ -2419,15 +2420,13 @@ export function createWidgetComponent(
 			if (finished?.sessions.length) {
 				const pageCount = Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
 				finished.state.page = Math.min(Math.max(0, finished.state.page), pageCount - 1);
+				const label = ` FINISHED(${finished.sessions.length})`;
+				const showArrows = finished.state.open && pageCount > 1;
 				push(
-					` FINISHED ${finished.sessions.length} — ${finished.state.open ? "hide" : "browse"} (click)`,
-					{ type: "finished" },
+					`${label}${showArrows ? " < >" : ""}`,
+					{ type: "finished", prevX: showArrows ? label.length + 1 : undefined, nextX: showArrows ? label.length + 3 : undefined },
 				);
 				if (finished.state.open) {
-					if (pageCount > 1) {
-						if (finished.state.page > 0) push("  ← Previous", { type: "prev" });
-						push(`  ${finished.state.page === pageCount - 1 ? "↻ First" : "Next →"} (${finished.state.page + 1}/${pageCount})`, { type: "next" });
-					}
 					const start = finished.state.page * WIDGET_FINISHED_PAGE_SIZE;
 					for (const session of finished.sessions.slice(start, start + WIDGET_FINISHED_PAGE_SIZE)) {
 						pushSession(session);
@@ -2447,9 +2446,14 @@ export function createWidgetComponent(
 					if (expandedSessionIds.has(target.id)) expandedSessionIds.delete(target.id);
 					else expandedSessionIds.add(target.id);
 				} else if (finished) {
-					if (target.type === "finished") finished.state.open = !finished.state.open;
-					else if (target.type === "prev") finished.state.page--;
-					else finished.state.page = (finished.state.page + 1) % Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
+					const pageCount = Math.ceil(finished.sessions.length / WIDGET_FINISHED_PAGE_SIZE);
+					if (event.x === target.prevX && target.prevX !== undefined) {
+						finished.state.page = (finished.state.page - 1 + pageCount) % pageCount;
+					} else if (event.x === target.nextX && target.nextX !== undefined) {
+						finished.state.page = (finished.state.page + 1) % pageCount;
+					} else {
+						finished.state.open = !finished.state.open;
+					}
 				}
 				return { handled: true, render: true };
 			}
