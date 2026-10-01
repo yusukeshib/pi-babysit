@@ -2411,8 +2411,8 @@ export function createWidgetComponent(
 		render(width: number): string[] {
 			const lines: string[] = [];
 			targetByLine = [];
-			const push = (text: string, target?: Target) => {
-				lines.push(truncateToWidth(text, Math.max(0, width), ""));
+			const push = (text: string, target?: Target, ellipsis = "") => {
+				lines.push(truncateToWidth(text, Math.max(0, width), ellipsis));
 				targetByLine.push(target);
 			};
 			const pushSession = (session: WidgetSessionDisplay) => {
@@ -2431,8 +2431,7 @@ export function createWidgetComponent(
 					}
 				};
 				if (!expanded && details[0]?.startsWith("task: ")) {
-					push(session.header, target);
-					pushDetail(details[0]);
+					push(`${session.header} ${details[0].slice(6)}`, target, "…");
 				} else if (!expanded && details.length) {
 					push(`${session.header} ${details[0]}`, target);
 					for (const detail of details.slice(1)) pushDetail(detail);

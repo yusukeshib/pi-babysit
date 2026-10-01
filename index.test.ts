@@ -422,16 +422,16 @@ test("widget shows command and agent launch/task details alongside output", () =
 	], new Set(), { mode: "all", page: 0 });
 	expect(widget.render(100)).toEqual([
 		" babysits(2 all)", "build PROCESS RUNNING \x1b[1mbun test\x1b[22m",
-		"review AGENT IDLE", "      Review changes",
+		"review AGENT IDLE Review changes",
 	]);
 	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	expect(widget.render(100)).toContain("      compiled");
 	const narrow = widget.render(22);
-	expect(narrow).toContain("review AGENT IDLE");
-	expect(narrow).toContain("      Review changes");
+	expect(narrow.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))).toContain("review AGENT IDLE Rev…");
 	expect(narrow.join("")).not.toContain("rpc-stream-proxy.mjs");
 	widget.handleMouse({ type: "press", button: "left", y: 4, x: 2 });
 	const open = widget.render(22);
+	expect(open).toContain("      Review changes");
 	expect(open.join("").replace(/\x1b\[[0-9;]*m|\s/g, "")).toContain("rpc-stream-proxy.mjs");
 	expect(open.some((line) => line.includes("(no output"))).toBe(true);
 	const longTask = "a".repeat(300);
@@ -439,9 +439,12 @@ test("widget shows command and agent launch/task details alongside output", () =
 		{ id: "agent", header: "agent AGENT RUNNING", tail: [], expandable: true, active: true,
 			details: [`task: ${longTask}`, "\x1b[1mnode --mode rpc\x1b[22m"] },
 	], new Set(), { mode: "running", page: 0 });
-	const rendered = full.render(40);
-	expect(rendered.filter((line) => line.startsWith("      ")).join("").replace(/\s/g, "")).toContain(longTask);
-	expect(rendered.some((line) => line.includes("…"))).toBe(false);
+	const collapsed = full.render(40);
+	expect(collapsed).toHaveLength(2);
+	expect(collapsed[1].replace(/\x1b\[[0-9;]*m/g, "").endsWith("…")).toBe(true);
+	full.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+	const expanded = full.render(40);
+	expect(expanded.filter((line) => line.startsWith("      ")).join("").replace(/\s/g, "")).toContain(longTask);
 });
 
 test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {
