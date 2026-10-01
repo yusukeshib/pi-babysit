@@ -2369,7 +2369,6 @@ function renderWidgetSessionHeader(
 // How many trailing output lines to show per session in the widget.
 const WIDGET_COLLAPSED_TAIL_LINES = 1;
 const WIDGET_EXPANDED_TAIL_LINES = 20;
-const WIDGET_TAIL_WIDTH = 100;
 const WIDGET_SESSION_PAGE_SIZE = 10;
 
 export interface WidgetSessionListState {
@@ -2422,14 +2421,14 @@ export function createWidgetComponent(
 				);
 				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
 				const details = session.details ?? [];
-				const pushDetail = (detail: string) => {
-					const text = detail.startsWith("task: ") ? detail.slice(6) : detail;
-					if (width > 6) {
-						for (const line of wrapTextWithAnsi(text, width - 6)) push(`      ${line}`, target);
-					} else {
-						push(`      ${text}`, target);
+				const pushWrapped = (text: string) => {
+					const indent = width > 6 ? "      " : "";
+					for (const line of wrapTextWithAnsi(text, Math.max(1, width - indent.length))) {
+						push(`${indent}${line}`, target);
 					}
 				};
+				const pushDetail = (detail: string) =>
+					pushWrapped(detail.startsWith("task: ") ? detail.slice(6) : detail);
 				if (!expanded && details.length) {
 					const preview = details[0].startsWith("task: ") ? details[0].slice(6) : details[0];
 					push(`${session.header} ${preview}`, target, "…");
@@ -2438,7 +2437,7 @@ export function createWidgetComponent(
 				} else {
 					push(session.header, target);
 					for (const detail of details) pushDetail(detail);
-					for (const line of tail) push(`      ${line}`, target);
+					for (const line of tail) pushWrapped(line);
 					if (expanded && tail.length === 0) push("      (no output available)", target);
 				}
 			};
@@ -2524,7 +2523,7 @@ function sanitizeTailLine(s: string): string {
 		.replace(/\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]/g, "")
 		// remaining non-printable control chars (keep tab)
 		.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
-	return clean.length > WIDGET_TAIL_WIDTH ? `${clean.slice(0, WIDGET_TAIL_WIDTH - 1)}…` : clean;
+	return clean;
 }
 
 function readTailLines(file: string, lines: number, maxBytes = 64_000): string[] {

@@ -89,7 +89,8 @@ arrows to page. Collapsed rows occupy one line, previewing the command for
 processes and the task for agents (with `…` when clipped). Click a row for the
 complete wrapped command or task; agent rows also show their RPC worker launch
 argv (bold, readable text rather than a copy-paste shell command), and up to 20
-output lines. Opening another row closes the previous
+output lines. Expanded output lines wrap without a 100-character cutoff.
+Opening another row closes the previous
 one. A session with no available output shows an explicit placeholder when
 expanded. Mouse clicks
 require fullscreen mode; `/babysit` works in regular mode. The displayed `age`

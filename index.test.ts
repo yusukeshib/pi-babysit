@@ -182,6 +182,29 @@ test("agent widget uses live text before a prior final answer and falls back to 
 	expect(widgetTail("agent", true, parseEvents(""), 20)).toEqual([]);
 });
 
+test("expanded widget preserves long log and agent progress lines while closed rows stay one line", () => {
+	const longLine = "Needed linked AE API for hybrid export: " + "AfterEffects::stage_picture_layers_with_progress(archive, ".repeat(5) + "end";
+	const progress = parseEvents(JSON.stringify({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: longLine },
+	}));
+	const agentTail = widgetTail("agent", true, progress, 20);
+	expect(agentTail).toEqual([longLine]);
+	for (const [id, tail] of [["agent", agentTail], ["process", [longLine]]] as const) {
+		const widget = createWidgetComponent([], [
+			{ id, header: `${id} RUNNING`, tail, expandable: true },
+		], new Set(), { mode: "all", page: 0 });
+		const collapsed = widget.render(60);
+		expect(collapsed).toHaveLength(2);
+		expect(visibleWidth(collapsed[1])).toBeLessThanOrEqual(60);
+		widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+		const opened = widget.render(60);
+		expect(opened.slice(2).join("").replace(/\s/g, "")).toContain(longLine.replace(/\s/g, ""));
+		expect(opened.join("")).not.toContain("…");
+		expect(opened.every((line) => visibleWidth(line) <= 60)).toBe(true);
+	}
+});
+
 test("process widget toggles the latest 20 log lines by click and keeps live state", () => {
 	const expanded = new Set<string>();
 	const tail = Array.from({ length: 25 }, (_, i) => `line-${i + 1}`);
