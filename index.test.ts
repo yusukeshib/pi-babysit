@@ -428,7 +428,7 @@ test("widget shows command and agent launch/task details alongside output", () =
 	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	expect(widget.render(100)).toContain("      compiled");
 	const narrow = widget.render(22);
-	expect(narrow.join("").replace(/\x1b\[[0-9;]*m|\s/g, "")).toContain("reviewAGENTIDLEReviewchanges");
+	expect(narrow.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))).toContain("review AGENT IDLE Rev…");
 	expect(narrow.join("")).not.toContain("rpc-stream-proxy.mjs");
 	widget.handleMouse({ type: "press", button: "left", y: narrow.findIndex((line) => line.includes("review")), x: 2 });
 	const open = widget.render(22);
@@ -441,25 +441,38 @@ test("widget shows command and agent launch/task details alongside output", () =
 			details: [`task: ${longTask}`, "\x1b[1mnode --mode rpc\x1b[22m"] },
 	], new Set(), { mode: "running", page: 0 });
 	const collapsed = full.render(40);
-	expect(collapsed.slice(1).join("").replace(/\s/g, "")).toContain(longTask);
-	expect(collapsed.join("")).not.toContain("…");
+	expect(collapsed).toHaveLength(2);
+	expect(collapsed[1].replace(/\x1b\[[0-9;]*m/g, "").endsWith("…")).toBe(true);
 	full.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	const expanded = full.render(40);
 	expect(expanded.filter((line) => line.startsWith("      ")).join("").replace(/\s/g, "")).toContain(longTask);
 });
 
-test("long process commands stay complete in the collapsed widget", () => {
+test("closed rows stay one line and opening them reveals the complete command or task", () => {
 	const command = "python3 - <<'PY'\\nimport re,json\\np='/Users/yusuke/Desktop/Play_OFintro/Play_OFintro.aep'\\nprint(p)\\nPY";
-	const widget = createWidgetComponent([], [
-		{ id: "inspect-native-alias-records", header: "inspect-native-alias-records PROCESS FINISHED",
-			tail: [], expandable: true, details: [command] },
+	for (const state of ["RUNNING", "FINISHED"]) {
+		const widget = createWidgetComponent([], [
+			{ id: "inspect-native-alias-records", header: `inspect-native-alias-records PROCESS ${state}`,
+				tail: [], expandable: true, details: [`\x1b[1m${command}\x1b[22m`] },
+		], new Set(), { mode: "all", page: 0 });
+		const closed = widget.render(80);
+		expect(closed).toHaveLength(2);
+		expect(closed[1].replace(/\x1b\[[0-9;]*m/g, "").endsWith("…")).toBe(true);
+		widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+		const open = widget.render(80);
+		expect(open.filter((line) => line.startsWith("      ")).join("").replace(/\x1b\[[0-9;]*m|\s/g, ""))
+			.toContain(command.replace(/\s/g, ""));
+		expect(open.every((line) => visibleWidth(line) <= 80)).toBe(true);
+	}
+	const task = "Review changes ".repeat(20);
+	const agent = createWidgetComponent([], [
+		{ id: "review", header: "review AGENT FINISHED", tail: [], expandable: true,
+			details: [`task: ${task}`, "\x1b[1mnode --mode rpc\x1b[22m"] },
 	], new Set(), { mode: "all", page: 0 });
-	const rows = widget.render(80);
-	expect(rows.slice(1).join("").replace(/\s/g, "")).toBe(
-		`inspect-native-alias-recordsPROCESSFINISHED${command.replace(/\s/g, "")}`,
-	);
-	expect(rows.join("")).not.toContain("…");
-	expect(rows.every((line) => visibleWidth(line) <= 80)).toBe(true);
+	expect(agent.render(40)).toHaveLength(2);
+	agent.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+	expect(agent.render(40).filter((line) => line.startsWith("      ")).join("").replace(/\s/g, ""))
+		.toContain(task.replace(/\s/g, ""));
 });
 
 test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {

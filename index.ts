@@ -2411,12 +2411,9 @@ export function createWidgetComponent(
 		render(width: number): string[] {
 			const lines: string[] = [];
 			targetByLine = [];
-			const push = (text: string, target?: Target) => {
-				lines.push(truncateToWidth(text, Math.max(0, width), ""));
+			const push = (text: string, target?: Target, ellipsis = "") => {
+				lines.push(truncateToWidth(text, Math.max(0, width), ellipsis));
 				targetByLine.push(target);
-			};
-			const pushWrapped = (text: string, target?: Target) => {
-				for (const line of wrapTextWithAnsi(text, Math.max(1, width))) push(line, target);
 			};
 			const pushSession = (session: WidgetSessionDisplay) => {
 				const expanded = session.expandable && expandedSessionIds.has(session.id);
@@ -2433,11 +2430,9 @@ export function createWidgetComponent(
 						push(`      ${text}`, target);
 					}
 				};
-				if (!expanded && details[0]?.startsWith("task: ")) {
-					pushWrapped(`${session.header} ${details[0].slice(6)}`, target);
-				} else if (!expanded && details.length) {
-					pushWrapped(`${session.header} ${details[0]}`, target);
-					for (const detail of details.slice(1)) pushDetail(detail);
+				if (!expanded && details.length) {
+					const preview = details[0].startsWith("task: ") ? details[0].slice(6) : details[0];
+					push(`${session.header} ${preview}`, target, "…");
 				} else if (!expanded && tail.length === 1) {
 					push(`${session.header} ${tail[0]}`, target);
 				} else {
