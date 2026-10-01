@@ -335,10 +335,10 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 	];
 	const make = (rows = sessions) => createWidgetComponent(["RUNNING 1 process"], rows, expanded, state);
 	const widget = make();
-	const header = "RUNNING 1 process babysits(13 all) < 1/3 >";
+	const header = "RUNNING 1 process babysits(13 all) < 1/2 >";
 	expect(widget.render(80)).toEqual([
 		header,
-		...sessions.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
+		...sessions.slice(0, 10).map((row) => `${row.header} ${row.tail[0]}`),
 	]);
 	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 })).toEqual({ handled: true, render: true });
 	expect(widget.render(80)).toEqual(["RUNNING 1 process babysits(1 running)", "live PROCESS RUNNING live output"]);
@@ -346,20 +346,17 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 });
 	expect(widget.render(80)[0]).toBe(header);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
-	expect(widget.render(80)[0]).toBe("RUNNING 1 process babysits(13 all) < 2/3 >");
-	expect(widget.render(80)).toContain("done-4 FINISHED output-4");
+	expect(widget.render(80)[0]).toBe("RUNNING 1 process babysits(13 all) < 2/2 >");
+	expect(widget.render(80)).toContain("done-9 FAILED output-9");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
-	expect(expanded).toEqual(new Set(["done-4"]));
+	expect(expanded).toEqual(new Set(["done-9"]));
 	const refreshed = make();
-	expect(refreshed.render(80)).toContain("      output-4");
+	expect(refreshed.render(80)).toContain("      output-9");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
-	expect(refreshed.render(80)[0]).toBe("RUNNING 1 process babysits(13 all) < 3/3 >");
-	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
+	expect(refreshed.render(80)[0]).toBe(header);
+	expect(refreshed.render(80)).toContain("live PROCESS RUNNING live output");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
-	expect(refreshed.render(80)).toContain("done-4 FINISHED");
-	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
-	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
-	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
+	expect(refreshed.render(80)).toContain("done-9 FAILED");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
 	expect(refreshed.render(80)).toContain("live PROCESS RUNNING live output");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("babysits") });
@@ -377,35 +374,35 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 
 test("sessions header keeps click targets correct with ANSI colors and narrow widths", () => {
 	const summary = "\x1b[32mRUNNING 1 process\x1b[0m";
-	const sessions = Array.from({ length: 6 }, (_, i) => ({
+	const sessions = Array.from({ length: 11 }, (_, i) => ({
 		id: `job-${i}`, header: `job-${i}`, tail: ["output"], expandable: true,
 	}));
 	const state = { mode: "all" as "running" | "all", page: 0 };
 	const widget = createWidgetComponent([summary], sessions, new Set(), state);
-	const header = "RUNNING 1 process babysits(6 all) < 1/2 >";
-	expect(widget.render(80)[0]).toBe(`${summary} babysits(6 all) < 1/2 >`);
+	const header = "RUNNING 1 process babysits(11 all) < 1/2 >";
+	expect(widget.render(80)[0]).toBe(`${summary} babysits(11 all) < 1/2 >`);
 	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 })).toEqual({ handled: true, render: true });
 	expect(widget.render(80)).toEqual([`${summary} babysits(0 running)`]);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
-	expect(widget.render(80)[0]).toBe(`${summary} babysits(6 all) < 1/2 >`);
+	expect(widget.render(80)[0]).toBe(`${summary} babysits(11 all) < 1/2 >`);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
-	expect(widget.render(80)).toContain("job-5 output");
+	expect(widget.render(80)).toContain("job-10 output");
 	const narrow = createWidgetComponent([summary], sessions, new Set(), state);
-	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(6 all) < 2/2 >"]);
+	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(11 all) < 2/2 >"]);
 	narrow.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
 	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(0 running)"]);
 	narrow.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
-	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(6 all) < 1/2 >"]);
-	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " babysits(6 all) < 1/2 >".indexOf(">") });
-	expect(narrow.render(26)).toContain("job-5 output");
+	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(11 all) < 1/2 >"]);
+	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " babysits(11 all) < 1/2 >".indexOf(">") });
+	expect(narrow.render(26)).toContain("job-10 output");
 	const many = createWidgetComponent([], Array.from({ length: 51 }, (_, i) => ({
 		id: `many-${i}`, header: `many-${i}`, tail: [], expandable: true,
-	})), new Set(), { mode: "all" as "running" | "all", page: 8 });
-	expect(many.render(80)[0]).toBe(" babysits(51 all) < 9/11 >");
+	})), new Set(), { mode: "all" as "running" | "all", page: 4 });
+	expect(many.render(80)[0]).toBe(" babysits(51 all) < 5/6 >");
 	many.handleMouse({ type: "press", button: "left", y: 0, x: many.render(80)[0].indexOf(">") });
-	expect(many.render(80)[0]).toBe(" babysits(51 all) < 10/11 >");
+	expect(many.render(80)[0]).toBe(" babysits(51 all) < 6/6 >");
 	many.handleMouse({ type: "press", button: "left", y: 0, x: many.render(80)[0].indexOf(">") });
-	expect(many.render(80)[0]).toBe(" babysits(51 all) < 11/11 >");
+	expect(many.render(80)[0]).toBe(" babysits(51 all) < 1/6 >");
 	const empty = createWidgetComponent([summary], [], new Set(), { mode: "all" as "running" | "all", page: 0 });
 	expect(empty.render(80)).toEqual([summary]);
 });

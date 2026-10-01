@@ -84,7 +84,7 @@ summary counts use `RUNNING` / `IDLE`, and every row is labeled
 `babysits(n running)` list shows live sessions (including idle agents) by default.
 Click the header to toggle to `babysits(n all)`, which also shows finished and failed
 sessions, and click again to return to running-only. Both modes show newest first,
-five per page; `< 1/4 >` shows the current/total page when needed. Click the
+ten per page; `< 1/4 >` shows the current/total page when needed. Click the
 arrows to page. Collapsed rows show the command for processes or the task and
 launch information for agents instead of an arbitrary log line. Agent tasks and
 launch commands wrap onto additional lines without preview truncation. New agents

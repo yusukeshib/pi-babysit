@@ -2370,7 +2370,7 @@ function renderWidgetSessionHeader(
 const WIDGET_COLLAPSED_TAIL_LINES = 1;
 const WIDGET_EXPANDED_TAIL_LINES = 20;
 const WIDGET_TAIL_WIDTH = 100;
-const WIDGET_SESSION_PAGE_SIZE = 5;
+const WIDGET_SESSION_PAGE_SIZE = 10;
 
 export interface WidgetSessionListState {
 	mode: "running" | "all";
