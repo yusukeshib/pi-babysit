@@ -141,6 +141,7 @@ export const NOTIFY_MARKER = "[notify-on-exit]";
 // PI_BABYSIT_VIEW_CMD="" to disable formatting, or provide a custom command.
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+export const displayArg = (s: string) => /^[a-zA-Z0-9_./:@=+,-]+$/.test(s) ? s : shq(s);
 const VIEW_CMD =
 	process.env.PI_BABYSIT_VIEW_CMD ??
 	`${shq(process.execPath)} ${shq(path.join(EXT_DIR, "format-stream.mjs"))}`;
@@ -2155,7 +2156,7 @@ async function spawnSubagent(
 		PI_BIN,
 		...piArgs,
 	);
-	const launchCommand = bsArgs.slice(bsArgs.indexOf("--") + 1).map(shq).join(" ");
+	const launchCommand = bsArgs.slice(bsArgs.indexOf("--") + 1).map(displayArg).join(" ");
 
 	let r: Awaited<ReturnType<typeof bs>>;
 	try {
@@ -2417,7 +2418,7 @@ export function createWidgetComponent(
 				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
 				const details = session.details ?? [];
 				const pushDetail = (detail: string) => {
-					if (detail.startsWith("task: ") && width > 6) {
+					if (width > 6) {
 						for (const line of wrapTextWithAnsi(detail, width - 6)) push(`      ${line}`, target);
 					} else {
 						push(`      ${detail}`, target);
@@ -3501,7 +3502,7 @@ export default function (pi: ExtensionAPI) {
 			const isSubagent = meta?.kind === "subagent";
 			const details = isSubagent
 				? [
-					...(meta?.task ? [`task: ${summarizeNotificationCommand(meta.task)}`] : []),
+					...(meta?.task ? [`task: ${escapeCommandForDisplay(meta.task)}`] : []),
 					...(meta?.launchCommand ? [theme.bold(escapeCommandForDisplay(meta.launchCommand))] : []),
 				]
 				: meta?.command ? [theme.bold(summarizeNotificationCommand(meta.command))] : [];

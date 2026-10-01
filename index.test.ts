@@ -28,6 +28,7 @@ import extension, {
 	createWidgetComponent,
 	clipMultiWaitResult,
 	deliverProcessCompletionMessage,
+	displayArg,
 	gcBabysitRoots,
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
@@ -404,17 +405,22 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 	expect(empty.render(80)).toEqual([summary]);
 });
 
+test("raw agent argv only quotes arguments that need it", () => {
+	expect(["/usr/bin/node", "rpc-stream-proxy.mjs", "--", "pi", "--mode", "rpc", "two words", "it's"].map(displayArg).join(" "))
+		.toBe("/usr/bin/node rpc-stream-proxy.mjs -- pi --mode rpc 'two words' 'it'\\''s'");
+});
+
 test("widget shows command and agent launch/task details alongside output", () => {
 	const widget = createWidgetComponent([], [
 		{ id: "build", header: "build PROCESS RUNNING", tail: ["compiled"], expandable: true,
 			details: ["\x1b[1mbun test\x1b[22m"] },
 		{ id: "review", header: "review AGENT IDLE", tail: [], expandable: true,
-			details: ["task: Review changes", "\x1b[1m'node' 'rpc-stream-proxy.mjs' '--' 'pi' '--mode' 'rpc'\x1b[22m"] },
+			details: ["task: Review changes", "\x1b[1mnode rpc-stream-proxy.mjs -- pi --mode rpc\x1b[22m"] },
 	], new Set(), { mode: "all", page: 0 });
 	expect(widget.render(100)).toEqual([
 		" babysits(2 all)", "build PROCESS RUNNING \x1b[1mbun test\x1b[22m",
 		"review AGENT IDLE", "      task: Review changes",
-		"      \x1b[1m'node' 'rpc-stream-proxy.mjs' '--' 'pi' '--mode' 'rpc'\x1b[22m",
+		"      \x1b[1mnode rpc-stream-proxy.mjs -- pi --mode rpc\x1b[22m",
 	]);
 	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	expect(widget.render(100)).toContain("      compiled");
@@ -423,6 +429,15 @@ test("widget shows command and agent launch/task details alongside output", () =
 	expect(narrow.filter((line) => line.startsWith("      task:")).length).toBe(1);
 	expect(narrow).toContain("      task: Review");
 	expect(narrow).toContain("      changes");
+	expect(narrow.join("").replace(/\x1b\[[0-9;]*m|\s/g, "")).toContain("rpc-stream-proxy.mjs");
+	const longTask = "a".repeat(300);
+	const full = createWidgetComponent([], [
+		{ id: "agent", header: "agent AGENT RUNNING", tail: [], expandable: true, active: true,
+			details: [`task: ${longTask}`, "\x1b[1mnode --mode rpc\x1b[22m"] },
+	], new Set(), { mode: "running", page: 0 });
+	const rendered = full.render(40);
+	expect(rendered.filter((line) => line.startsWith("      ")).join("").replace(/\s/g, "")).toContain(`task:${longTask}`);
+	expect(rendered.some((line) => line.includes("…"))).toBe(false);
 });
 
 test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {

@@ -86,11 +86,10 @@ Click the header to toggle to `babysits(n all)`, which also shows finished and f
 sessions, and click again to return to running-only. Both modes show newest first,
 five per page; `< 1/4 >` shows the current/total page when needed. Click the
 arrows to page. Collapsed rows show the command for processes or the task and
-launch information for agents instead of an arbitrary log line. Agent tasks wrap onto
-additional lines rather than being clipped by the session header. New agents show
-their actual RPC worker launch argv (shell-quoted, bold); terminal width may
-truncate the displayed line. Click a row to show its latest 20 available output
-lines. A session with no available output shows an explicit
+launch information for agents instead of an arbitrary log line. Agent tasks and
+launch commands wrap onto additional lines without preview truncation. New agents
+show their actual RPC worker launch argv in bold, quoting only arguments that need
+it. Click a row to show its latest 20 available output lines. A session with no available output shows an explicit
 placeholder when expanded. Mouse clicks require fullscreen mode; `/babysit`
 works in regular mode. The displayed `age` is total session age, not time spent
 in the current state. Transcript details
