@@ -2412,7 +2412,7 @@ export function createWidgetComponent(
 			const lines: string[] = [];
 			targetByLine = [];
 			const push = (text: string, target?: Target) => {
-				lines.push(truncateToWidth(text, Math.max(0, width)));
+				lines.push(truncateToWidth(text, Math.max(0, width), ""));
 				targetByLine.push(target);
 			};
 			const pushWrapped = (text: string, target?: Target) => {
