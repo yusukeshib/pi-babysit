@@ -2363,7 +2363,7 @@ const WIDGET_TAIL_WIDTH = 100;
 const WIDGET_SESSION_PAGE_SIZE = 5;
 
 export interface WidgetSessionListState {
-	open: boolean;
+	mode: "running" | "all";
 	page: number;
 }
 
@@ -2372,6 +2372,7 @@ export interface WidgetSessionDisplay {
 	header: string;
 	tail: string[];
 	expandable: boolean;
+	active?: boolean;
 }
 
 interface WidgetMouseEvent {
@@ -2421,10 +2422,11 @@ export function createWidgetComponent(
 			for (const line of summaryLines.slice(0, -1)) push(line);
 			const summary = summaryLines.at(-1);
 			if (listState && sessions.length) {
-				const pageCount = Math.ceil(sessions.length / WIDGET_SESSION_PAGE_SIZE);
+				const visible = listState.mode === "running" ? sessions.filter((session) => session.active) : sessions;
+				const pageCount = Math.max(1, Math.ceil(visible.length / WIDGET_SESSION_PAGE_SIZE));
 				listState.page = Math.min(Math.max(0, listState.page), pageCount - 1);
-				const label = ` SESSIONS(${sessions.length})`;
-				const showArrows = listState.open && pageCount > 1;
+				const label = ` babysits(${visible.length} ${listState.mode})`;
+				const showArrows = pageCount > 1;
 				const suffix = `${label}${showArrows ? ` < ${listState.page + 1}/${pageCount} >` : ""}`;
 				// Keep the count clickable on narrow terminals by moving it to its own row.
 				const inline = summary !== undefined && visibleWidth(summary) + visibleWidth(suffix) <= width;
@@ -2439,11 +2441,9 @@ export function createWidgetComponent(
 					prevX: showArrows ? prefixWidth + suffix.indexOf("<") : undefined,
 					nextX: showArrows ? prefixWidth + suffix.indexOf(">") : undefined,
 				});
-				if (listState.open) {
-					const start = listState.page * WIDGET_SESSION_PAGE_SIZE;
-					for (const session of sessions.slice(start, start + WIDGET_SESSION_PAGE_SIZE)) {
-						pushSession(session);
-					}
+				const start = listState.page * WIDGET_SESSION_PAGE_SIZE;
+				for (const session of visible.slice(start, start + WIDGET_SESSION_PAGE_SIZE)) {
+					pushSession(session);
 				}
 			} else {
 				if (summary !== undefined) push(summary);
@@ -2462,13 +2462,15 @@ export function createWidgetComponent(
 					if (expandedSessionIds.has(target.id)) expandedSessionIds.delete(target.id);
 					else expandedSessionIds.add(target.id);
 				} else if (listState) {
-					const pageCount = Math.ceil(sessions.length / WIDGET_SESSION_PAGE_SIZE);
+					const count = listState.mode === "running" ? sessions.filter((session) => session.active).length : sessions.length;
+					const pageCount = Math.max(1, Math.ceil(count / WIDGET_SESSION_PAGE_SIZE));
 					if (event.x === target.prevX && target.prevX !== undefined) {
 						listState.page = (listState.page - 1 + pageCount) % pageCount;
 					} else if (event.x === target.nextX && target.nextX !== undefined) {
 						listState.page = (listState.page + 1) % pageCount;
 					} else {
-						listState.open = !listState.open;
+						listState.mode = listState.mode === "running" ? "all" : "running";
+						listState.page = 0;
 					}
 				}
 				return { handled: true, render: true };
@@ -3437,7 +3439,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	const expandedWidgetSessions = new Set<string>();
-	const widgetListState: WidgetSessionListState = { open: true, page: 0 };
+	const widgetListState: WidgetSessionListState = { mode: "running", page: 0 };
 
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
@@ -3483,6 +3485,7 @@ export default function (pi: ExtensionAPI) {
 					header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme),
 					tail: activeTails.get(id) ?? [],
 					expandable: true,
+					active: true,
 				};
 			}
 			return {

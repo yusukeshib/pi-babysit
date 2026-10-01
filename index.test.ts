@@ -317,9 +317,9 @@ test("process widget toggles the second process independently", () => {
 
 test("widget pages running, failed, and completed sessions in one list", () => {
 	const expanded = new Set<string>();
-	const state = { open: true, page: 0 };
+	const state = { mode: "all" as "running" | "all", page: 0 };
 	const sessions = [
-		{ id: "live", header: "live PROCESS RUNNING", tail: ["live output"], expandable: true },
+		{ id: "live", header: "live PROCESS RUNNING", tail: ["live output"], expandable: true, active: true },
 		...Array.from({ length: 12 }, (_, i) => ({
 			id: `done-${i}`,
 			header: `done-${i} ${i % 2 ? "FAILED" : "FINISHED"}`,
@@ -329,25 +329,25 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 	];
 	const make = (rows = sessions) => createWidgetComponent(["RUNNING 1 process"], rows, expanded, state);
 	const widget = make();
-	const header = "RUNNING 1 process SESSIONS(13) < 1/3 >";
+	const header = "RUNNING 1 process babysits(13 all) < 1/3 >";
 	expect(widget.render(80)).toEqual([
 		header,
 		...sessions.slice(0, 5).map((row) => `${row.header} ${row.tail[0]}`),
 	]);
 	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 })).toEqual({ handled: true, render: true });
-	expect(widget.render(80)).toEqual(["RUNNING 1 process SESSIONS(13)"]);
+	expect(widget.render(80)).toEqual(["RUNNING 1 process babysits(1 running)", "live PROCESS RUNNING live output"]);
 	widget.handleMouse({ type: "click", button: "left", y: 0, x: 2 });
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 });
 	expect(widget.render(80)[0]).toBe(header);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
-	expect(widget.render(80)[0]).toBe("RUNNING 1 process SESSIONS(13) < 2/3 >");
+	expect(widget.render(80)[0]).toBe("RUNNING 1 process babysits(13 all) < 2/3 >");
 	expect(widget.render(80)).toContain("done-4 FINISHED output-4");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(expanded).toEqual(new Set(["done-4"]));
 	const refreshed = make();
 	expect(refreshed.render(80)).toContain("      output-4");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
-	expect(refreshed.render(80)[0]).toBe("RUNNING 1 process SESSIONS(13) < 3/3 >");
+	expect(refreshed.render(80)[0]).toBe("RUNNING 1 process babysits(13 all) < 3/3 >");
 	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
 	expect(refreshed.render(80)).toContain("done-4 FINISHED");
@@ -356,15 +356,15 @@ test("widget pages running, failed, and completed sessions in one list", () => {
 	expect(refreshed.render(80)).toContain("done-9 FAILED output-9");
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
 	expect(refreshed.render(80)).toContain("live PROCESS RUNNING live output");
-	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("SESSIONS") });
-	expect(refreshed.render(80)).toEqual(["RUNNING 1 process SESSIONS(13)"]);
-	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("SESSIONS") });
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("babysits") });
+	expect(refreshed.render(80)).toEqual(["RUNNING 1 process babysits(1 running)", "live PROCESS RUNNING live output"]);
+	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("babysits") });
 	refreshed.render(80);
 	refreshed.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf("<") });
 	// Shrinking the list clamps the current page without dropping the running session.
 	const shortened = make(sessions.slice(0, 2));
 	expect(shortened.render(80)).toEqual([
-		"RUNNING 1 process SESSIONS(2)", "live PROCESS RUNNING live output", "done-0 FINISHED output-0",
+		"RUNNING 1 process babysits(2 all)", "live PROCESS RUNNING live output", "done-0 FINISHED output-0",
 	]);
 	expect(state.page).toBe(0);
 });
@@ -374,46 +374,62 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 	const sessions = Array.from({ length: 6 }, (_, i) => ({
 		id: `job-${i}`, header: `job-${i}`, tail: ["output"], expandable: true,
 	}));
-	const state = { open: true, page: 0 };
+	const state = { mode: "all" as "running" | "all", page: 0 };
 	const widget = createWidgetComponent([summary], sessions, new Set(), state);
-	const header = "RUNNING 1 process SESSIONS(6) < 1/2 >";
-	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < 1/2 >`);
+	const header = "RUNNING 1 process babysits(6 all) < 1/2 >";
+	expect(widget.render(80)[0]).toBe(`${summary} babysits(6 all) < 1/2 >`);
 	expect(widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 })).toEqual({ handled: true, render: true });
-	expect(widget.render(80)).toEqual([`${summary} SESSIONS(6)`]);
+	expect(widget.render(80)).toEqual([`${summary} babysits(0 running)`]);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
-	expect(widget.render(80)[0]).toBe(`${summary} SESSIONS(6) < 1/2 >`);
+	expect(widget.render(80)[0]).toBe(`${summary} babysits(6 all) < 1/2 >`);
 	widget.handleMouse({ type: "press", button: "left", y: 0, x: header.indexOf(">") });
 	expect(widget.render(80)).toContain("job-5 output");
 	const narrow = createWidgetComponent([summary], sessions, new Set(), state);
-	expect(narrow.render(22).slice(0, 2)).toEqual([summary, " SESSIONS(6) < 2/2 >"]);
+	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(6 all) < 2/2 >"]);
 	narrow.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
-	expect(narrow.render(22).slice(0, 2)).toEqual([summary, " SESSIONS(6)"]);
+	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(0 running)"]);
 	narrow.handleMouse({ type: "press", button: "left", y: 0, x: 0 });
-	narrow.render(22);
-	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " SESSIONS(6) < 2/2 >".indexOf(">") });
-	expect(narrow.render(22)).toContain("job-0 output");
+	expect(narrow.render(26).slice(0, 2)).toEqual([summary, " babysits(6 all) < 1/2 >"]);
+	narrow.handleMouse({ type: "press", button: "left", y: 1, x: " babysits(6 all) < 1/2 >".indexOf(">") });
+	expect(narrow.render(26)).toContain("job-5 output");
 	const many = createWidgetComponent([], Array.from({ length: 51 }, (_, i) => ({
 		id: `many-${i}`, header: `many-${i}`, tail: [], expandable: true,
-	})), new Set(), { open: true, page: 8 });
-	expect(many.render(80)[0]).toBe(" SESSIONS(51) < 9/11 >");
+	})), new Set(), { mode: "all" as "running" | "all", page: 8 });
+	expect(many.render(80)[0]).toBe(" babysits(51 all) < 9/11 >");
 	many.handleMouse({ type: "press", button: "left", y: 0, x: many.render(80)[0].indexOf(">") });
-	expect(many.render(80)[0]).toBe(" SESSIONS(51) < 10/11 >");
+	expect(many.render(80)[0]).toBe(" babysits(51 all) < 10/11 >");
 	many.handleMouse({ type: "press", button: "left", y: 0, x: many.render(80)[0].indexOf(">") });
-	expect(many.render(80)[0]).toBe(" SESSIONS(51) < 11/11 >");
-	const empty = createWidgetComponent([summary], [], new Set(), { open: true, page: 0 });
+	expect(many.render(80)[0]).toBe(" babysits(51 all) < 11/11 >");
+	const empty = createWidgetComponent([summary], [], new Set(), { mode: "all" as "running" | "all", page: 0 });
 	expect(empty.render(80)).toEqual([summary]);
+});
+
+test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {
+	const state = { mode: "running" as "running" | "all", page: 4 };
+	const rows = [
+		{ id: "done", header: "done PROCESS FINISHED", tail: [], expandable: true },
+		{ id: "idle", header: "idle AGENT IDLE", tail: [], expandable: true, active: true },
+		{ id: "busy", header: "busy PROCESS RUNNING", tail: [], expandable: true, active: true },
+	];
+	const widget = createWidgetComponent([], rows, new Set(), state);
+	expect(widget.render(80)).toEqual([" babysits(2 running)", "idle AGENT IDLE", "busy PROCESS RUNNING"]);
+	expect(state.page).toBe(0);
+	widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 });
+	expect(widget.render(80)).toEqual([" babysits(3 all)", "done PROCESS FINISHED", "idle AGENT IDLE", "busy PROCESS RUNNING"]);
+	widget.handleMouse({ type: "press", button: "left", y: 0, x: 2 });
+	expect(widget.render(80)).toEqual([" babysits(2 running)", "idle AGENT IDLE", "busy PROCESS RUNNING"]);
 });
 
 test("widget keeps a session expandable as it moves from running to finished", () => {
 	const expanded = new Set<string>();
-	const state = { open: true, page: 0 };
+	const state = { mode: "all" as "running" | "all", page: 0 };
 	const active = createWidgetComponent(
 		["RUNNING 1 process"],
 		[{ id: "build", header: "build PROCESS RUNNING", tail: ["building"], expandable: true }],
 		expanded,
 		state,
 	);
-	expect(active.render(80)[0]).toBe("RUNNING 1 process SESSIONS(1)");
+	expect(active.render(80)[0]).toBe("RUNNING 1 process babysits(1 all)");
 	expect(active.render(80)).toContain("build PROCESS RUNNING building");
 	active.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(expanded.has("build")).toBe(true);
@@ -425,11 +441,11 @@ test("widget keeps a session expandable as it moves from running to finished", (
 		id: session.id, header: "build PROCESS FINISHED", tail: ["built"], expandable: true,
 	})), expanded, state);
 	expect(completed.render(80)).toEqual([
-		" SESSIONS(1)", "build PROCESS FINISHED", "      built",
+		" babysits(1 all)", "build PROCESS FINISHED", "      built",
 	]);
 	completed.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(completed.render(80)).toEqual([
-		" SESSIONS(1)", "build PROCESS FINISHED built",
+		" babysits(1 all)", "build PROCESS FINISHED built",
 	]);
 });
 
@@ -442,14 +458,14 @@ test("empty agent and process rows visibly expand, including finished sessions w
 			{ id: "idle", header: "idle AGENT IDLE", tail: [], expandable: true },
 		],
 		expanded,
-		{ open: true, page: 0 },
+		{ mode: "all" as "running" | "all", page: 0 },
 	);
-	expect(widget.render(80)).toEqual(["IDLE 1 agent SESSIONS(2)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
+	expect(widget.render(80)).toEqual(["IDLE 1 agent babysits(2 all)", "lost PROCESS FAILED", "idle AGENT IDLE"]);
 	widget.handleMouse({ type: "press", button: "left", y: 2 });
 	expect(widget.render(80)).toContain("      (no output available)");
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(widget.render(80)).toEqual([
-		"IDLE 1 agent SESSIONS(2)", "lost PROCESS FAILED", "      (no output available)",
+		"IDLE 1 agent babysits(2 all)", "lost PROCESS FAILED", "      (no output available)",
 		"idle AGENT IDLE", "      (no output available)",
 	]);
 });
