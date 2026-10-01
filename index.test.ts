@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -427,9 +428,9 @@ test("widget shows command and agent launch/task details alongside output", () =
 	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	expect(widget.render(100)).toContain("      compiled");
 	const narrow = widget.render(22);
-	expect(narrow.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))).toContain("review AGENT IDLE Rev…");
+	expect(narrow.join("").replace(/\x1b\[[0-9;]*m|\s/g, "")).toContain("reviewAGENTIDLEReviewchanges");
 	expect(narrow.join("")).not.toContain("rpc-stream-proxy.mjs");
-	widget.handleMouse({ type: "press", button: "left", y: 4, x: 2 });
+	widget.handleMouse({ type: "press", button: "left", y: narrow.findIndex((line) => line.includes("review")), x: 2 });
 	const open = widget.render(22);
 	expect(open).toContain("      Review changes");
 	expect(open.join("").replace(/\x1b\[[0-9;]*m|\s/g, "")).toContain("rpc-stream-proxy.mjs");
@@ -440,11 +441,25 @@ test("widget shows command and agent launch/task details alongside output", () =
 			details: [`task: ${longTask}`, "\x1b[1mnode --mode rpc\x1b[22m"] },
 	], new Set(), { mode: "running", page: 0 });
 	const collapsed = full.render(40);
-	expect(collapsed).toHaveLength(2);
-	expect(collapsed[1].replace(/\x1b\[[0-9;]*m/g, "").endsWith("…")).toBe(true);
+	expect(collapsed.slice(1).join("").replace(/\s/g, "")).toContain(longTask);
+	expect(collapsed.join("")).not.toContain("…");
 	full.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	const expanded = full.render(40);
 	expect(expanded.filter((line) => line.startsWith("      ")).join("").replace(/\s/g, "")).toContain(longTask);
+});
+
+test("long process commands stay complete in the collapsed widget", () => {
+	const command = "python3 - <<'PY'\\nimport re,json\\np='/Users/yusuke/Desktop/Play_OFintro/Play_OFintro.aep'\\nprint(p)\\nPY";
+	const widget = createWidgetComponent([], [
+		{ id: "inspect-native-alias-records", header: "inspect-native-alias-records PROCESS FINISHED",
+			tail: [], expandable: true, details: [command] },
+	], new Set(), { mode: "all", page: 0 });
+	const rows = widget.render(80);
+	expect(rows.slice(1).join("").replace(/\s/g, "")).toBe(
+		`inspect-native-alias-recordsPROCESSFINISHED${command.replace(/\s/g, "")}`,
+	);
+	expect(rows.join("")).not.toContain("…");
+	expect(rows.every((line) => visibleWidth(line) <= 80)).toBe(true);
 });
 
 test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {

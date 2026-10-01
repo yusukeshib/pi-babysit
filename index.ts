@@ -2411,9 +2411,12 @@ export function createWidgetComponent(
 		render(width: number): string[] {
 			const lines: string[] = [];
 			targetByLine = [];
-			const push = (text: string, target?: Target, ellipsis = "") => {
-				lines.push(truncateToWidth(text, Math.max(0, width), ellipsis));
+			const push = (text: string, target?: Target) => {
+				lines.push(truncateToWidth(text, Math.max(0, width)));
 				targetByLine.push(target);
+			};
+			const pushWrapped = (text: string, target?: Target) => {
+				for (const line of wrapTextWithAnsi(text, Math.max(1, width))) push(line, target);
 			};
 			const pushSession = (session: WidgetSessionDisplay) => {
 				const expanded = session.expandable && expandedSessionIds.has(session.id);
@@ -2431,9 +2434,9 @@ export function createWidgetComponent(
 					}
 				};
 				if (!expanded && details[0]?.startsWith("task: ")) {
-					push(`${session.header} ${details[0].slice(6)}`, target, "…");
+					pushWrapped(`${session.header} ${details[0].slice(6)}`, target);
 				} else if (!expanded && details.length) {
-					push(`${session.header} ${details[0]}`, target);
+					pushWrapped(`${session.header} ${details[0]}`, target);
 					for (const detail of details.slice(1)) pushDetail(detail);
 				} else if (!expanded && tail.length === 1) {
 					push(`${session.header} ${tail[0]}`, target);
@@ -3513,7 +3516,7 @@ export default function (pi: ExtensionAPI) {
 					...(meta?.task ? [`task: ${escapeCommandForDisplay(meta.task)}`] : []),
 					...(meta?.launchCommand ? [theme.bold(escapeCommandForDisplay(readableLaunchCommand(meta.launchCommand)))] : []),
 				]
-				: meta?.command ? [theme.bold(summarizeNotificationCommand(meta.command))] : [];
+				: meta?.command ? [theme.bold(escapeCommandForDisplay(meta.command))] : [];
 			if (session.state === "running") {
 				const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
 				return {

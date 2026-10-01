@@ -85,8 +85,9 @@ summary counts use `RUNNING` / `IDLE`, and every row is labeled
 Click the header to toggle to `babysits(n all)`, which also shows finished and failed
 sessions, and click again to return to running-only. Both modes show newest first,
 ten per page; `< 1/4 >` shows the current/total page when needed. Click the
-arrows to page. Collapsed rows occupy one line: processes show the command,
-while agents show a task preview. Click an agent row for the full wrapped task,
+arrows to page. Collapsed rows show the complete command for processes and the
+complete task for agents, wrapping long text across lines rather than abbreviating
+it. Click an agent row for the task,
 its RPC worker launch argv (bold, readable text rather than a copy-paste shell
 command), and up to 20 output lines. Opening another row closes the previous
 one. A session with no available output shows an explicit placeholder when
