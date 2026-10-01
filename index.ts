@@ -43,7 +43,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2416,14 +2416,24 @@ export function createWidgetComponent(
 				);
 				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
 				const details = session.details ?? [];
-				if (!expanded && details.length) {
+				const pushDetail = (detail: string) => {
+					if (detail.startsWith("task: ") && width > 6) {
+						for (const line of wrapTextWithAnsi(detail, width - 6)) push(`      ${line}`, target);
+					} else {
+						push(`      ${detail}`, target);
+					}
+				};
+				if (!expanded && details[0]?.startsWith("task: ")) {
+					push(session.header, target);
+					for (const detail of details) pushDetail(detail);
+				} else if (!expanded && details.length) {
 					push(`${session.header} ${details[0]}`, target);
-					for (const detail of details.slice(1)) push(`      ${detail}`, target);
+					for (const detail of details.slice(1)) pushDetail(detail);
 				} else if (!expanded && tail.length === 1) {
 					push(`${session.header} ${tail[0]}`, target);
 				} else {
 					push(session.header, target);
-					for (const detail of details) push(`      ${detail}`, target);
+					for (const detail of details) pushDetail(detail);
 					for (const line of tail) push(`      ${line}`, target);
 					if (expanded && tail.length === 0) push("      (no output available)", target);
 				}

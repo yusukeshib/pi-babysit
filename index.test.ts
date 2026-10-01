@@ -413,11 +413,16 @@ test("widget shows command and agent launch/task details alongside output", () =
 	], new Set(), { mode: "all", page: 0 });
 	expect(widget.render(100)).toEqual([
 		" babysits(2 all)", "build PROCESS RUNNING \x1b[1mbun test\x1b[22m",
-		"review AGENT IDLE task: Review changes",
+		"review AGENT IDLE", "      task: Review changes",
 		"      \x1b[1m'node' 'rpc-stream-proxy.mjs' '--' 'pi' '--mode' 'rpc'\x1b[22m",
 	]);
 	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	expect(widget.render(100)).toContain("      compiled");
+	const narrow = widget.render(22);
+	expect(narrow).toContain("review AGENT IDLE");
+	expect(narrow.filter((line) => line.startsWith("      task:")).length).toBe(1);
+	expect(narrow).toContain("      task: Review");
+	expect(narrow).toContain("      changes");
 });
 
 test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {
