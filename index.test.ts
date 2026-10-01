@@ -28,7 +28,6 @@ import extension, {
 	createWidgetComponent,
 	clipMultiWaitResult,
 	deliverProcessCompletionMessage,
-	displayArg,
 	gcBabysitRoots,
 	isAllowedDirectBash,
 	isConfirmedTerminalState,
@@ -40,6 +39,7 @@ import extension, {
 	prepareBabysitRunArguments,
 	processSessionEnvironment,
 	pruneTerminalSessionCache,
+	readableLaunchCommand,
 	readLogBytesFrom,
 	resolveKillConfirmation,
 	resolveProcessLifecycle,
@@ -260,7 +260,7 @@ test("agent widget toggles the latest 20 parsed progress lines by click", () => 
 	expect(component.render(80)).toEqual(["RUNNING", "review AGENT progress-25"]);
 });
 
-test("process widget tracks expansion independently by process id", () => {
+test("process widget keeps at most one session expanded", () => {
 	const expanded = new Set<string>();
 	const component = createWidgetComponent(
 		["RUNNING"],
@@ -279,6 +279,11 @@ test("process widget tracks expansion independently by process id", () => {
 		"      one-a",
 		"      one-b",
 		"two two-b",
+	]);
+	component.handleMouse({ type: "press", button: "left", y: 4 });
+	expect(expanded).toEqual(new Set(["two"]));
+	expect(component.render(80)).toEqual([
+		"RUNNING", "one one-b", "two", "      two-a", "      two-b",
 	]);
 });
 
@@ -405,9 +410,10 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 	expect(empty.render(80)).toEqual([summary]);
 });
 
-test("raw agent argv only quotes arguments that need it", () => {
-	expect(["/usr/bin/node", "rpc-stream-proxy.mjs", "--", "pi", "--mode", "rpc", "two words", "it's"].map(displayArg).join(" "))
-		.toBe("/usr/bin/node rpc-stream-proxy.mjs -- pi --mode rpc 'two words' 'it'\\''s'");
+test("old agent launch argv is readable without shell quoting", () => {
+	expect(readableLaunchCommand("'node' '--' 'pi' '--append-system-prompt' 'worker pi'\\''s RPC protocol'"))
+		.toBe("node -- pi --append-system-prompt worker pi's RPC protocol");
+	expect(readableLaunchCommand("node -- pi --mode rpc")).toBe("node -- pi --mode rpc");
 });
 
 test("widget shows command and agent launch/task details alongside output", () => {
@@ -502,7 +508,7 @@ test("empty agent and process rows visibly expand, including finished sessions w
 	widget.handleMouse({ type: "press", button: "left", y: 1 });
 	expect(widget.render(80)).toEqual([
 		"IDLE 1 agent babysits(2 all)", "lost PROCESS FAILED", "      (no output available)",
-		"idle AGENT IDLE", "      (no output available)",
+		"idle AGENT IDLE",
 	]);
 });
 

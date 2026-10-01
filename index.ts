@@ -141,7 +141,6 @@ export const NOTIFY_MARKER = "[notify-on-exit]";
 // PI_BABYSIT_VIEW_CMD="" to disable formatting, or provide a custom command.
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-export const displayArg = (s: string) => /^[a-zA-Z0-9_./:@=+,-]+$/.test(s) ? s : shq(s);
 const VIEW_CMD =
 	process.env.PI_BABYSIT_VIEW_CMD ??
 	`${shq(process.execPath)} ${shq(path.join(EXT_DIR, "format-stream.mjs"))}`;
@@ -1241,6 +1240,12 @@ function escapeCommandForDisplay(command: string): string {
 		);
 }
 
+export function readableLaunchCommand(command: string): string {
+	// Older sessions quoted every argv element, including safe paths and flags.
+	if (!command.startsWith("'") || !command.endsWith("'") || !command.includes("' '")) return command;
+	return command.slice(1, -1).split("' '").map((arg) => arg.replace(/'\\''/g, "'")).join(" ");
+}
+
 export function summarizeNotificationCommand(command: string | undefined): string {
 	const preview = escapeCommandForDisplay((command ?? "?").trim()) || "?";
 	const bytes = Buffer.from(preview, "utf8");
@@ -2156,7 +2161,7 @@ async function spawnSubagent(
 		PI_BIN,
 		...piArgs,
 	);
-	const launchCommand = bsArgs.slice(bsArgs.indexOf("--") + 1).map(displayArg).join(" ");
+	const launchCommand = bsArgs.slice(bsArgs.indexOf("--") + 1).join(" ");
 
 	let r: Awaited<ReturnType<typeof bs>>;
 	try {
@@ -2480,8 +2485,11 @@ export function createWidgetComponent(
 			// Toggle on press so a terminal that omits release still works.
 			if (event.type === "press") {
 				if (target.type === "session") {
-					if (expandedSessionIds.has(target.id)) expandedSessionIds.delete(target.id);
-					else expandedSessionIds.add(target.id);
+					if (expandedSessionIds.has(target.id)) expandedSessionIds.clear();
+					else {
+						expandedSessionIds.clear();
+						expandedSessionIds.add(target.id);
+					}
 				} else if (listState) {
 					const count = listState.mode === "running" ? sessions.filter((session) => session.active).length : sessions.length;
 					const pageCount = Math.max(1, Math.ceil(count / WIDGET_SESSION_PAGE_SIZE));
@@ -3503,7 +3511,7 @@ export default function (pi: ExtensionAPI) {
 			const details = isSubagent
 				? [
 					...(meta?.task ? [`task: ${escapeCommandForDisplay(meta.task)}`] : []),
-					...(meta?.launchCommand ? [theme.bold(escapeCommandForDisplay(meta.launchCommand))] : []),
+					...(meta?.launchCommand ? [theme.bold(escapeCommandForDisplay(readableLaunchCommand(meta.launchCommand)))] : []),
 				]
 				: meta?.command ? [theme.bold(summarizeNotificationCommand(meta.command))] : [];
 			if (session.state === "running") {

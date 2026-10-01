@@ -88,10 +88,11 @@ five per page; `< 1/4 >` shows the current/total page when needed. Click the
 arrows to page. Collapsed rows show the command for processes or the task and
 launch information for agents instead of an arbitrary log line. Agent tasks and
 launch commands wrap onto additional lines without preview truncation. New agents
-show their actual RPC worker launch argv in bold, quoting only arguments that need
-it. Click a row to show its latest 20 available output lines. A session with no available output shows an explicit
-placeholder when expanded. Mouse clicks require fullscreen mode; `/babysit`
-works in regular mode. The displayed `age` is total session age, not time spent
+show their actual RPC worker launch argv in bold as readable text, not a
+copy-paste shell command. Click a row to show its latest 20 available output
+lines; opening another row closes the previous one. A session with no available
+output shows an explicit placeholder when expanded. Mouse clicks require
+fullscreen mode; `/babysit` works in regular mode. The displayed `age` is total session age, not time spent
 in the current state. Transcript details
 from tool results, snapshots, and completion notifications collapse or expand
 with Pi's tool-output toggle (`Ctrl+O` by default).
