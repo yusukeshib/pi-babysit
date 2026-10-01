@@ -2373,6 +2373,7 @@ export interface WidgetSessionDisplay {
 	tail: string[];
 	expandable: boolean;
 	active?: boolean;
+	details?: string[];
 }
 
 interface WidgetMouseEvent {
@@ -2410,10 +2411,15 @@ export function createWidgetComponent(
 					expanded ? -WIDGET_EXPANDED_TAIL_LINES : -WIDGET_COLLAPSED_TAIL_LINES,
 				);
 				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
-				if (!expanded && tail.length === 1) {
+				const details = session.details ?? [];
+				if (!expanded && details.length) {
+					push(`${session.header} ${details[0]}`, target);
+					for (const detail of details.slice(1)) push(`      ${detail}`, target);
+				} else if (!expanded && tail.length === 1) {
 					push(`${session.header} ${tail[0]}`, target);
 				} else {
 					push(session.header, target);
+					for (const detail of details) push(`      ${detail}`, target);
 					for (const line of tail) push(`      ${line}`, target);
 					if (expanded && tail.length === 0) push("      (no output available)", target);
 				}
@@ -3477,7 +3483,17 @@ export default function (pi: ExtensionAPI) {
 		const activeTails = new Map(active.map((session, index) => [session.id, tails[index]]));
 		const displays = ordered.map((session): WidgetSessionDisplay => {
 			const id = session.id;
-			const isSubagent = kindOf(id) === "subagent";
+			const meta = readMeta(id);
+			const isSubagent = meta?.kind === "subagent";
+			const launch = `${path.basename(PI_BIN)} --mode rpc --no-session` +
+				(meta?.model ? ` --model ${shq(meta.model)}` : "") +
+				(meta?.tools?.length ? ` --tools ${shq(meta.tools.join(","))}` : "");
+			const details = isSubagent
+				? [
+					...(meta?.task ? [`task: ${summarizeNotificationCommand(meta.task)}`] : []),
+					`launch: ${summarizeNotificationCommand(launch)} …`,
+				]
+				: meta?.command ? [`command: ${summarizeNotificationCommand(meta.command)}`] : [];
 			if (session.state === "running") {
 				const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
 				return {
@@ -3486,6 +3502,7 @@ export default function (pi: ExtensionAPI) {
 					tail: activeTails.get(id) ?? [],
 					expandable: true,
 					active: true,
+					details,
 				};
 			}
 			return {
@@ -3497,6 +3514,7 @@ export default function (pi: ExtensionAPI) {
 					"",
 					theme,
 				),
+				details,
 				// Only read/parse the five visible sessions on demand.
 				get tail() {
 					try {

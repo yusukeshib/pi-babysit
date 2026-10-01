@@ -404,6 +404,22 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 	expect(empty.render(80)).toEqual([summary]);
 });
 
+test("widget shows command and agent launch/task details alongside output", () => {
+	const widget = createWidgetComponent([], [
+		{ id: "build", header: "build PROCESS RUNNING", tail: ["compiled"], expandable: true,
+			details: ["command: bun test"] },
+		{ id: "review", header: "review AGENT IDLE", tail: [], expandable: true,
+			details: ["task: Review changes", "launch: pi --mode rpc --no-session --model sample (RPC worker)"] },
+	], new Set(), { mode: "all", page: 0 });
+	expect(widget.render(100)).toEqual([
+		" babysits(2 all)", "build PROCESS RUNNING command: bun test",
+		"review AGENT IDLE task: Review changes",
+		"      launch: pi --mode rpc --no-session --model sample (RPC worker)",
+	]);
+	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
+	expect(widget.render(100)).toContain("      compiled");
+});
+
 test("running-only mode includes idle live agents and toggles to all without hiding the list", () => {
 	const state = { mode: "running" as "running" | "all", page: 4 };
 	const rows = [

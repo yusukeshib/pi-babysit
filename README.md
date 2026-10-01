@@ -85,7 +85,8 @@ summary counts use `RUNNING` / `IDLE`, and every row is labeled
 Click the header to toggle to `babysits(n all)`, which also shows finished and failed
 sessions, and click again to return to running-only. Both modes show newest first,
 five per page; `< 1/4 >` shows the current/total page when needed. Click the
-arrows to page. Click a row to toggle between its latest line and latest 20
+arrows to page. Collapsed rows show the command for processes or the task and launch information
+for agents instead of an arbitrary log line. Click a row to show its latest 20
 available output lines. A session with no available output shows an explicit
 placeholder when expanded. Mouse clicks require fullscreen mode; `/babysit`
 works in regular mode. The displayed `age` is total session age, not time spent
