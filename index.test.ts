@@ -409,12 +409,12 @@ test("widget shows command and agent launch/task details alongside output", () =
 		{ id: "build", header: "build PROCESS RUNNING", tail: ["compiled"], expandable: true,
 			details: ["\x1b[1mbun test\x1b[22m"] },
 		{ id: "review", header: "review AGENT IDLE", tail: [], expandable: true,
-			details: ["task: Review changes", "launch: pi --mode rpc --no-session --model sample (RPC worker)"] },
+			details: ["task: Review changes", "\x1b[1m'node' 'rpc-stream-proxy.mjs' '--' 'pi' '--mode' 'rpc'\x1b[22m"] },
 	], new Set(), { mode: "all", page: 0 });
 	expect(widget.render(100)).toEqual([
 		" babysits(2 all)", "build PROCESS RUNNING \x1b[1mbun test\x1b[22m",
 		"review AGENT IDLE task: Review changes",
-		"      launch: pi --mode rpc --no-session --model sample (RPC worker)",
+		"      \x1b[1m'node' 'rpc-stream-proxy.mjs' '--' 'pi' '--mode' 'rpc'\x1b[22m",
 	]);
 	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
 	expect(widget.render(100)).toContain("      compiled");

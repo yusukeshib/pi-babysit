@@ -463,6 +463,7 @@ interface Meta {
 	startedAt?: number;
 	// subagent
 	task?: string;
+	launchCommand?: string;
 	promptOffset?: number;
 	model?: string;
 	tools?: string[];
@@ -2154,6 +2155,7 @@ async function spawnSubagent(
 		PI_BIN,
 		...piArgs,
 	);
+	const launchCommand = bsArgs.slice(bsArgs.indexOf("--") + 1).map(shq).join(" ");
 
 	let r: Awaited<ReturnType<typeof bs>>;
 	try {
@@ -2187,6 +2189,7 @@ async function spawnSubagent(
 		kind: "subagent",
 		name: opts.name ?? id,
 		task: opts.task,
+		launchCommand,
 		notified: true,
 		depth: opts.depth,
 		maxDepth: opts.maxDepth,
@@ -2274,6 +2277,7 @@ async function spawnSubagent(
 		kind: "subagent",
 		name: opts.name ?? id,
 		task: opts.task,
+		launchCommand,
 		promptOffset: resp.offset,
 		model: resolvedModel,
 		tools,
@@ -3485,13 +3489,10 @@ export default function (pi: ExtensionAPI) {
 			const id = session.id;
 			const meta = readMeta(id);
 			const isSubagent = meta?.kind === "subagent";
-			const launch = `${path.basename(PI_BIN)} --mode rpc --no-session` +
-				(meta?.model ? ` --model ${shq(meta.model)}` : "") +
-				(meta?.tools?.length ? ` --tools ${shq(meta.tools.join(","))}` : "");
 			const details = isSubagent
 				? [
 					...(meta?.task ? [`task: ${summarizeNotificationCommand(meta.task)}`] : []),
-					`launch: ${theme.bold(`${summarizeNotificationCommand(launch)} …`)}`,
+					...(meta?.launchCommand ? [theme.bold(escapeCommandForDisplay(meta.launchCommand))] : []),
 				]
 				: meta?.command ? [theme.bold(summarizeNotificationCommand(meta.command))] : [];
 			if (session.state === "running") {
