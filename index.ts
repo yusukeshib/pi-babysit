@@ -2423,15 +2423,16 @@ export function createWidgetComponent(
 				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
 				const details = session.details ?? [];
 				const pushDetail = (detail: string) => {
+					const text = detail.startsWith("task: ") ? detail.slice(6) : detail;
 					if (width > 6) {
-						for (const line of wrapTextWithAnsi(detail, width - 6)) push(`      ${line}`, target);
+						for (const line of wrapTextWithAnsi(text, width - 6)) push(`      ${line}`, target);
 					} else {
-						push(`      ${detail}`, target);
+						push(`      ${text}`, target);
 					}
 				};
 				if (!expanded && details[0]?.startsWith("task: ")) {
 					push(session.header, target);
-					for (const detail of details) pushDetail(detail);
+					pushDetail(details[0]);
 				} else if (!expanded && details.length) {
 					push(`${session.header} ${details[0]}`, target);
 					for (const detail of details.slice(1)) pushDetail(detail);
