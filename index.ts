@@ -3491,9 +3491,9 @@ export default function (pi: ExtensionAPI) {
 			const details = isSubagent
 				? [
 					...(meta?.task ? [`task: ${summarizeNotificationCommand(meta.task)}`] : []),
-					`launch: ${summarizeNotificationCommand(launch)} …`,
+					`launch: ${theme.bold(`${summarizeNotificationCommand(launch)} …`)}`,
 				]
-				: meta?.command ? [`command: ${summarizeNotificationCommand(meta.command)}`] : [];
+				: meta?.command ? [theme.bold(summarizeNotificationCommand(meta.command))] : [];
 			if (session.state === "running") {
 				const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
 				return {

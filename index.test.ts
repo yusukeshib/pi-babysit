@@ -407,12 +407,12 @@ test("sessions header keeps click targets correct with ANSI colors and narrow wi
 test("widget shows command and agent launch/task details alongside output", () => {
 	const widget = createWidgetComponent([], [
 		{ id: "build", header: "build PROCESS RUNNING", tail: ["compiled"], expandable: true,
-			details: ["command: bun test"] },
+			details: ["\x1b[1mbun test\x1b[22m"] },
 		{ id: "review", header: "review AGENT IDLE", tail: [], expandable: true,
 			details: ["task: Review changes", "launch: pi --mode rpc --no-session --model sample (RPC worker)"] },
 	], new Set(), { mode: "all", page: 0 });
 	expect(widget.render(100)).toEqual([
-		" babysits(2 all)", "build PROCESS RUNNING command: bun test",
+		" babysits(2 all)", "build PROCESS RUNNING \x1b[1mbun test\x1b[22m",
 		"review AGENT IDLE task: Review changes",
 		"      launch: pi --mode rpc --no-session --model sample (RPC worker)",
 	]);
