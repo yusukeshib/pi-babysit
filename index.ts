@@ -48,6 +48,9 @@ import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
 
+// ANSI palette 236 is dark gray (#303030), independent of the success palette.
+const babysitBackground = (text: string): string => `\x1b[48;5;236m${text}\x1b[49m`;
+
 // Dedicated babysit state root so pi-managed sessions never collide with the
 // user's own manual `babysit` sessions. The base is namespaced per pi session
 // on session_start (BABYSIT_DIR=<base>/<session-id>), so each pi session only
@@ -3210,8 +3213,23 @@ export default function (pi: ExtensionAPI) {
 		const execute = tool.execute;
 		pi.registerTool({
 			...tool,
-			// Opt out of Pi's colored outer box as well as our message backgrounds.
+			// Keep a neutral card without Pi's success/error-colored outer shell.
 			renderShell: "self",
+			renderCall(args, theme, context) {
+				const box = new Box(1, 0, babysitBackground);
+				box.addChild(tool.renderCall?.(args, theme, context) ??
+					new Text(theme.fg("toolTitle", theme.bold(tool.name)), 0, 0));
+				return box;
+			},
+			renderResult(result, options, theme, context) {
+				const box = new Box(1, 0, babysitBackground);
+				const text = result.content.filter((item) => item.type === "text")
+					.map((item) => item.text).join("\n");
+				box.addChild(tool.renderResult?.(result, options, theme, context) ??
+					new Text(theme.fg("toolOutput", options.expanded ? text :
+						text.split("\n").slice(0, 10).join("\n")), 0, 0));
+				return box;
+			},
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
 				const result = await execute(toolCallId, params, signal, onUpdate, ctx);
 				if ((result as typeof result & { isError?: boolean }).isError === true) {
@@ -3597,15 +3615,14 @@ export default function (pi: ExtensionAPI) {
 		};
 		const body =
 			d.body ?? (typeof message.content === "string" ? message.content : "");
-		const box = new Box(1, 0);
+		const box = new Box(1, 0, babysitBackground);
 		if (d.status) box.addChild(new Text(renderStatus(d.status, theme), 0, 0));
 		if (d.title) box.addChild(new Text(theme.fg("accent", d.title), 0, 0));
 		if (expanded && body) box.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
 		return box;
 	});
 
-	// Process-end notification rendering with a colored lifecycle label. Leave
-	// the background uncolored so frequent notifications don't dominate the transcript.
+	// Keep lifecycle colors on the label, with a neutral background for the card.
 	pi.registerMessageRenderer(
 		"pi-babysit-process-end",
 		(message, { expanded }, theme) => {
@@ -3629,7 +3646,7 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 				theme.bold(`babysit_run COMMAND${payload}`),
 			);
-			const box = new Box(1, 1);
+			const box = new Box(1, 1, babysitBackground);
 			box.addChild(new Text(header, 0, 0));
 			box.addChild(new Text(renderStatus(status, theme), 0, 0));
 			if (expanded && content) {
