@@ -639,6 +639,42 @@ test("pi-babysit message renderers keep the background uncolored and follow the 
 	expect(lines.at(-1)).not.toContain("process details");
 });
 
+test("babysit tools render without Pi's colored outer shell", async () => {
+	const piEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+	const { ToolExecutionComponent } = await import(
+		new URL("./modes/interactive/components/tool-execution.js", piEntry).href
+	);
+	const { initTheme } = await import(
+		new URL("./modes/interactive/theme/theme.js", piEntry).href
+	);
+	initTheme("dark");
+	const backgroundEscape = /\x1b\[(?:48;|4[0-7](?:;|m)|10[0-7](?:;|m))/;
+	const makeComponent = (tool: any) => new ToolExecutionComponent(
+		tool.name, "background-test", { command: "echo hello" },
+		{ showImages: false }, tool, { requestRender() {} }, process.cwd(),
+	);
+	// Ensure this test detects the host-applied background, not just our renderers.
+	const defaultShell = makeComponent({ ...tools.get("babysit_run"), renderShell: "default" });
+	expect(defaultShell.render(100).join("\n")).toMatch(backgroundEscape);
+	for (const tool of tools.values()) {
+		expect(tool.renderShell).toBe("self");
+		const component = makeComponent(tool);
+		expect(component.render(100).join("\n")).not.toMatch(backgroundEscape);
+		for (const isError of [false, true]) {
+			component.updateResult({
+				content: [{ type: "text", text: "result details" }],
+				details: { status: isError ? "failed" : "success" }, isError,
+			});
+			for (const expanded of [false, true]) {
+				component.setExpanded(expanded);
+				const rendered = component.render(100).join("\n");
+				expect(rendered).not.toMatch(backgroundEscape);
+				if (expanded) expect(rendered).toContain("result details");
+			}
+		}
+	}
+});
+
 test("babysit_run renders a status label for quick and background results", () => {
 	const tool = tools.get("babysit_run");
 	const renderResult = tool.renderResult;

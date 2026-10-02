@@ -3210,6 +3210,8 @@ export default function (pi: ExtensionAPI) {
 		const execute = tool.execute;
 		pi.registerTool({
 			...tool,
+			// Opt out of Pi's colored outer box as well as our message backgrounds.
+			renderShell: "self",
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
 				const result = await execute(toolCallId, params, signal, onUpdate, ctx);
 				if ((result as typeof result & { isError?: boolean }).isError === true) {
