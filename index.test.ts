@@ -653,6 +653,14 @@ test("babysit tools render dark gray cards without Pi's colored outer shell", as
 	);
 	initTheme("dark");
 	const grayBackground = "\x1b[48;5;236m";
+	const checkPadding = (lines: string[]) => {
+		const card = lines.filter((line) => line.includes(grayBackground))
+			.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trim());
+		expect(card[0]).toBe("");
+		expect(card.at(-1)).toBe("");
+		// Padding belongs to the outer edges, not between the call and result.
+		for (const line of card.slice(1, -1)) expect(line).not.toBe("");
+	};
 	const hostBackgrounds = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"]
 		.map((color) => theme.getBgAnsi(color));
 	const makeComponent = (tool: any) => new ToolExecutionComponent(
@@ -665,7 +673,9 @@ test("babysit tools render dark gray cards without Pi's colored outer shell", as
 	for (const tool of tools.values()) {
 		expect(tool.renderShell).toBe("self");
 		const component = makeComponent(tool);
-		const pending = component.render(100).join("\n");
+		const pendingLines = component.render(100);
+		checkPadding(pendingLines);
+		const pending = pendingLines.join("\n");
 		expect(pending).toContain(grayBackground);
 		for (const background of hostBackgrounds) expect(pending).not.toContain(background);
 		for (const isError of [false, true]) {
@@ -675,7 +685,9 @@ test("babysit tools render dark gray cards without Pi's colored outer shell", as
 			});
 			for (const expanded of [false, true]) {
 				component.setExpanded(expanded);
-				const rendered = component.render(100).join("\n");
+				const lines = component.render(100);
+				checkPadding(lines);
+				const rendered = lines.join("\n");
 				expect(rendered).toContain(grayBackground);
 				for (const background of hostBackgrounds) expect(rendered).not.toContain(background);
 				if (expanded) expect(rendered).toContain("result details");

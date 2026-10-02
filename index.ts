@@ -3216,19 +3216,33 @@ export default function (pi: ExtensionAPI) {
 			// Keep a neutral card without Pi's success/error-colored outer shell.
 			renderShell: "self",
 			renderCall(args, theme, context) {
-				const box = new Box(1, 0, babysitBackground);
+				const box = new Box(1, 1, babysitBackground);
+				const state = context?.state as { babysitHasResult?: boolean } | undefined;
 				box.addChild(tool.renderCall?.(args, theme, context) ??
 					new Text(theme.fg("toolTitle", theme.bold(tool.name)), 0, 0));
-				return box;
+				return {
+					render(width) {
+						const lines = box.render(width);
+						// Once a result follows, its card supplies the bottom padding.
+						return state?.babysitHasResult ? lines.slice(0, -1) : lines;
+					},
+					invalidate() { box.invalidate(); },
+				};
 			},
 			renderResult(result, options, theme, context) {
-				const box = new Box(1, 0, babysitBackground);
+				const box = new Box(1, 1, babysitBackground);
+				const state = context?.state as { babysitHasResult?: boolean } | undefined;
+				if (state) state.babysitHasResult = true;
 				const text = result.content.filter((item) => item.type === "text")
 					.map((item) => item.text).join("\n");
 				box.addChild(tool.renderResult?.(result, options, theme, context) ??
 					new Text(theme.fg("toolOutput", options.expanded ? text :
 						text.split("\n").slice(0, 10).join("\n")), 0, 0));
-				return box;
+				return {
+					// The call card already supplies the top padding.
+					render(width) { return box.render(width).slice(1); },
+					invalidate() { box.invalidate(); },
+				};
 			},
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
 				const result = await execute(toolCallId, params, signal, onUpdate, ctx);
