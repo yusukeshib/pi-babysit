@@ -3595,15 +3595,15 @@ export default function (pi: ExtensionAPI) {
 		};
 		const body =
 			d.body ?? (typeof message.content === "string" ? message.content : "");
-		const box = new Box(1, 0, (t) => theme.bg("toolSuccessBg", t));
+		const box = new Box(1, 0);
 		if (d.status) box.addChild(new Text(renderStatus(d.status, theme), 0, 0));
 		if (d.title) box.addChild(new Text(theme.fg("accent", d.title), 0, 0));
 		if (expanded && body) box.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
 		return box;
 	});
 
-	// Process-end notification rendering with a colored lifecycle label. Keep the
-	// box background subtle: coloring a potentially large log excerpt is noisy.
+	// Process-end notification rendering with a colored lifecycle label. Leave
+	// the background uncolored so frequent notifications don't dominate the transcript.
 	pi.registerMessageRenderer(
 		"pi-babysit-process-end",
 		(message, { expanded }, theme) => {
@@ -3627,7 +3627,7 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 				theme.bold(`babysit_run COMMAND${payload}`),
 			);
-			const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
+			const box = new Box(1, 1);
 			box.addChild(new Text(header, 0, 0));
 			box.addChild(new Text(renderStatus(status, theme), 0, 0));
 			if (expanded && content) {

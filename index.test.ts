@@ -576,7 +576,7 @@ test("process widget truncates every rendered line to the available width", () =
 	expect(rendered).toEqual(["1234567", "abcdefg"]);
 });
 
-test("pi-babysit message renderers follow the tool expansion toggle", () => {
+test("pi-babysit message renderers keep the background uncolored and follow the tool expansion toggle", () => {
 	const theme = {
 		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
 		bg: (color: string, text: string) => `<bg-${color}>${text}</bg-${color}>`,
@@ -611,7 +611,18 @@ test("pi-babysit message renderers follow the tool expansion toggle", () => {
 		"<warning>babysit_run COMMAND  npm test</warning>",
 	);
 	expect(render({ status: "success" })).toContain("<success>SUCCESS</success>");
-	expect(render({ status: "success" })).toContain("<bg-toolSuccessBg>");
+	for (const expanded of [false, true]) {
+		for (const status of ["running", "started", "success", "failed", "terminated"]) {
+			expect(
+				resultRenderer(
+					{ ...resultMessage, details: { ...resultMessage.details, status } },
+					{ expanded },
+					theme,
+				).render(100).join("\n"),
+			).not.toContain("<bg-");
+			expect(renderLines({ status }, expanded).join("\n")).not.toContain("<bg-");
+		}
+	}
 	expect(render({ status: "success" })).toContain(
 		"<toolOutput>process details</toolOutput>",
 	);
