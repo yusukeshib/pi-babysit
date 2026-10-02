@@ -576,7 +576,7 @@ test("process widget truncates every rendered line to the available width", () =
 	expect(rendered).toEqual(["1234567", "abcdefg"]);
 });
 
-test("pi-babysit message renderers use dark gray and follow the tool expansion toggle", () => {
+test("pi-babysit message renderers follow the tool expansion toggle", () => {
 	const theme = {
 		fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
 		bg: (color: string, text: string) => `<bg-${color}>${text}</bg-${color}>`,
@@ -597,8 +597,6 @@ test("pi-babysit message renderers use dark gray and follow the tool expansion t
 	expect(collapsedResult).toContain("<accent>snapshot</accent>");
 	expect(collapsedResult).not.toContain("snapshot details");
 	expect(expandedResult).toContain("snapshot details");
-	expect(collapsedResult).toContain("\x1b[48;5;236m");
-	expect(expandedResult).toContain("\x1b[48;5;236m");
 
 	const completionRenderer = renderers.get("pi-babysit-process-end");
 	const renderLines = (details: Record<string, unknown>, expanded = true) =>
@@ -613,20 +611,7 @@ test("pi-babysit message renderers use dark gray and follow the tool expansion t
 		"<warning>babysit_run COMMAND  npm test</warning>",
 	);
 	expect(render({ status: "success" })).toContain("<success>SUCCESS</success>");
-	for (const expanded of [false, true]) {
-		for (const status of ["running", "started", "success", "failed", "terminated"]) {
-			expect(
-				resultRenderer(
-					{ ...resultMessage, details: { ...resultMessage.details, status } },
-					{ expanded },
-					theme,
-				).render(100).join("\n"),
-			).not.toContain("<bg-");
-			const completion = renderLines({ status }, expanded).join("\n");
-			expect(completion).not.toContain("<bg-");
-			expect(completion).toContain("\x1b[48;5;236m");
-		}
-	}
+	expect(render({ status: "success" })).toContain("<bg-toolSuccessBg>");
 	expect(render({ status: "success" })).toContain(
 		"<toolOutput>process details</toolOutput>",
 	);
@@ -641,59 +626,6 @@ test("pi-babysit message renderers use dark gray and follow the tool expansion t
 	const lines = renderLines({ status: "success" });
 	expect(lines[0]).not.toContain("babysit_run");
 	expect(lines.at(-1)).not.toContain("process details");
-});
-
-test("babysit tools render dark gray cards without Pi's colored outer shell", async () => {
-	const piEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
-	const { ToolExecutionComponent } = await import(
-		new URL("./modes/interactive/components/tool-execution.js", piEntry).href
-	);
-	const { initTheme, theme } = await import(
-		new URL("./modes/interactive/theme/theme.js", piEntry).href
-	);
-	initTheme("dark");
-	const grayBackground = "\x1b[48;5;236m";
-	const checkPadding = (lines: string[]) => {
-		const card = lines.filter((line) => line.includes(grayBackground))
-			.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trim());
-		expect(card[0]).toBe("");
-		expect(card.at(-1)).toBe("");
-		// Padding belongs to the outer edges, not between the call and result.
-		for (const line of card.slice(1, -1)) expect(line).not.toBe("");
-	};
-	const hostBackgrounds = ["toolPendingBg", "toolSuccessBg", "toolErrorBg"]
-		.map((color) => theme.getBgAnsi(color));
-	const makeComponent = (tool: any) => new ToolExecutionComponent(
-		tool.name, "background-test", { command: "echo hello" },
-		{ showImages: false }, tool, { requestRender() {} }, process.cwd(),
-	);
-	// Ensure this test detects the host-applied background, not just our renderers.
-	const defaultShell = makeComponent({ ...tools.get("babysit_run"), renderShell: "default" });
-	expect(defaultShell.render(100).join("\n")).toContain(hostBackgrounds[0]);
-	for (const tool of tools.values()) {
-		expect(tool.renderShell).toBe("self");
-		const component = makeComponent(tool);
-		const pendingLines = component.render(100);
-		checkPadding(pendingLines);
-		const pending = pendingLines.join("\n");
-		expect(pending).toContain(grayBackground);
-		for (const background of hostBackgrounds) expect(pending).not.toContain(background);
-		for (const isError of [false, true]) {
-			component.updateResult({
-				content: [{ type: "text", text: "result details" }],
-				details: { status: isError ? "failed" : "success" }, isError,
-			});
-			for (const expanded of [false, true]) {
-				component.setExpanded(expanded);
-				const lines = component.render(100);
-				checkPadding(lines);
-				const rendered = lines.join("\n");
-				expect(rendered).toContain(grayBackground);
-				for (const background of hostBackgrounds) expect(rendered).not.toContain(background);
-				if (expanded) expect(rendered).toContain("result details");
-			}
-		}
-	}
 });
 
 test("babysit_run renders a status label for quick and background results", () => {
@@ -737,7 +669,7 @@ test("babysit_run renders a status label for quick and background results", () =
 	);
 	expect(incompleteCall).toContain("<warning>babysit_run COMMAND</warning>");
 	expect(unsafeCall).toContain("first\\n\\x1B[31msecond");
-	expect(unsafeCall).not.toContain("\x1b[31m");
+	expect(unsafeCall).not.toContain("\x1b");
 	expect(unsafeCall).toContain(`second'${"x".repeat(300)}`);
 	expect(unsafeCall).not.toContain("…");
 	expect(longCall).toContain(`  echo begin\\n${"x".repeat(4096)}; printf 'END_MARKER'  </warning>`);

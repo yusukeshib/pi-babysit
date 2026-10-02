@@ -48,9 +48,6 @@ import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
 
-// ANSI palette 236 is dark gray (#303030), independent of the success palette.
-const babysitBackground = (text: string): string => `\x1b[48;5;236m${text}\x1b[49m`;
-
 // Dedicated babysit state root so pi-managed sessions never collide with the
 // user's own manual `babysit` sessions. The base is namespaced per pi session
 // on session_start (BABYSIT_DIR=<base>/<session-id>), so each pi session only
@@ -3213,37 +3210,6 @@ export default function (pi: ExtensionAPI) {
 		const execute = tool.execute;
 		pi.registerTool({
 			...tool,
-			// Keep a neutral card without Pi's success/error-colored outer shell.
-			renderShell: "self",
-			renderCall(args, theme, context) {
-				const box = new Box(1, 1, babysitBackground);
-				const state = context?.state as { babysitHasResult?: boolean } | undefined;
-				box.addChild(tool.renderCall?.(args, theme, context) ??
-					new Text(theme.fg("toolTitle", theme.bold(tool.name)), 0, 0));
-				return {
-					render(width) {
-						const lines = box.render(width);
-						// Once a result follows, its card supplies the bottom padding.
-						return state?.babysitHasResult ? lines.slice(0, -1) : lines;
-					},
-					invalidate() { box.invalidate(); },
-				};
-			},
-			renderResult(result, options, theme, context) {
-				const box = new Box(1, 1, babysitBackground);
-				const state = context?.state as { babysitHasResult?: boolean } | undefined;
-				if (state) state.babysitHasResult = true;
-				const text = result.content.filter((item) => item.type === "text")
-					.map((item) => item.text).join("\n");
-				box.addChild(tool.renderResult?.(result, options, theme, context) ??
-					new Text(theme.fg("toolOutput", options.expanded ? text :
-						text.split("\n").slice(0, 10).join("\n")), 0, 0));
-				return {
-					// The call card already supplies the top padding.
-					render(width) { return box.render(width).slice(1); },
-					invalidate() { box.invalidate(); },
-				};
-			},
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
 				const result = await execute(toolCallId, params, signal, onUpdate, ctx);
 				if ((result as typeof result & { isError?: boolean }).isError === true) {
@@ -3629,14 +3595,15 @@ export default function (pi: ExtensionAPI) {
 		};
 		const body =
 			d.body ?? (typeof message.content === "string" ? message.content : "");
-		const box = new Box(1, 0, babysitBackground);
+		const box = new Box(1, 0, (t) => theme.bg("toolSuccessBg", t));
 		if (d.status) box.addChild(new Text(renderStatus(d.status, theme), 0, 0));
 		if (d.title) box.addChild(new Text(theme.fg("accent", d.title), 0, 0));
 		if (expanded && body) box.addChild(new Markdown(body, 0, 0, getMarkdownTheme()));
 		return box;
 	});
 
-	// Keep lifecycle colors on the label, with a neutral background for the card.
+	// Process-end notification rendering with a colored lifecycle label. Keep the
+	// box background subtle: coloring a potentially large log excerpt is noisy.
 	pi.registerMessageRenderer(
 		"pi-babysit-process-end",
 		(message, { expanded }, theme) => {
@@ -3660,7 +3627,7 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 				theme.bold(`babysit_run COMMAND${payload}`),
 			);
-			const box = new Box(1, 1, babysitBackground);
+			const box = new Box(1, 1, (t) => theme.bg("toolSuccessBg", t));
 			box.addChild(new Text(header, 0, 0));
 			box.addChild(new Text(renderStatus(status, theme), 0, 0));
 			if (expanded && content) {
