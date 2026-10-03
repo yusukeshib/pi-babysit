@@ -20,6 +20,7 @@
   "type": "module",
   "files": [
     "index.ts",
+    "log-viewer.ts",
     "agents.ts",
     "self-reap.ts",
     "format-stream.mjs",
@@ -39,8 +40,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "@earendil-works/pi-tui": ">=1.0.0",
     "typebox": "*"
   }
 }

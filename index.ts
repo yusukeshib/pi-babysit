@@ -43,7 +43,8 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, VStack, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { createLogViewer } from "./log-viewer";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2401,7 +2402,6 @@ function renderWidgetSessionHeader(
 
 // How many trailing output lines to show per session in the widget.
 const WIDGET_COLLAPSED_TAIL_LINES = 1;
-const WIDGET_EXPANDED_TAIL_LINES = 50;
 const WIDGET_SESSION_PAGE_SIZE = 10;
 
 export interface WidgetSessionListState {
@@ -2413,7 +2413,7 @@ export interface WidgetSessionDisplay {
 	id: string;
 	header: string;
 	tail: string[];
-	expandable: boolean;
+	viewable: boolean;
 	active?: boolean;
 	details?: string[];
 }
@@ -2426,14 +2426,12 @@ interface WidgetMouseEvent {
 }
 
 /**
- * Build the live widget as a mouse-aware component without depending on newer
- * pi-tui mouse classes. Older hosts still render it normally; fullscreen hosts
- * dispatch component-local click coordinates to handleMouse.
+ * Compact session list. Item presses open a viewer; rows never expand inline.
  */
 export function createWidgetComponent(
 	summaryLines: string[],
 	sessions: WidgetSessionDisplay[],
-	expandedSessionIds: Set<string>,
+	onOpen: (id: string) => void,
 	listState?: WidgetSessionListState,
 ) {
 	type Target = { type: "session"; id: string } | { type: "sessions"; endX: number; prevX?: number; nextX?: number };
@@ -2448,31 +2446,10 @@ export function createWidgetComponent(
 				targetByLine.push(target);
 			};
 			const pushSession = (session: WidgetSessionDisplay) => {
-				const expanded = session.expandable && expandedSessionIds.has(session.id);
-				const tail = session.tail.slice(
-					expanded ? -WIDGET_EXPANDED_TAIL_LINES : -WIDGET_COLLAPSED_TAIL_LINES,
-				);
-				const target = session.expandable ? { type: "session" as const, id: session.id } : undefined;
-				const details = session.details ?? [];
-				const pushWrapped = (text: string) => {
-					const indent = width > 6 ? "      " : "";
-					for (const line of wrapTextWithAnsi(text, Math.max(1, width - indent.length))) {
-						push(`${indent}${line}`, target);
-					}
-				};
-				const pushDetail = (detail: string) =>
-					pushWrapped(detail.startsWith("task: ") ? detail.slice(6) : detail);
-				if (!expanded && details.length) {
-					const preview = details[0].startsWith("task: ") ? details[0].slice(6) : details[0];
-					push(`${session.header} ${preview}`, target, "…");
-				} else if (!expanded && tail.length === 1) {
-					push(`${session.header} ${tail[0]}`, target);
-				} else {
-					push(session.header, target);
-					for (const detail of details) pushDetail(detail);
-					for (const line of tail) pushWrapped(line);
-					if (expanded && tail.length === 0) push("      (no output available)", target);
-				}
+				const target = session.viewable ? { type: "session" as const, id: session.id } : undefined;
+				const detail = session.details?.[0];
+				const preview = detail?.startsWith("task: ") ? detail.slice(6) : detail ?? session.tail.at(-1);
+				push(`${session.header}${preview ? ` ${preview}` : ""}`, target, "…");
 			};
 
 			for (const line of summaryLines.slice(0, -1)) push(line);
@@ -2515,11 +2492,7 @@ export function createWidgetComponent(
 			// Toggle on press so a terminal that omits release still works.
 			if (event.type === "press") {
 				if (target.type === "session") {
-					if (expandedSessionIds.has(target.id)) expandedSessionIds.clear();
-					else {
-						expandedSessionIds.clear();
-						expandedSessionIds.add(target.id);
-					}
+					onOpen(target.id);
 				} else if (listState) {
 					const count = listState.mode === "running" ? sessions.filter((session) => session.active).length : sessions.length;
 					const pageCount = Math.max(1, Math.ceil(count / WIDGET_SESSION_PAGE_SIZE));
@@ -2542,6 +2515,85 @@ export function createWidgetComponent(
 			targetByLine = [];
 		},
 	};
+}
+
+export function createSessionWidget(options: {
+	getHeight: () => number;
+	requestRender: () => void;
+	getTheme: () => Theme;
+	readLog: (id: string) => { text: string; isAgent: boolean; clipped?: boolean };
+}) {
+	const listState: WidgetSessionListState = { mode: "running", page: 0 };
+	let selectedId: string | undefined;
+	let displays: WidgetSessionDisplay[] = [];
+	let viewer: ReturnType<typeof createLogViewer> | undefined;
+	let list = createWidgetComponent([], [], open, listState);
+	const root = new VStack([list]);
+	function refreshLayout() {
+		root.clear();
+		root.addChild(viewer ?? list, { shrink: 1, minSize: 0 });
+	}
+	function refreshViewer() {
+		if (!selectedId || !viewer) return;
+		const log = options.readLog(selectedId);
+		const session = displays.find((session) => session.id === selectedId);
+		const header = session?.header ?? selectedId;
+		const detail = session?.details?.[0] ?? "";
+		viewer.update(
+			`${log.clipped ? "[older log omitted: 1 MiB limit] " : ""}${header}`,
+			log.text,
+			log.isAgent,
+			detail.startsWith("task: ") ? detail.slice(6) : detail,
+		);
+	}
+	function close() {
+		selectedId = undefined;
+		viewer = undefined;
+		refreshLayout();
+		options.requestRender();
+	}
+	function open(id: string) {
+		selectedId = id;
+		viewer = createLogViewer({ ...options, onClose: close });
+		refreshLayout();
+		refreshViewer();
+		options.requestRender();
+	}
+	return Object.assign(root, {
+		open,
+		update(summary: string[], sessions: WidgetSessionDisplay[]) {
+			displays = sessions;
+			list = createWidgetComponent(summary, sessions, open, listState);
+			refreshLayout();
+			refreshViewer();
+			options.requestRender();
+		},
+		render(width: number) { return (viewer ?? list).render(width); },
+		handleMouse(event: WidgetMouseEvent) {
+			// Viewer mouse handling belongs to its native layout children.
+			return viewer ? undefined : list.handleMouse(event);
+		},
+		handleKey(data: string) { return viewer?.handleKey(data) ?? false; },
+		invalidate() { list.invalidate(); viewer?.invalidate(); },
+	});
+}
+
+/** Only the selected session is read; bounded snapshots never affect worker logs. */
+export function readViewerLog(file: string): { text: string; clipped: boolean } {
+	try {
+		const fd = fs.openSync(file, "r");
+		try {
+			const size = fs.fstatSync(fd).size;
+			const start = Math.max(0, size - 1024 * 1024);
+			const buffer = Buffer.alloc(size - start);
+			const bytes = fs.readSync(fd, buffer, 0, buffer.length, start);
+			let text = buffer.subarray(0, bytes).toString("utf8");
+			if (start > 0) text = text.slice(text.indexOf("\n") + 1);
+			return { text, clipped: start > 0 };
+		} finally { fs.closeSync(fd); }
+	} catch {
+		return { text: "", clipped: false };
+	}
 }
 
 // Strip ANSI/control escapes and clamp width so raw PTY output can't wrap or
@@ -3498,8 +3550,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	const expandedWidgetSessions = new Set<string>();
-	const widgetListState: WidgetSessionListState = { mode: "running", page: 0 };
+	let sessionWidget: ReturnType<typeof createSessionWidget> | undefined;
+	let unsubscribeWidgetInput: (() => void) | undefined;
 
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
@@ -3516,10 +3568,6 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const idle = subs.filter((session) => progressById.get(session.id)?.done).length;
-		const sessionIds = new Set(all.map((session) => session.id));
-		for (const id of expandedWidgetSessions) {
-			if (!sessionIds.has(id)) expandedWidgetSessions.delete(id);
-		}
 
 		const theme = ctx.ui.theme;
 		const summaryLines = renderWidgetLines(procs, subs.length - idle, idle, theme);
@@ -3530,7 +3578,7 @@ export default function (pi: ExtensionAPI) {
 					session.id,
 					isSubagent,
 					isSubagent ? progressById.get(session.id) : undefined,
-					WIDGET_EXPANDED_TAIL_LINES,
+					WIDGET_COLLAPSED_TAIL_LINES,
 				);
 			}),
 		);
@@ -3551,7 +3599,7 @@ export default function (pi: ExtensionAPI) {
 					id,
 					header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme),
 					tail: activeTails.get(id) ?? [],
-					expandable: true,
+					viewable: true,
 					active: true,
 					details,
 				};
@@ -3566,27 +3614,38 @@ export default function (pi: ExtensionAPI) {
 					theme,
 				),
 				details,
-				// Only read/parse the five visible sessions on demand.
+				// Only read/parse visible sessions on demand.
 				get tail() {
 					try {
-						return widgetTail(id, isSubagent, undefined, WIDGET_EXPANDED_TAIL_LINES);
+						return widgetTail(id, isSubagent, undefined, WIDGET_COLLAPSED_TAIL_LINES);
 					} catch {
 						return [];
 					}
 				},
-				expandable: true,
+				viewable: true,
 			};
 		});
 
 		if (ctx.mode === "tui") {
-			ctx.ui.setWidget(
-				"pi-babysit",
-				() => createWidgetComponent(summaryLines, displays, expandedWidgetSessions, widgetListState),
-				{ placement: "belowEditor" },
-			);
+			if (!sessionWidget) {
+				ctx.ui.setWidget("pi-babysit", (tui) => {
+					sessionWidget = createSessionWidget({
+						// Leave space for the editor, footer and status. Native dock layout
+						// can shrink this further when other widgets/editor need more room.
+						getHeight: () => Math.max(3, tui.terminal.rows - 8),
+						requestRender: () => tui.requestRender(),
+						getTheme: () => ctx.ui.theme,
+						readLog: (id) => ({ ...readViewerLog(logPath(id)), isAgent: kindOf(id) === "subagent" }),
+					});
+					return sessionWidget;
+				}, { placement: "belowEditor" });
+				unsubscribeWidgetInput = ctx.ui.onTerminalInput((data) =>
+					sessionWidget?.handleKey(data) ? { consume: true } : undefined);
+			}
+			sessionWidget?.update(summaryLines, displays);
 		} else {
 			const activeIds = new Set(active.map((session) => session.id));
-			const component = createWidgetComponent(summaryLines, displays.filter((session) => activeIds.has(session.id)), new Set());
+			const component = createWidgetComponent(summaryLines, displays.filter((session) => activeIds.has(session.id)), () => {});
 			ctx.ui.setWidget("pi-babysit", component.render(10_000), {
 				placement: "belowEditor",
 			});
@@ -3768,6 +3827,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		unsubscribeWidgetInput?.();
+		unsubscribeWidgetInput = undefined;
+		sessionWidget = undefined;
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = undefined;
 		// Pi also emits session_shutdown while hot-reloading and switching sessions.
@@ -5050,9 +5112,10 @@ export default function (pi: ExtensionAPI) {
 	// output + a copy-paste `babysit attach` take-over hint; running subagent →
 	// read-only progress; finished → summary. Re-run to refresh.
 	pi.registerCommand("babysit", {
-		description: "Pick a session to inspect, or `/babysit gc [days]` to remove old terminal roots",
+		description: "Pick a session to inspect; /babysit view opens its log viewer; /babysit gc [days] removes old terminal roots",
 		handler: async (args, ctx) => {
-			const command = args.trim();
+			const view = args.trim() === "view";
+			const command = view ? "" : args.trim();
 			if (command === "gc" || command.startsWith("gc ")) {
 				const daysText = command.slice(2).trim();
 				const days = daysText ? Number(daysText) : 14;
@@ -5087,7 +5150,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (command) {
-				ctx.ui.notify("Usage: /babysit or /babysit gc [days]", "error");
+				ctx.ui.notify("Usage: /babysit, /babysit view, or /babysit gc [days]", "error");
 				return;
 			}
 			if (!(await babysitAvailable())) {
@@ -5124,6 +5187,11 @@ export default function (pi: ExtensionAPI) {
 			if (!choice) return;
 			const picked = sessions[labels.indexOf(choice)];
 			if (!picked) return;
+			if (view && ctx.mode === "tui") {
+				await refreshWidget(ctx);
+				sessionWidget?.open(picked.id);
+				return;
+			}
 			const kind = kindOf(picked.id);
 			const elapsed = picked.state === "running" ? elapsedOf(picked.id) : null;
 			const elapsedSuffix = elapsed ? ` ${elapsed}` : "";

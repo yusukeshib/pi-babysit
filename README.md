@@ -76,6 +76,7 @@ backgrounding (`… &`, `nohup`, `setsid`, `disown`). Set
 | Command | What it does |
 | ------- | ------------ |
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
+| `/babysit view` | Keyboard picker to open a session in the widget log viewer (Pi TUI) |
 | `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; old empty roots are eligible once their lease is gone. Deletion uses a GC lock and atomic rename |
 
 A widget below the editor separates session **kind** from task **state** at a glance:
@@ -85,20 +86,23 @@ summary counts use `RUNNING` / `IDLE`, and every row is labeled
 Click the header to toggle to `babysits(n all)`, which also shows finished and failed
 sessions, and click again to return to running-only. Both modes show newest first,
 ten per page; `< 1/4 >` shows the current/total page when needed. Click the
-arrows to page. Collapsed rows occupy one line, previewing the command for
-processes and the task for agents (with `…` when clipped). Click a row for the
-complete wrapped command or task; agent rows also show their RPC worker launch
-argv (bold, readable text rather than a copy-paste shell command), and up to 50
-output lines. Agent output retains recent RPC text, tool calls, and tool results
-in chronological order instead of showing only the latest message. Blank lines
-and surrounding whitespace are preserved. Expanded output lines wrap without a
-100-character cutoff.
-Opening another row closes the previous
-one. A session with no available output shows an explicit placeholder when
-expanded. Mouse clicks
-require fullscreen mode; `/babysit` works in regular mode. The displayed `age`
-is total session age, not time spent
-in the current state. Transcript details
+arrows to page. Rows occupy one line, previewing the command for processes and
+the task for agents (with `…` when clipped). Click an AGENT or PROCESS row to
+replace the list with a tall **log viewer in the same widget area**, not an
+overlay or separate screen. `Esc` or the right-hand **Close** button restores
+the list, preserving its mode and page. The viewer uses Pi core's `ScrollView`
+and native scrollbar: wheel/scrollbar drag, arrow keys, PageUp/PageDown, and
+Home/End navigate the log. At the bottom it follows new output; scrolling up
+pauses following until you return to the bottom. The viewer resizes with the
+terminal, leaving room for the editor/status/footer. Agent logs separate
+assistant text, tool calls, and results; process logs show terminal output.
+Only the selected log is loaded, bounded to the latest 1 MiB / 2,000 display
+lines with an omission notice; the full log file is unchanged. Empty logs show
+a placeholder. Native scrolling requires the Pi core widget-layout fix
+(`VStack` widget hosts; not yet included in Pi 1.0.0/1.0.1). Mouse interaction
+requires fullscreen mode; `/babysit view` opens the viewer using a keyboard
+picker, and `/babysit` still provides a snapshot. The displayed `age` is total
+session age, not time spent in the current state. Transcript details
 from tool results, snapshots, and completion notifications collapse or expand
 with Pi's tool-output toggle (`Ctrl+O` by default).
 
