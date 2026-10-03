@@ -2,18 +2,14 @@ import { describe, test, expect } from "bun:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import {
 	visibleWidth,
-	ScrollView,
-	Text,
-	VStack,
+	Container,
 	stripTerminalSequences,
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import {
-	renderLayoutFrame,
-	getScrollViewBox,
-	getLayoutBoxesAt,
-	getScrollbarGeometry,
-} from "@earendil-works/pi-tui/dist/layout.js";
+	dispatchMouseEvent,
+	retargetMouseEvent,
+} from "@earendil-works/pi-tui/dist/tui.js";
 import { createLogViewer } from "./log-viewer";
 
 import { theme } from "./node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
@@ -39,79 +35,127 @@ function setup() {
 	};
 }
 const plain = (lines: string[]) => lines.map(stripTerminalSequences).join("\n");
-describe("native log viewer", () => {
-	test("open viewer becomes the core navigation target after the transcript", () => {
-		const { viewer } = setup();
-		const transcript = new ScrollView(new Text("chat", 0, 0), {
-			primary: true,
-		});
-		const root = new VStack([
-			{ component: transcript, basis: 2 },
-			{ component: viewer, basis: 8 },
-		]);
-		const frame = renderLayoutFrame(root, 40, 10, () => {});
-		expect(frame.primaryScrollView).toBe(viewer.scrollView);
-		root.removeChild(viewer);
-		expect(renderLayoutFrame(root, 40, 10, () => {}).primaryScrollView).toBe(
-			transcript,
-		);
-	});
-	test("native frame exposes scrollbar and preserves follow/offset over update and resize", () => {
+describe("stock Container log viewer", () => {
+	function host(viewer: ReturnType<typeof createLogViewer>, width = 30) {
+		const container = new Container();
+		container.addChild(viewer);
+		const render = () => container.render(width);
+		render();
+		const mouse = (
+			type: TuiMouseEvent["type"],
+			x: number,
+			y: number,
+			wheelDelta = 0,
+		) =>
+			container.handleMouse({
+				type,
+				button: "left",
+				x,
+				y,
+				screenX: x,
+				screenY: y,
+				width,
+				height: render().length,
+				shift: false,
+				alt: false,
+				ctrl: false,
+				wheelDelta,
+			});
+		return { container, render, mouse };
+	}
+	test("plain host renders scrollbar, wheel consumes boundaries, follow and resize persist", () => {
 		const { viewer, resize } = setup();
 		const log = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
 		viewer.update("process", log, false);
-		expect(viewer.render(30)).toHaveLength(8);
-		const frame = renderLayoutFrame(viewer, 30, 8, () => {});
-		const box = getScrollViewBox(frame, viewer.scrollView)!;
-		expect(box.rect.height).toBe(6);
-		expect(getScrollbarGeometry(box)).toBeDefined();
-		expect(viewer.scrollView.isFollowingEnd).toBe(true);
-		expect(plain(frame.lines)).toContain("line 39");
-		viewer.handleKey("\x1b[H");
-		viewer.update("new header", log + "\nline 40", false);
-		viewer.render(30);
+		const h = host(viewer);
+		expect(h.render()).toHaveLength(8);
+		expect(plain(h.render())).toContain("line 39");
+		expect(plain(h.render())).toContain("│");
+		expect(plain(h.render())).toContain("┃");
+		expect(h.mouse("wheel", 2, 2, 100)?.handled).toBe(true);
+		viewer.update("process", log + "\nline 40", false);
+		expect(plain(h.render())).toContain("line 40");
+		expect(h.mouse("wheel", 2, 2, -100)?.handled).toBe(true);
+		expect(viewer.scrollView.scrollTop).toBe(0);
+		expect(h.mouse("wheel", 2, 2, -1)?.handled).toBe(true);
+		viewer.update("new header", log + "\nline 41", false);
+		h.render();
 		expect(viewer.scrollView.scrollTop).toBe(0);
 		expect(viewer.scrollView.isFollowingEnd).toBe(false);
 		resize(5);
 		viewer.invalidate();
-		viewer.render(15);
+		h.render();
 		expect(viewer.scrollView.viewportHeight).toBe(3);
-		viewer.handleKey("\x1b[F");
-		viewer.render(15);
-		expect(viewer.scrollView.isFollowingEnd).toBe(true);
-		for (const key of ["\x1b[A", "\x1b[B", "\x1b[5~", "\x1b[6~"])
-			expect(viewer.handleKey(key)).toBe(true);
-		viewer.invalidate();
-		viewer.render(9);
-		expect(viewer.scrollView).toBe(frame.root.children[1].scrollView!);
-		expect(viewer.handleKey("x")).toBe(false);
+		expect(viewer.handleKey("\x1b[B")).toBe(true);
+		expect(viewer.scrollView.scrollTop).toBe(1);
+		expect(viewer.handleKey("\x1b[A")).toBe(true);
+		for (const key of ["x", "\x1b[H", "\x1b[F", "\x1b[5~", "\x1b[6~"])
+			expect(viewer.handleKey(key)).toBe(false);
 	});
-	test("Close press fires once, click consumed, narrow Close and Esc", () => {
-		const { viewer, closed } = setup();
-		const frame = renderLayoutFrame(viewer, 4, 8, () => {});
-		const target = getLayoutBoxesAt(frame, 3, 0).find(
-			(b) => b.component.handleMouse,
-		)!;
-		const event = {
-			type: "press",
+	test("track pages and thumb captures drag/release outside stock host", () => {
+		const { viewer } = setup();
+		viewer.update(
+			"process",
+			Array.from({ length: 40 }, (_, i) => `${i}`).join("\n"),
+			false,
+		);
+		const h = host(viewer);
+		expect(h.mouse("press", 29, 1)?.handled).toBe(true);
+		expect(viewer.scrollView.scrollTop).toBe(28);
+		h.mouse("wheel", 1, 2, -100);
+		const captured = h.mouse("press", 29, 1)!;
+		expect(captured.capture).toBe(true);
+		expect(plain(h.render())).toContain("█");
+		const outside = {
+			type: "drag",
 			button: "left",
-			x: 3,
-			y: 0,
-			screenX: 3,
-			screenY: 0,
-			width: 4,
-			height: 1,
+			x: 50,
+			y: 50,
+			screenX: 50,
+			screenY: 50,
+			width: 30,
+			height: 8,
 			shift: false,
 			alt: false,
 			ctrl: false,
 		} as TuiMouseEvent;
-		expect(target.component.handleMouse!(event)?.handled).toBe(true);
 		expect(
-			target.component.handleMouse!({ ...event, type: "click" })?.handled,
+			dispatchMouseEvent(
+				captured.target.component,
+				retargetMouseEvent(outside, captured.target),
+			)?.render,
 		).toBe(true);
+		expect(viewer.scrollView.scrollTop).toBe(34);
+		expect(
+			dispatchMouseEvent(
+				captured.target.component,
+				retargetMouseEvent({ ...outside, type: "release" }, captured.target),
+			)?.handled,
+		).toBe(true);
+		expect(plain(h.render())).not.toContain("█");
+	});
+	test("Close press fires once, click consumed, narrow Close and Esc", () => {
+		const { viewer, closed } = setup();
+		const h = host(viewer, 4);
+		expect(h.mouse("press", 3, 0)?.handled).toBe(true);
+		expect(h.mouse("click", 3, 0)?.handled).toBe(true);
 		expect(closed()).toBe(1);
 		expect(viewer.handleKey("\x1b")).toBe(true);
 		expect(closed()).toBe(2);
+	});
+	test("zero/one body rows and narrow widths stay bounded", () => {
+		const { viewer, resize } = setup();
+		viewer.update("title", "界😀\nmore", false);
+		for (const height of [2, 3, 8]) {
+			resize(height);
+			for (const width of [0, 1, 2]) {
+				const h = host(viewer, width);
+				expect(h.render().every((line) => visibleWidth(line) <= width)).toBe(
+					true,
+				);
+				expect(h.render()).toHaveLength(height);
+			}
+		}
 	});
 	test("Unicode and control safety, safe SGR retained", () => {
 		const { viewer } = setup();
@@ -251,7 +295,7 @@ describe("native log viewer", () => {
 			false,
 		);
 		viewer.render(30);
-		viewer.handleKey("\x1b[H");
+		viewer.scrollView.scrollToStart();
 		expect(plain(viewer.render(30))).toContain("Earlier log lines clipped");
 	});
 });

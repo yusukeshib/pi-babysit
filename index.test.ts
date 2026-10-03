@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
-import { VStack, visibleWidth } from "@earendil-works/pi-tui";
-import { getLayoutBoxesAt, renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
+import { Container, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -582,26 +581,33 @@ function sessionWidgetFixture() {
 		id: `job-${i}`, header: `job-${i} PROCESS RUNNING`, tail: ["preview"], viewable: true, active: true,
 	}));
 	widget.update(["RUNNING"], rows);
-	return { widget, rows, reads, setLog: (text: string) => { log = text; }, renders: () => renders };
+	// Match the released Pi host: ordinary Container, no native layout tree.
+	const host = new Container();
+	host.addChild(widget);
+	const render = () => host.render(80);
+	const mouse = (event: Partial<TuiMouseEvent>) => host.handleMouse({
+		type: "press", button: "left", x: 2, y: 0, screenX: 2, screenY: 0,
+		width: 80, height: render().length, shift: false, alt: false, ctrl: false, ...event,
+	});
+	return { widget, host, render, mouse, rows, reads, setLog: (text: string) => { log = text; }, renders: () => renders };
 }
 
-test("session widget opens a tall native viewer once and Esc preserves all mode and page", () => {
-	const { widget, reads, renders } = sessionWidgetFixture();
-	expect(widget).toBeInstanceOf(VStack);
-	const initial = widget.render(80)[0];
-	widget.handleMouse({ type: "press", button: "left", y: 0, x: initial.indexOf("babysits") });
-	const all = widget.render(80)[0];
-	widget.handleMouse({ type: "press", button: "left", y: 0, x: all.indexOf(">") });
-	const page = widget.render(80);
+test("stock widget host opens a tall viewer once and Esc preserves all mode and page", () => {
+	const { widget, render, mouse, reads, renders } = sessionWidgetFixture();
+	const initial = render()[0];
+	mouse({ x: initial.indexOf("babysits") });
+	const all = render()[0];
+	mouse({ x: all.indexOf(">") });
+	const page = render();
 	expect(page[0]).toContain("13 all) < 2/2 >");
-	widget.handleMouse({ type: "press", button: "left", y: 1, x: 2 });
-	widget.handleMouse({ type: "click", button: "left", y: 1, x: 2 });
+	mouse({ y: 1 });
+	mouse({ type: "click", y: 1 });
 	expect(reads).toEqual(["job-10"]);
-	expect(widget.render(80)).toHaveLength(20);
-	expect(widget.render(80)[0]).toContain("job-10");
-	expect(renderLayoutFrame(widget, 80, 20, () => {}).primaryScrollView).toBeDefined();
+	expect(render()).toHaveLength(20);
+	expect(render()[0]).toContain("job-10");
+	expect(render().join("\n")).toMatch(/[│┃]/);
 	expect(widget.handleKey("\x1b")).toBe(true);
-	expect(widget.render(80)).toEqual(page);
+	expect(render()).toEqual(page);
 	expect(renders()).toBeGreaterThan(0);
 });
 
@@ -615,34 +621,32 @@ test("session widget retains running mode on Esc and supports direct open", () =
 	expect(widget.render(80)[0]).toContain("13 running");
 });
 
-test("session widget finished log updates preserve native ScrollView identity and offset", () => {
-	const { widget, rows, setLog } = sessionWidgetFixture();
+test("stock widget host scrolls and retains viewed position after finished-log updates", () => {
+	const { widget, render, mouse, rows, setLog } = sessionWidgetFixture();
 	widget.open("job-0");
-	let frame = renderLayoutFrame(widget, 80, 20, () => {});
-	const scroll = frame.primaryScrollView!;
-	scroll.scrollTo(10);
-	frame = renderLayoutFrame(widget, 80, 20, () => {});
-	const offset = scroll.scrollTop;
+	expect(render().join("\n")).toContain("output-99");
+	const handled = mouse({ type: "wheel", button: "none", y: 5, wheelDelta: -72 });
+	expect(handled?.handled).toBe(true);
+	const before = render().slice(1, -1).map((line) => line.slice(0, -1));
+	expect(before.join("\n")).toContain("output-10");
 	setLog(Array.from({ length: 110 }, (_, i) => `output-${i}`).join("\n"));
 	widget.update([], rows.map((row) => ({ ...row, active: false, header: `${row.id} PROCESS FINISHED` })));
-	frame = renderLayoutFrame(widget, 80, 20, () => {});
-	expect(frame.primaryScrollView).toBe(scroll);
-	expect(scroll.scrollTop).toBe(offset);
-	expect(frame.lines[0]).toContain("FINISHED");
-	expect(frame.lines.join("\n")).toContain("output-10");
+	expect(render()[0]).toContain("FINISHED");
+	expect(render().slice(1, -1).map((line) => line.slice(0, -1))).toEqual(before);
+	mouse({ type: "wheel", button: "none", y: 5, wheelDelta: 500 });
+	expect(render().join("\n")).toContain("output-109");
+	// Do not let wheel input at the end escape into the chat transcript.
+	expect(mouse({ type: "wheel", button: "none", y: 5, wheelDelta: 1 })?.handled).toBe(true);
 });
 
-test("session widget missing logs remain closable through native layout hit testing", () => {
-	const { widget, setLog } = sessionWidgetFixture();
-	const list = widget.render(80);
+test("stock widget host closes empty logs via the Close button", () => {
+	const { widget, render, mouse, setLog } = sessionWidgetFixture();
+	const list = render();
 	setLog("");
 	widget.open("job-0");
-	const frame = renderLayoutFrame(widget, 80, 20, () => {});
-	expect(frame.lines.join("\n")).toContain("no output");
-	const box = getLayoutBoxesAt(frame, 77, 0).find((box) => typeof box.component.handleMouse === "function");
-	expect(box).toBeDefined();
-	box!.component.handleMouse!({ type: "press", button: "left", x: 77 - box!.rect.x, y: 0, width: box!.rect.width, height: box!.rect.height } as any);
-	expect(widget.render(80)).toEqual(list);
+	expect(render().join("\n")).toContain("no output");
+	expect(mouse({ x: 77, y: 0 })?.handled).toBe(true);
+	expect(render()).toEqual(list);
 });
 
 test("readViewerLog bounds snapshots to 1 MiB and reports clipping and missing files", () => {

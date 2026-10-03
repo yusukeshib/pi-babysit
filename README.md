@@ -90,16 +90,17 @@ arrows to page. Rows occupy one line, previewing the command for processes and
 the task for agents (with `…` when clipped). Click an AGENT or PROCESS row to
 replace the list with a tall **log viewer in the same widget area**, not an
 overlay or separate screen. `Esc` or the right-hand **Close** button restores
-the list, preserving its mode and page. The viewer uses Pi core's `ScrollView`
-and native scrollbar: wheel/scrollbar drag, arrow keys, PageUp/PageDown, and
-Home/End navigate the log. At the bottom it follows new output; scrolling up
+the list, preserving its mode and page. The viewer uses Pi's `ScrollView` for
+scroll position and follow behavior, with a widget-local scrollbar styled using
+Pi's scrollbar theme. Wheel, scrollbar drag/track clicks, and ↑/↓ navigate the
+log without requiring any Pi core changes. Home/End and PageUp/PageDown remain
+Pi's transcript shortcuts. At the bottom it follows new output; scrolling up
 pauses following until you return to the bottom. The viewer resizes with the
 terminal, leaving room for the editor/status/footer. Agent logs separate
 assistant text, tool calls, and results; process logs show terminal output.
 Only the selected log is loaded, bounded to the latest 1 MiB / 2,000 display
 lines with an omission notice; the full log file is unchanged. Empty logs show
-a placeholder. Native scrolling requires the Pi core widget-layout fix
-(`VStack` widget hosts; not yet included in Pi 1.0.0/1.0.1). Mouse interaction
+a placeholder. Works in the released Pi 1.0 widget host. Mouse interaction
 requires fullscreen mode; `/babysit view` opens the viewer using a keyboard
 picker, and `/babysit` still provides a snapshot. The displayed `age` is total
 session age, not time spent in the current state. Transcript details

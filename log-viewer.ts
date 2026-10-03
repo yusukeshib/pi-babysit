@@ -4,7 +4,6 @@ import {
 	Markdown,
 	ScrollView,
 	Text,
-	VStack,
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
@@ -178,9 +177,6 @@ export function createLogViewer(options: LogViewerOptions) {
 	};
 	const scrollView = new ScrollView(body, {
 		follow: "end",
-		// While this viewer is open, core viewport navigation (Home/End,
-		// PageUp/PageDown) must target it rather than the chat transcript.
-		primary: true,
 		overscroll: "contain",
 		scrollbar: "always",
 		scrollbarTrackStyle: (s) => options.getTheme().fg("scrollbarTrack", s),
@@ -201,7 +197,12 @@ export function createLogViewer(options: LogViewerOptions) {
 			];
 		},
 		handleMouse(e: TuiMouseEvent) {
-			if (e.button !== "left" || e.x < Math.max(0, e.width - 7)) return;
+			if (
+				e.button !== "left" ||
+				e.x < Math.max(0, e.width - 7) ||
+				e.x >= e.width
+			)
+				return;
 			if (e.type === "press") {
 				options.onClose();
 				return { handled: true };
@@ -212,36 +213,110 @@ export function createLogViewer(options: LogViewerOptions) {
 	const footer: Component = {
 		invalidate() {},
 		render: (width) => [
-			options
-				.getTheme()
-				.fg("dim", truncateToWidth("↑↓ PgUp/PgDn Home/End · Esc close", width)),
+			options.getTheme().fg("dim", truncateToWidth("↑↓ · Esc close", width)),
 		],
 	};
-	const root = new VStack([
-		{ component: heading, basis: 1, shrink: 0 },
-		{ component: scrollView, basis: 0, grow: 1, minSize: 0 },
-		{ component: footer, basis: 1, shrink: 0 },
-	]);
-	// Return the actual core VStack: its layout identity must come from the host's
-	// pi-tui instance, not a private dist import from a second installed copy.
-	return Object.assign(root, {
+	let geometry = {
+		width: 0,
+		height: 0,
+		thumbTop: 0,
+		thumbHeight: 0,
+		maxTop: 0,
+	};
+	let dragOffset: number | undefined;
+	// Stock widget Containers are opaque to native layout. Draw and route this
+	// viewport locally, retaining the public ScrollView's follow/scroll state.
+	return {
 		scrollView,
 		render(width: number) {
-			// Regular mode has no native layout/scrollbar. Keep a bounded keyboard
-			// viewport there; fullscreen uses the inherited VStack/ScrollView tree.
+			width = Math.max(0, Math.floor(width));
 			const height = Math.max(0, Math.floor(options.getHeight()) - 2);
-			const lines = body.render(Math.max(1, scrollView.getContentWidth(width)));
+			const contentWidth = Math.max(0, width - 1);
+			const lines = body.render(Math.max(1, contentWidth));
 			scrollView.updateLayout(lines.length, height, options.requestRender);
 			const visible = lines.slice(
 				scrollView.scrollTop,
 				scrollView.scrollTop + height,
 			);
+			const thumbHeight =
+				height === 0
+					? 0
+					: Math.max(
+							1,
+							Math.min(
+								height,
+								Math.round((height * height) / Math.max(1, lines.length)),
+							),
+						);
+			const maxTop = Math.max(0, lines.length - height);
+			const thumbTop =
+				maxTop === 0
+					? 0
+					: Math.round(
+							(scrollView.scrollTop / maxTop) * (height - thumbHeight),
+						);
+			geometry = { width, height, thumbTop, thumbHeight, maxTop };
 			return [
 				...heading.render(width),
-				...visible,
-				...Array(Math.max(0, height - visible.length)).fill(""),
+				...Array.from({ length: height }, (_, row) => {
+					if (width === 0) return "";
+					const text = truncateToWidth(visible[row] ?? "", contentWidth);
+					const thumb = row >= thumbTop && row < thumbTop + thumbHeight;
+					return (
+						text +
+						" ".repeat(Math.max(0, contentWidth - visibleWidth(text))) +
+						options
+							.getTheme()
+							.fg(
+								thumb ? "scrollbarThumb" : "scrollbarTrack",
+								thumb ? (dragOffset === undefined ? "┃" : "█") : "│",
+							)
+					);
+				}),
 				...footer.render(width),
 			];
+		},
+		handleMouse(e: TuiMouseEvent) {
+			if (dragOffset !== undefined) {
+				if (e.type === "release") {
+					dragOffset = undefined;
+					return { handled: true, render: true };
+				}
+				if (e.type === "drag" || e.type === "move") {
+					const travel = geometry.height - geometry.thumbHeight;
+					const offset = Math.max(0, Math.min(travel, e.y - 1 - dragOffset));
+					scrollView.scrollTo(
+						travel > 0
+							? Math.round((offset / travel) * geometry.maxTop)
+							: scrollView.scrollTop,
+					);
+					return { handled: true, render: true };
+				}
+			}
+			if (e.y === 0) return heading.handleMouse(e);
+			if (e.y < 1 || e.y > geometry.height || e.x < 0 || e.x >= geometry.width)
+				return;
+			if (e.type === "wheel") {
+				scrollView.scrollBy(e.wheelDelta ?? 0);
+				return { handled: true, render: true };
+			}
+			if (e.x === geometry.width - 1 && e.button === "left") {
+				if (e.type === "press") {
+					const row = e.y - 1;
+					if (
+						row >= geometry.thumbTop &&
+						row < geometry.thumbTop + geometry.thumbHeight
+					) {
+						dragOffset = row - geometry.thumbTop;
+						return { handled: true, capture: true, render: true };
+					}
+					scrollView.scrollBy(
+						row < geometry.thumbTop ? -geometry.height : geometry.height,
+					);
+				}
+				if (["press", "click", "release"].includes(e.type))
+					return { handled: true, render: true };
+			}
 		},
 		invalidate() {
 			body.invalidate();
@@ -263,15 +338,9 @@ export function createLogViewer(options: LogViewerOptions) {
 			}
 			if (matchesKey(data, Key.up)) scrollView.scrollBy(-1);
 			else if (matchesKey(data, Key.down)) scrollView.scrollBy(1);
-			else if (matchesKey(data, Key.pageUp))
-				scrollView.scrollBy(-Math.max(1, scrollView.viewportHeight));
-			else if (matchesKey(data, Key.pageDown))
-				scrollView.scrollBy(Math.max(1, scrollView.viewportHeight));
-			else if (matchesKey(data, Key.home)) scrollView.scrollToStart();
-			else if (matchesKey(data, Key.end)) scrollView.scrollToEnd();
 			else return false;
 			options.requestRender();
 			return true;
 		},
-	});
+	};
 }

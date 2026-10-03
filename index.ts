@@ -43,7 +43,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, VStack, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { createLogViewer } from "./log-viewer";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -2528,11 +2528,6 @@ export function createSessionWidget(options: {
 	let displays: WidgetSessionDisplay[] = [];
 	let viewer: ReturnType<typeof createLogViewer> | undefined;
 	let list = createWidgetComponent([], [], open, listState);
-	const root = new VStack([list]);
-	function refreshLayout() {
-		root.clear();
-		root.addChild(viewer ?? list, { shrink: 1, minSize: 0 });
-	}
 	function refreshViewer() {
 		if (!selectedId || !viewer) return;
 		const log = options.readLog(selectedId);
@@ -2549,33 +2544,31 @@ export function createSessionWidget(options: {
 	function close() {
 		selectedId = undefined;
 		viewer = undefined;
-		refreshLayout();
 		options.requestRender();
 	}
 	function open(id: string) {
 		selectedId = id;
 		viewer = createLogViewer({ ...options, onClose: close });
-		refreshLayout();
 		refreshViewer();
 		options.requestRender();
 	}
-	return Object.assign(root, {
+	return {
 		open,
 		update(summary: string[], sessions: WidgetSessionDisplay[]) {
 			displays = sessions;
 			list = createWidgetComponent(summary, sessions, open, listState);
-			refreshLayout();
 			refreshViewer();
 			options.requestRender();
 		},
 		render(width: number) { return (viewer ?? list).render(width); },
-		handleMouse(event: WidgetMouseEvent) {
-			// Viewer mouse handling belongs to its native layout children.
-			return viewer ? undefined : list.handleMouse(event);
+		handleMouse(event: TuiMouseEvent) {
+			// Stock Pi widget hosts forward mouse input to this component, not
+			// to a nested native layout tree. Keep the full wheel/drag event.
+			return (viewer ?? list).handleMouse(event);
 		},
 		handleKey(data: string) { return viewer?.handleKey(data) ?? false; },
 		invalidate() { list.invalidate(); viewer?.invalidate(); },
-	});
+	};
 }
 
 /** Only the selected session is read; bounded snapshots never affect worker logs. */
@@ -3630,8 +3623,7 @@ export default function (pi: ExtensionAPI) {
 			if (!sessionWidget) {
 				ctx.ui.setWidget("pi-babysit", (tui) => {
 					sessionWidget = createSessionWidget({
-						// Leave space for the editor, footer and status. Native dock layout
-						// can shrink this further when other widgets/editor need more room.
+						// Keep the viewer bounded while leaving room for editor/status/footer.
 						getHeight: () => Math.max(3, tui.terminal.rows - 8),
 						requestRender: () => tui.requestRender(),
 						getTheme: () => ctx.ui.theme,
