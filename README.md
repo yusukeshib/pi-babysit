@@ -210,8 +210,13 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   incrementally, which keeps follow-up tasks efficient.
 
 Subagents load `self-reap.ts`, which exits an idle finished subagent after a
-grace window (`PI_BABYSIT_REAP_AFTER`, default 120s) using the same parked-turn
-rule, so a subagent waiting on a long build is never false-killed. Give bounded
+grace window using the same parked-turn rule, so a subagent waiting on a long
+build is never false-killed. Callers can set `reapAfter: "5m"` on
+`babysit_run { profile: "subagent", task, reapAfter: "5m" }`. Omission uses
+`PI_BABYSIT_REAP_AFTER`, then `PI_SUBAGENT_REAP_AFTER`, then 120s.
+`reapAfter: "none"` (also `"off"` or `"0"`) disables idle reaping; the absolute
+`timeout` still applies. Follow-up tasks cancel the idle timer. This differs
+from `idleTimeout`, which kills based on lack of output, even during work. Give bounded
 recon/review tasks at least one cost, turn, tool-call, or token budget; omit
 budgets only for intentionally open-ended work. Optional task budgets are
 observed by the parent poller. `maxUsageTokens` counts cumulative input, output,

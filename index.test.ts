@@ -17,6 +17,7 @@ import { compactRpcLine } from "./rpc-stream-proxy.mjs";
 import { isParked as selfReaperIsParked } from "./self-reap.ts";
 import { discoverAgents } from "./agents.ts";
 import extension, {
+	subagentReuseHint,
 	activeToolsWithoutDirectBash,
 	automaticNotificationGroup,
 	babysitSpawnInstallHint,
@@ -153,6 +154,13 @@ test("widget labels make session kind and state explicit without visual clutter"
 	expect(widgetSessionHeader("crash", "process", "failed")).toBe(
 		"  ✗ crash PROCESS FAILED",
 	);
+});
+
+test("subagent reuse hint reflects caller-specified idle grace", () => {
+	expect(subagentReuseHint("5m")).toContain("5m idle grace");
+	for (const disabled of ["none", "off", "0"]) {
+		expect(subagentReuseHint(disabled)).toBe("Session remains available until its absolute timeout.");
+	}
 });
 
 test("widget retains running and idle workers while sorting finished sessions newest first", () => {

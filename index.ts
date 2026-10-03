@@ -464,6 +464,7 @@ interface Meta {
 	// subagent
 	task?: string;
 	launchCommand?: string;
+	reapAfter?: string;
 	promptOffset?: number;
 	model?: string;
 	tools?: string[];
@@ -1065,9 +1066,11 @@ const SUBAGENT_BUDGET_GRACE_MS =
 	parseDurMs(process.env.PI_BABYSIT_BUDGET_GRACE ?? "90s") ?? 90_000;
 const SUBAGENT_REAP_AFTER =
 	process.env.PI_BABYSIT_REAP_AFTER ?? process.env.PI_SUBAGENT_REAP_AFTER ?? "120s";
-const SUBAGENT_REUSE_HINT = ["0", "off", "none"].includes(SUBAGENT_REAP_AFTER)
-	? "Session remains available until its absolute timeout."
-	: `Session remains available for follow-ups during the ${SUBAGENT_REAP_AFTER} idle grace.`;
+export function subagentReuseHint(reapAfter = SUBAGENT_REAP_AFTER): string {
+	return ["0", "off", "none"].includes(reapAfter)
+		? "Session remains available until its absolute timeout."
+		: `Session remains available for follow-ups during the ${reapAfter} idle grace.`;
+}
 
 export function clip(s: string, maxBytes = TAIL_MAX_BYTES): string {
 	if (maxBytes <= 0) return "";
@@ -2101,6 +2104,7 @@ interface SubagentOpts {
 	depth: number;
 	maxDepth: number;
 	budget?: SubagentBudget;
+	reapAfter?: string;
 	// Idle-timeout is OFF by default: an RPC-mode pi is silent while it works,
 	// so idle detection would false-kill a busy subagent. The absolute timeout
 	// is the safety valve instead.
@@ -2111,6 +2115,11 @@ interface SubagentOpts {
 async function spawnSubagent(
 	opts: SubagentOpts,
 ): Promise<{ id: string; model?: string } | { error: string }> {
+	const reapAfter = opts.reapAfter?.trim() ?? SUBAGENT_REAP_AFTER;
+	if (opts.reapAfter !== undefined && !["0", "off", "none"].includes(reapAfter) &&
+		(!/^\d+(ms|s|m|h)?$/.test(reapAfter) || !Number.isFinite(parseDurMs(reapAfter)))) {
+		return { error: "Invalid reapAfter: use a duration such as 30s or 5m, or none/off/0 to disable." };
+	}
 	// Long-lived RPC worker: the task is NOT passed as argv — it is injected
 	// below as an RPC `prompt` command, whose response we validate so spawn
 	// failures (bad model, missing API key) are loud instead of a silent exit=1.
@@ -2189,6 +2198,7 @@ async function spawnSubagent(
 		r = await bs(bsArgs, {
 			cwd: opts.cwd,
 			env: {
+				PI_BABYSIT_REAP_AFTER: reapAfter,
 				[SUBAGENT_DEPTH_ENV]: String(opts.depth),
 				[SUBAGENT_MAX_DEPTH_ENV]: String(opts.maxDepth),
 			},
@@ -2221,6 +2231,7 @@ async function spawnSubagent(
 		depth: opts.depth,
 		maxDepth: opts.maxDepth,
 		budget: opts.budget,
+		reapAfter,
 	});
 
 	// Wait for pi to boot (first JSON event in the log), then inject the task.
@@ -2314,6 +2325,7 @@ async function spawnSubagent(
 		depth: opts.depth,
 		maxDepth: opts.maxDepth,
 		budget: opts.budget,
+		reapAfter,
 		startedAt: Date.now(),
 	});
 	return { id, model: resolvedModel };
@@ -2804,7 +2816,7 @@ async function waitForTask(
 				ok: completed.ok,
 				text:
 					`Subagent ${id} finished its task (${stats}).\n` +
-					`${SUBAGENT_REUSE_HINT} Follow-up: babysit_send { id: "${id}" }, ` +
+					`${subagentReuseHint(readMeta(id)?.reapAfter)} Follow-up: babysit_send { id: "${id}" }, ` +
 					`or babysit_kill when done.\n\n${completed.body}`,
 				status: st,
 				progress: prog,
@@ -3901,6 +3913,11 @@ export default function (pi: ExtensionAPI) {
 						"Absolute auto-kill after this long (e.g. 30m). Default: none for processes (dev servers may run forever), 15m for subagents. 'none' disables.",
 				}),
 			),
+			reapAfter: Type.Optional(
+				Type.String({
+					description: "Subagent only: stop the worker after this long in task-complete IDLE (e.g. 30s, 5m). Defaults to PI_BABYSIT_REAP_AFTER, then PI_SUBAGENT_REAP_AFTER, then 120s. none/off/0 disables; absolute timeout still applies. Follow-up tasks cancel the idle timer.",
+				}),
+			),
 			idleTimeout: Type.Optional(
 				Type.String({
 					description:
@@ -4221,6 +4238,7 @@ export default function (pi: ExtensionAPI) {
 							maxUsageTokens: params.maxUsageTokens,
 						}
 						: undefined,
+				reapAfter: params.reapAfter,
 				timeout: params.timeout ?? "15m",
 				idleTimeout: params.idleTimeout,
 			});
