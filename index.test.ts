@@ -172,14 +172,40 @@ test("widget retains running and idle workers while sorting finished sessions ne
 	expect(all.map((s) => s.id)).toEqual(["running", "dead", "killed", "failed", "idle", "success"]);
 });
 
-test("agent widget uses live text before a prior final answer and falls back to empty", () => {
+test("agent widget retains prior output alongside live text and falls back to empty", () => {
 	const progress = parseEvents([
 		JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "prior task" }] } }),
 		JSON.stringify({ type: "turn_start" }),
 		JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "current task" } }),
 	].join("\n"));
-	expect(widgetTail("agent", true, progress, 20)).toEqual(["current task"]);
+	expect(widgetTail("agent", true, progress, 20)).toEqual(["prior task", "current task"]);
 	expect(widgetTail("agent", true, parseEvents(""), 20)).toEqual([]);
+});
+
+test("agent log streams tool results and preserves the latest 50 lines without trimming", () => {
+	const events = [
+		{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "starting" } },
+		{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "starting" }] } },
+		{ type: "tool_execution_start", toolName: "read", args: { path: "file.ts" } },
+		{ type: "tool_execution_end", isError: false },
+		{ type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: Array.from({ length: 55 }, (_, i) => `  output-${i}  `).join("\n") }] } },
+		{ type: "turn_start" },
+		{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "\nnext" } },
+	];
+	const progress = parseEvents(events.map((event) => JSON.stringify(event)).join("\n"));
+	const tail = widgetTail("agent", true, progress, 50);
+	expect(tail).toHaveLength(50);
+	expect(tail[0]).toBe("  output-7  ");
+	expect(tail.slice(-3)).toEqual(["  output-54  ", "", "next"]);
+	expect(widgetTail("agent", true, progress, 30)).toHaveLength(30);
+	const widget = createWidgetComponent([], [{
+		id: "agent", header: "AGENT", tail: Array.from({ length: 60 }, (_, i) => `line-${i}`),
+		details: ["task: full task", "launch command"], expandable: true,
+	}], new Set(["agent"]));
+	const rendered = widget.render(80);
+	expect(rendered).toHaveLength(53);
+	expect(rendered.slice(0, 4)).toEqual(["AGENT", "      full task", "      launch command", "      line-10"]);
+	expect(rendered.at(-1)).toBe("      line-59");
 });
 
 test("expanded widget preserves long log and agent progress lines while closed rows stay one line", () => {
@@ -205,7 +231,7 @@ test("expanded widget preserves long log and agent progress lines while closed r
 	}
 });
 
-test("process widget toggles the latest 20 log lines by click and keeps live state", () => {
+test("process widget toggles the latest 50 log lines by click and keeps live state", () => {
 	const expanded = new Set<string>();
 	const tail = Array.from({ length: 25 }, (_, i) => `line-${i + 1}`);
 	const sessions = [
@@ -234,9 +260,9 @@ test("process widget toggles the latest 20 log lines by click and keeps live sta
 		render: false,
 	});
 	const expandedLines = component.render(80);
-	expect(expandedLines).toHaveLength(23);
-	expect(expandedLines.slice(2, 22)).toEqual(
-		Array.from({ length: 20 }, (_, i) => `      line-${i + 6}`),
+	expect(expandedLines).toHaveLength(28);
+	expect(expandedLines.slice(2, 27)).toEqual(
+		Array.from({ length: 25 }, (_, i) => `      line-${i + 1}`),
 	);
 	expect(expandedLines.at(-1)).toBe("agent AGENT thinking");
 
@@ -256,7 +282,7 @@ test("process widget toggles the latest 20 log lines by click and keeps live sta
 	expect(refreshed.render(80)).toEqual(["RUNNING", "build PROCESS line-26"]);
 });
 
-test("agent widget toggles the latest 20 parsed progress lines by click", () => {
+test("agent widget toggles the latest 50 parsed progress lines by click", () => {
 	const expanded = new Set<string>();
 	const tail = Array.from({ length: 25 }, (_, i) => `progress-${i + 1}`);
 	const component = createWidgetComponent(
@@ -277,7 +303,7 @@ test("agent widget toggles the latest 20 parsed progress lines by click", () => 
 	expect(component.render(80)).toEqual([
 		"RUNNING",
 		"review AGENT",
-		...Array.from({ length: 20 }, (_, i) => `      progress-${i + 6}`),
+		...Array.from({ length: 25 }, (_, i) => `      progress-${i + 1}`),
 	]);
 	component.handleMouse({ type: "press", button: "left", y: 10 });
 	component.handleMouse({ type: "click", button: "left", y: 10 });

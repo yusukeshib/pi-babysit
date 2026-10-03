@@ -1556,6 +1556,8 @@ export interface Progress {
 	finalText: string;
 	/** Best-effort text from the currently streaming assistant message. */
 	streamingText: string;
+	/** Recent readable RPC output, independent of the latest assistant message. */
+	logText: string;
 	/** Context size reported by the most recent assistant response. */
 	tokens?: number;
 	/** Cumulative model usage for the current subagent task. */
@@ -1616,6 +1618,7 @@ function emptyProgress(): Progress {
 		toolCallCount: 0,
 		finalText: "",
 		streamingText: "",
+		logText: "",
 		modelCalls: 0,
 		usageTokens: 0,
 		inputTokens: 0,
@@ -1713,6 +1716,12 @@ function updateProgressState(progress: Progress): Progress {
 	return progress;
 }
 
+function appendProgressLog(progress: Progress, text: string, separate = false): void {
+	if (!text) return;
+	const separator = separate && progress.logText && !progress.logText.endsWith("\n") ? "\n" : "";
+	progress.logText = (progress.logText + separator + text).split("\n").slice(-50).join("\n");
+}
+
 function parseEventLine(progress: Progress, raw: string): void {
 	const line = raw.replace(/\r$/, "").trim();
 	if (!line.startsWith("{")) return;
@@ -1732,12 +1741,14 @@ function parseEventLine(progress: Progress, raw: string): void {
 				| { type?: string; delta?: string }
 				| undefined;
 			if (update?.type === "text_delta" && typeof update.delta === "string") {
+				appendProgressLog(progress, update.delta, !progress.streamingText);
 				progress.streamingText = clip(progress.streamingText + update.delta, ANSWER_MAX_BYTES);
 			}
 			break;
 		}
 		case "tool_execution_start": {
 			const name = String(event.toolName ?? "tool");
+			appendProgressLog(progress, summarizeToolCall(name, (event.args as Record<string, unknown>) ?? {}), true);
 			progress.toolCallCount++;
 			progress.toolCalls.push({
 				name,
@@ -1771,12 +1782,22 @@ function parseEventLine(progress: Progress, raw: string): void {
 						};
 					}
 				| undefined;
+			// Compact RPC logs omit successful tool_execution_end payloads, but
+			// retain the corresponding toolResult message once.
+			if (message?.role === "toolResult") {
+				for (const block of message.content ?? []) {
+					if (block.type === "text" && block.text) appendProgressLog(progress, block.text, true);
+				}
+			}
 			if (message?.role === "assistant") {
 				const text = (message.content ?? [])
 					.filter((content) => content.type === "text" && content.text)
 					.map((content) => content.text)
 					.join("");
-				if (text.trim()) progress.finalText = clip(text, ANSWER_MAX_BYTES);
+				if (text.trim()) {
+					if (!progress.streamingText) appendProgressLog(progress, text, true);
+					progress.finalText = clip(text, ANSWER_MAX_BYTES);
+				}
 				if (message.stopReason === "error") {
 					progress.errorMsg = message.errorMessage || "subagent model request failed";
 				}
@@ -2368,7 +2389,7 @@ function renderWidgetSessionHeader(
 
 // How many trailing output lines to show per session in the widget.
 const WIDGET_COLLAPSED_TAIL_LINES = 1;
-const WIDGET_EXPANDED_TAIL_LINES = 20;
+const WIDGET_EXPANDED_TAIL_LINES = 50;
 const WIDGET_SESSION_PAGE_SIZE = 10;
 
 export interface WidgetSessionListState {
@@ -2565,10 +2586,12 @@ export function widgetTail(
 		raw = readTailLines(logPath(id), lines);
 	} else {
 		const progress = subagentProgress ?? taskProgressOf(id).progress;
-		if (progress.streamingText.trim()) {
-			raw = progress.streamingText.trim().split("\n");
+		if (progress.logText) {
+			raw = progress.logText.split("\n");
+		} else if (progress.streamingText.trim()) {
+			raw = progress.streamingText.split("\n");
 		} else if (progress.finalText.trim()) {
-			raw = progress.finalText.trim().split("\n");
+			raw = progress.finalText.split("\n");
 		} else if (progress.toolCalls.length > 0) {
 			raw = progress.toolCalls.map((tool) => tool.summary);
 		} else {
@@ -2577,7 +2600,6 @@ export function widgetTail(
 	}
 	return raw
 		.map(sanitizeTailLine)
-		.filter((line) => line.trim().length > 0)
 		.slice(-lines);
 }
 

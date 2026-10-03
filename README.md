@@ -88,8 +88,11 @@ ten per page; `< 1/4 >` shows the current/total page when needed. Click the
 arrows to page. Collapsed rows occupy one line, previewing the command for
 processes and the task for agents (with `…` when clipped). Click a row for the
 complete wrapped command or task; agent rows also show their RPC worker launch
-argv (bold, readable text rather than a copy-paste shell command), and up to 20
-output lines. Expanded output lines wrap without a 100-character cutoff.
+argv (bold, readable text rather than a copy-paste shell command), and up to 50
+output lines. Agent output retains recent RPC text, tool calls, and tool results
+in chronological order instead of showing only the latest message. Blank lines
+and surrounding whitespace are preserved. Expanded output lines wrap without a
+100-character cutoff.
 Opening another row closes the previous
 one. A session with no available output shows an explicit placeholder when
 expanded. Mouse clicks
