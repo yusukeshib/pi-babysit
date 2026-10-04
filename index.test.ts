@@ -2220,6 +2220,8 @@ test("GC removes only old roots without live supervisors", () => {
 	createRoot("stale-running", "running", 99_999_999, 30);
 	const locked = createRoot("locked", "exited", 0, 30);
 	writeFileSync(path.join(locked, ".pi-babysit-gc.lock"), "busy");
+	const lockedAt = new Date(now - 30 * 86_400_000);
+	utimesSync(locked, lockedAt, lockedAt);
 	createRoot("live", "running", process.pid, 30);
 	createRoot("child-live", "running", 99_999_999, 30, process.pid);
 	const leased = createRoot("leased", "exited", 0, 30);
@@ -2463,7 +2465,14 @@ test("attached foreground abort terminates while detached foreground abort prese
 		ctx,
 	);
 	expect(attachedStatus.details.status.state).not.toBe("running");
-	expect(attachedStatus.details.status.child_pid).toBeNull();
+	const binary = process.env.PI_BABYSIT_CLI ?? "babysit";
+	const root = path.dirname(path.dirname(path.dirname(attached.details.logPath)));
+	const persisted = spawnSync(binary, ["status", "-s", attached.details.id, "--json"], {
+		encoding: "utf8",
+		env: { ...process.env, BABYSIT_DIR: root },
+	});
+	expect(persisted.status).toBe(0);
+	expect(JSON.parse(persisted.stdout).status.child_pid).toBeNull();
 
 	const detached = await runWithAbort("detached");
 	try {
@@ -2490,14 +2499,16 @@ test("attached foreground abort terminates while detached foreground abort prese
 
 test("babysit_kill returns success only after terminal state is persisted", async () => {
 	const binary = process.env.PI_BABYSIT_CLI ?? "babysit";
-	const root = process.env.PI_BABYSIT_DIR ?? path.join(os.homedir(), ".pi-babysit");
-	const started = spawnSync(
-		binary,
-		["run", "-d", "--json", "--no-tty", "--", "sh", "-c", "sleep 60"],
-		{ encoding: "utf8", env: { ...process.env, BABYSIT_DIR: root } },
+	const started = await tools.get("babysit_run").execute(
+		"start-for-kill-test",
+		{ name: `kill-test-${Date.now()}-${sequence++}`, command: "sleep 60", pty: false, continueAfterStart: true },
+		undefined,
+		undefined,
+		interactiveCtx,
 	);
-	expect(started.status).toBe(0);
-	const id = JSON.parse(started.stdout).id as string;
+	expect(started.isError).not.toBe(true);
+	const id = started.details.id as string;
+	const root = path.dirname(path.dirname(path.dirname(started.details.logPath)));
 	try {
 		const result = await tools.get("babysit_kill").execute(
 			"test",

@@ -575,9 +575,16 @@ function markAutomaticGc(now = new Date()): void {
 	}
 }
 
-function scanTreeStats(root: string): { bytes: number; newestMtimeMs: number } {
+function scanTreeStats(root: string, rootMtimeMs?: number): { bytes: number; newestMtimeMs: number } {
 	let bytes = 0;
-	let newestMtimeMs = 0;
+	let newestMtimeMs: number;
+	try {
+		// The collector's own lock file updates the root mtime; use the
+		// pre-lock age when rescanning, but still include fresh descendants.
+		newestMtimeMs = rootMtimeMs ?? fs.lstatSync(root).mtimeMs;
+	} catch {
+		return { bytes: 0, newestMtimeMs: Infinity };
+	}
 	const pending = [root];
 	while (pending.length > 0) {
 		const current = pending.pop() as string;
@@ -749,7 +756,7 @@ export function gcBabysitRoots(options: {
 				result.skippedLive.push(entry.name);
 				continue;
 			}
-			const refreshedStats = scanTreeStats(root);
+			const refreshedStats = scanTreeStats(root, stats.newestMtimeMs);
 			if (now - refreshedStats.newestMtimeMs < options.olderThanMs) continue;
 			tombstone = path.join(
 				options.rootBase,
