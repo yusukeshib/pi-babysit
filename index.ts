@@ -45,6 +45,7 @@ import type {
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { createLogViewer } from "./log-viewer";
+import { FileLogSource } from "./log-source";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2521,12 +2522,13 @@ export function createSessionWidget(options: {
 	getHeight: () => number;
 	requestRender: () => void;
 	getTheme: () => Theme;
-	readLog: (id: string) => { text: string; isAgent: boolean; clipped?: boolean; lineTimestamps?: (number | undefined)[] };
+	readLog: (id: string) => { text?: string; file?: string; isAgent: boolean; clipped?: boolean; lineTimestamps?: (number | undefined)[] };
 }) {
 	const listState: WidgetSessionListState = { mode: "running", page: 0 };
 	let selectedId: string | undefined;
 	let displays: WidgetSessionDisplay[] = [];
 	let viewer: ReturnType<typeof createLogViewer> | undefined;
+	let source: FileLogSource | undefined;
 	let list = createWidgetComponent([], [], open, listState);
 	function refreshViewer() {
 		if (!selectedId || !viewer) return;
@@ -2534,20 +2536,26 @@ export function createSessionWidget(options: {
 		const session = displays.find((session) => session.id === selectedId);
 		const header = session?.header ?? selectedId;
 		const detail = session?.details?.[0] ?? "";
-		viewer.update(
-			`${log.clipped ? "[older log omitted: 1 MiB limit] " : ""}${header}`,
-			log.text,
-			log.isAgent,
-			detail.startsWith("task: ") ? detail.slice(6) : detail,
-			log.lineTimestamps,
-		);
+		const context = detail.startsWith("task: ") ? detail.slice(6) : detail;
+		if (log.file) {
+			if (!source || source.file !== log.file || source.isAgent !== log.isAgent)
+				source = new FileLogSource(log.file, log.isAgent);
+			viewer.updateSource(header, source, context);
+		} else {
+			viewer.update(header, log.text ?? "", log.isAgent, context, log.lineTimestamps);
+			source = undefined;
+		}
 	}
 	function close() {
 		selectedId = undefined;
+		viewer?.dispose();
 		viewer = undefined;
+		source = undefined;
 		options.requestRender();
 	}
 	function open(id: string) {
+		viewer?.dispose();
+		source = undefined;
 		selectedId = id;
 		viewer = createLogViewer({ ...options, onClose: close });
 		refreshViewer();
@@ -3675,7 +3683,7 @@ export default function (pi: ExtensionAPI) {
 						getTheme: () => ctx.ui.theme,
 						readLog: (id) => {
 							const isAgent = kindOf(id) === "subagent";
-							return { ...readViewerLog(logPath(id), true), isAgent };
+							return { file: logPath(id), isAgent };
 						},
 					});
 					return sessionWidget;

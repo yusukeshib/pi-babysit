@@ -649,6 +649,28 @@ test("stock widget host closes empty logs via the Close button", () => {
 	expect(render()).toEqual(list);
 });
 
+test("session widget file source reaches history older than 1 MiB", () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "babysit-widget-pages-"));
+	try {
+		const file = path.join(dir, "output.log");
+		writeFileSync(file, "old-prefix\n" + "line\n".repeat(250_000) + "latest\n");
+		const widget = createSessionWidget({
+			getHeight: () => 10, requestRender() {},
+			getTheme: () => ({ fg: (_: string, text: string) => text }) as any,
+			readLog: () => ({ file, isAgent: false }),
+		});
+		widget.open("job");
+		expect(widget.render(100).join("\n")).toContain("latest");
+		for (let i = 0; i < 30; i++) {
+			widget.handleMouse({ type: "wheel", x: 0, y: 2, wheelDelta: -100000, width: 100, height: 10 } as any);
+			widget.render(100);
+		}
+		expect(widget.render(100).join("\n")).toContain("old-prefix");
+		expect(widget.render(100).join("\n")).not.toContain("omitted");
+		expect(widget.handleKey("\x1b")).toBe(true);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("readViewerLog bounds snapshots to 1 MiB and reports clipping and missing files", () => {
 	const dir = mkdtempSync(path.join(os.tmpdir(), "babysit-viewer-"));
 	try {

@@ -11,6 +11,8 @@ import {
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 
+import { FileLogSource, type LogPage } from "./log-source";
+
 export interface LogViewerOptions {
 	getHeight: () => number;
 	requestRender: () => void;
@@ -59,6 +61,7 @@ function agentBlocks(raw: string, timestamps?: (number | undefined)[]): Block[] 
 			continue;
 		}
 		if (!e || typeof e !== "object") continue;
+		if (e.type === "agent_start") { current = undefined; toolResults.clear(); }
 		if (e.type === "message_start" && e.message?.role === "assistant")
 			current = undefined;
 		if (["message_start", "message_update", "message_end"].includes(e.type)) {
@@ -137,6 +140,19 @@ export function createLogViewer(options: LogViewerOptions) {
 		description = "",
 		isAgent = false;
 	let lineTimestamps: (number | undefined)[] | undefined;
+	let source: FileLogSource | undefined;
+	let pages: LogPage[] = [];
+	let sourceSize = 0;
+	let tailDirty = false;
+	let metadataVersion = "";
+	let adjacentPageStart: number | undefined;
+	const setPages = () => {
+		raw = pages.map((page) => page.text).join("");
+		lineTimestamps = pages.flatMap((page, i) =>
+			i < pages.length - 1 && /[\r\n]$/.test(page.text)
+				? page.lineTimestamps.slice(0, -1) : page.lineTimestamps);
+		body.invalidate();
+	};
 	let cache: string[] | undefined,
 		cacheWidth = -1,
 		cacheTheme: Theme | undefined;
@@ -150,7 +166,7 @@ export function createLogViewer(options: LogViewerOptions) {
 			const blocks = isAgent
 				? agentBlocks(raw, lineTimestamps)
 				: [{ kind: "result" as const, text: sanitize(raw, true) }];
-			const lines: string[] = description
+			const lines: string[] = description && (!source || pages[0]?.start === 0)
 				? [
 						theme.fg("muted", isAgent ? "[task]" : "[command]"),
 						...new Text(sanitize(description), 0, 0).render(width),
@@ -212,13 +228,7 @@ export function createLogViewer(options: LogViewerOptions) {
 			}
 			if (!blocks.some((block) => block.text.trim()))
 				lines.push(theme.fg("muted", "(no output available)"));
-			cache =
-				lines.length > 2000
-					? [
-							theme.fg("warning", "[Earlier log lines clipped]"),
-							...lines.slice(-1999),
-						]
-					: lines;
+			cache = lines;
 			cacheWidth = width;
 			cacheTheme = theme;
 			return cache;
@@ -262,7 +272,7 @@ export function createLogViewer(options: LogViewerOptions) {
 	const footer: Component = {
 		invalidate() {},
 		render: (width) => [
-			options.getTheme().fg("dim", truncateToWidth("↑↓ · Esc close", width)),
+			options.getTheme().fg("dim", truncateToWidth(source ? `↑↓ · bytes ${pages[0]?.start ?? 0}–${pages.at(-1)?.end ?? 0}/${source.size} (window) · Esc close` : "↑↓ · Esc close", width)),
 		],
 	};
 	let geometry = {
@@ -281,8 +291,74 @@ export function createLogViewer(options: LogViewerOptions) {
 			width = Math.max(0, Math.floor(width));
 			const height = Math.max(0, Math.floor(options.getHeight()) - 2);
 			const contentWidth = Math.max(0, width - 1);
-			const lines = body.render(Math.max(1, contentWidth));
+			const renderWidth = Math.max(1, contentWidth);
+			let lines = body.render(renderWidth);
 			scrollView.updateLayout(lines.length, height, options.requestRender);
+			const followAtEof = source && pages.at(-1)?.end === source.size && scrollView.isFollowingEnd;
+			if (source && tailDirty && scrollView.scrollTop + height >= lines.length) {
+				const anchor = scrollView.scrollTop;
+				pages[pages.length - 1] = source.after(pages.at(-1)!.start);
+				tailDirty = false; setPages(); lines = body.render(renderWidth);
+				scrollView.updateLayout(lines.length, height, options.requestRender);
+				scrollView.scrollTo(anchor, { disableFollow: true });
+			}
+			if (source && pages.length && height > 0) {
+				const top = scrollView.scrollTop;
+				const first = pages[0], last = pages[pages.length - 1];
+				if (top === 0 && first.start > 0) {
+					const page = source.before(first.start);
+					if (page.start < first.start) {
+						adjacentPageStart = page.start;
+						pages.unshift(page); setPages();
+						const anchor = top + body.render(renderWidth).length - lines.length;
+						lines = body.render(renderWidth);
+						scrollView.updateLayout(lines.length, height, options.requestRender);
+						if (followAtEof) scrollView.scrollToEnd();
+						else scrollView.scrollTo(anchor, { disableFollow: true });
+					}
+				} else if (top + height >= lines.length && last.end < source.size) {
+					const page = source.after(last.end);
+					if (page.end > last.end) {
+						adjacentPageStart = page.start;
+						pages.push(page); setPages();
+						const anchor = top;
+						lines = body.render(renderWidth);
+						scrollView.updateLayout(lines.length, height, options.requestRender);
+						scrollView.scrollTo(anchor, { disableFollow: true });
+					}
+				}
+			}
+			// A resize may make formerly visible pages evictable. Keep only the
+			// small window plus pages that actually intersect the viewport.
+			while (source && pages.length > 3) {
+				const top = scrollView.scrollTop;
+				const first = pages.shift()!; setPages();
+				let next = body.render(renderWidth);
+				const delta = lines.length - next.length;
+				if (top >= delta && first.start !== adjacentPageStart) {
+					lines = next;
+					scrollView.updateLayout(lines.length, height, options.requestRender);
+					if (followAtEof) scrollView.scrollToEnd();
+					else scrollView.scrollTo(top - delta, { disableFollow: true });
+					continue;
+				}
+				pages.unshift(first);
+				const last = pages.pop()!; setPages(); next = body.render(renderWidth);
+				if (top + height <= next.length && last.start !== adjacentPageStart) {
+					lines = next;
+					scrollView.updateLayout(lines.length, height, options.requestRender);
+					if (followAtEof) scrollView.scrollToEnd();
+					else scrollView.scrollTo(top, { disableFollow: true });
+					continue;
+				}
+				pages.push(last); setPages(); lines = body.render(renderWidth);
+				break;
+			}
+			if (source && source.size === 0 && raw) {
+				pages = [source.before()]; tailDirty = false; setPages();
+				lines = body.render(renderWidth);
+				scrollView.updateLayout(lines.length, height, options.requestRender);
+			}
 			const visible = lines.slice(
 				scrollView.scrollTop,
 				scrollView.scrollTop + height,
@@ -370,7 +446,37 @@ export function createLogViewer(options: LogViewerOptions) {
 		invalidate() {
 			body.invalidate();
 		},
+		dispose() { source?.dispose(); source = undefined; pages = []; raw = ""; body.invalidate(); },
+		updateSource(nextHeader: string, nextSource: FileLogSource, context = "") {
+			header = nextHeader;
+			const changed = source !== nextSource;
+			if (changed) { source?.dispose(); pages = []; }
+			source = nextSource;
+			const reset = source.refresh();
+			isAgent = source.isAgent;
+			if (description !== context) body.invalidate();
+			description = context;
+			if (changed || reset || !pages.length) {
+				adjacentPageStart = undefined;
+				tailDirty = false;
+				pages = [source.before()]; setPages(); scrollView.scrollToEnd();
+			} else if (source.size !== sourceSize) {
+				if (scrollView.isFollowingEnd && pages.at(-1)?.end === sourceSize) {
+					tailDirty = false;
+					pages = [source.before()]; setPages(); scrollView.scrollToEnd();
+				} else if (pages.at(-1)?.end === sourceSize) {
+					tailDirty = true;
+				}
+			}
+			if (metadataVersion !== source.metadataVersion && !changed && !reset) {
+				pages = pages.map(page => source!.retime(page)); setPages();
+			}
+			metadataVersion = source.metadataVersion;
+			sourceSize = source.size;
+			options.requestRender();
+		},
 		update(nextHeader: string, logText: string, agent: boolean, context = "", timestamps?: (number | undefined)[]) {
+			if (source) { source.dispose(); source = undefined; pages = []; }
 			header = nextHeader;
 			if (raw !== logText || isAgent !== agent || description !== context ||
 				JSON.stringify(lineTimestamps) !== JSON.stringify(timestamps)) {

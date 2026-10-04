@@ -106,9 +106,17 @@ first content line; streamed updates and duplicate results keep that time. This
 is the time babysit received the first byte of the event or line, not an
 application event time. Narrow views place the date above the text. Old logs and
 lines without capture metadata remain readable without invented timestamps.
-Only the selected log is loaded, bounded to the latest 1 MiB / 2,000 display
-lines with an omission notice; the full log file is unchanged. Empty logs show
-a placeholder. Works in the released Pi 1.0 widget host. Mouse interaction
+Only the selected log is loaded: the viewer starts at the tail and lazily reads
+older/newer pages as you scroll to the loaded window's edges. The scrollbar
+represents that window, not the entire file; the footer shows its byte range.
+Normally a small sliding window of roughly 64 KiB pages is retained. Page limits
+are soft for oversized records and individual assistant-response/tool-result
+groups (streaming snapshots and duplicate results stay together), and for pages
+intersecting the viewport. Agent tasks are split at assistant-message boundaries,
+not loaded as a whole; older logs lacking those events can form larger groups.
+All saved history remains reachable, with no log records discarded or modified.
+Capture-time sidecars are sought by byte range rather than read in full. Empty
+logs show a placeholder. Works in the released Pi 1.0 widget host. Mouse interaction
 requires fullscreen mode; `/babysit view` opens the viewer using a keyboard
 picker, and `/babysit` still provides a snapshot. The displayed `age` is total
 session age, not time spent in the current state. Transcript details

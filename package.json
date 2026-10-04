@@ -21,6 +21,7 @@
   "files": [
     "index.ts",
     "log-viewer.ts",
+    "log-source.ts",
     "agents.ts",
     "self-reap.ts",
     "format-stream.mjs",

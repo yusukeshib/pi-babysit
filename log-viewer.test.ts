@@ -374,7 +374,7 @@ describe("stock Container log viewer", () => {
 			expect(lines.join("\n")).not.toContain("\x1b[2J");
 		}
 	});
-	test("display clipping explicitly reported", () => {
+	test("snapshot history beyond 2,000 lines remains reachable", () => {
 		const { viewer } = setup();
 		viewer.update(
 			"large",
@@ -383,6 +383,7 @@ describe("stock Container log viewer", () => {
 		);
 		viewer.render(30);
 		viewer.scrollView.scrollToStart();
-		expect(plain(viewer.render(30))).toContain("Earlier log lines clipped");
+		expect(plain(viewer.render(30))).toContain("0");
+		expect(plain(viewer.render(30))).not.toContain("clipped");
 	});
 });
