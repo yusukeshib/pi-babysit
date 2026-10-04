@@ -665,6 +665,50 @@ test("readViewerLog bounds snapshots to 1 MiB and reports clipping and missing f
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("readViewerLog maps capture chunks to UTF-8, CRLF, partial and uncovered lines", () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "babysit-times-"));
+	try {
+		const file = path.join(dir, "output.log");
+		writeFileSync(file, "日本\r\npartial\rnext\nuntimed");
+		const sidecar = path.join(dir, "output.timestamps.jsonl");
+		expect(readViewerLog(file, true).lineTimestamps).toEqual([undefined, undefined, undefined, undefined]);
+		writeFileSync(sidecar, [
+			[0, 9, 1000], [9, 9, 2000], [18, 2, 3000],
+			[20, 2, -1], [20, 2, "invalid"], [20, 2, 9e20],
+		].map((record) => JSON.stringify(record)).join("\n") + '\nmalformed\n[20,');
+		expect(readViewerLog(file, true).lineTimestamps).toEqual([1000, 1000, 2000, undefined]);
+		// Metadata can arrive after the raw log snapshot without changing its text.
+		writeFileSync(sidecar, JSON.stringify([0, 27, 4000]) + "\n");
+		expect(readViewerLog(file, true).lineTimestamps).toEqual([4000, 4000, 4000, 4000]);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("session widget passes process capture timestamps to its viewer", () => {
+	const time = new Date(2026, 6, 17, 14, 32, 8).getTime();
+	const widget = createSessionWidget({
+		getHeight: () => 10, requestRender() {},
+		getTheme: () => ({ fg: (_: string, text: string) => text }) as any,
+		readLog: () => ({ text: "captured", isAgent: false, lineTimestamps: [time] }),
+	});
+	widget.open("job");
+	expect(widget.render(80).join("\n")).toContain("[2026-07-17 14:32:08] captured");
+});
+
+test("readViewerLog timestamps use absolute byte offsets after tail clipping", () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "babysit-times-tail-"));
+	try {
+		const file = path.join(dir, "output.log");
+		const prefix = "old\n".repeat(270_000);
+		writeFileSync(file, prefix + "latest\n");
+		writeFileSync(path.join(dir, "output.timestamps.jsonl"),
+			JSON.stringify([prefix.length, 7, 1234]) + "\n");
+		const log = readViewerLog(file, true);
+		expect(log.clipped).toBe(true);
+		expect(log.lineTimestamps?.slice(-2)).toEqual([1234, undefined]);
+		expect(log.lineTimestamps?.[0]).toBeUndefined();
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("process widget truncates every rendered line to the available width", () => {
 	const component = createWidgetComponent(
 		["123456789"],

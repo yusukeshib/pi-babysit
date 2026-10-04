@@ -2521,7 +2521,7 @@ export function createSessionWidget(options: {
 	getHeight: () => number;
 	requestRender: () => void;
 	getTheme: () => Theme;
-	readLog: (id: string) => { text: string; isAgent: boolean; clipped?: boolean };
+	readLog: (id: string) => { text: string; isAgent: boolean; clipped?: boolean; lineTimestamps?: (number | undefined)[] };
 }) {
 	const listState: WidgetSessionListState = { mode: "running", page: 0 };
 	let selectedId: string | undefined;
@@ -2539,6 +2539,7 @@ export function createSessionWidget(options: {
 			log.text,
 			log.isAgent,
 			detail.startsWith("task: ") ? detail.slice(6) : detail,
+			log.lineTimestamps,
 		);
 	}
 	function close() {
@@ -2571,8 +2572,44 @@ export function createSessionWidget(options: {
 	};
 }
 
+/** Capture times are optional: old logs and incomplete sidecars remain readable. */
+function readLineTimestamps(file: string, data: Buffer, offset: number): (number | undefined)[] {
+	const metadata = readViewerLog(path.join(path.dirname(file), "output.timestamps.jsonl")).text;
+	const ranges: { start: number; end: number; time: number }[] = [];
+	for (const line of metadata.split("\n")) {
+		try {
+			const record = JSON.parse(line);
+			if (!Array.isArray(record) || record.length !== 3) continue;
+			const [start, length, time] = record;
+			if (!Number.isSafeInteger(start) || start < 0 ||
+				!Number.isSafeInteger(length) || length <= 0 ||
+				!Number.isSafeInteger(start + length) ||
+				!Number.isSafeInteger(time) || time < 0 || time > 8640000000000000 ||
+				start < (ranges.at(-1)?.end ?? 0)) continue;
+			ranges.push({ start, end: start + length, time });
+		} catch { /* A partial or malformed record has no trustworthy time. */ }
+	}
+	let range = 0;
+	const timestamps: (number | undefined)[] = [];
+	const addLine = (position: number) => {
+		const absolute = offset + position;
+		while (range < ranges.length && ranges[range].end <= absolute) range++;
+		const entry = ranges[range];
+		timestamps.push(position < data.length && entry && entry.start <= absolute ? entry.time : undefined);
+	};
+	addLine(0);
+	for (let i = 0; i < data.length; i++) {
+		if (data[i] !== 10 && data[i] !== 13) continue;
+		if (data[i] === 13 && data[i + 1] === 10) i++;
+		addLine(i + 1);
+	}
+	return timestamps;
+}
+
 /** Only the selected session is read; bounded snapshots never affect worker logs. */
-export function readViewerLog(file: string): { text: string; clipped: boolean } {
+export function readViewerLog(file: string, withTimestamps = false): {
+	text: string; clipped: boolean; lineTimestamps?: (number | undefined)[];
+} {
 	try {
 		const fd = fs.openSync(file, "r");
 		try {
@@ -2580,9 +2617,18 @@ export function readViewerLog(file: string): { text: string; clipped: boolean } 
 			const start = Math.max(0, size - 1024 * 1024);
 			const buffer = Buffer.alloc(size - start);
 			const bytes = fs.readSync(fd, buffer, 0, buffer.length, start);
-			let text = buffer.subarray(0, bytes).toString("utf8");
-			if (start > 0) text = text.slice(text.indexOf("\n") + 1);
-			return { text, clipped: start > 0 };
+			let data = buffer.subarray(0, bytes);
+			let offset = start;
+			if (start > 0) {
+				const skip = data.indexOf(10) + 1;
+				data = data.subarray(skip);
+				offset += skip;
+			}
+			const text = data.toString("utf8");
+			return {
+				text, clipped: start > 0,
+				...(withTimestamps ? { lineTimestamps: readLineTimestamps(file, data, offset) } : {}),
+			};
 		} finally { fs.closeSync(fd); }
 	} catch {
 		return { text: "", clipped: false };
@@ -3627,7 +3673,10 @@ export default function (pi: ExtensionAPI) {
 						getHeight: () => Math.max(3, tui.terminal.rows - 8),
 						requestRender: () => tui.requestRender(),
 						getTheme: () => ctx.ui.theme,
-						readLog: (id) => ({ ...readViewerLog(logPath(id)), isAgent: kindOf(id) === "subagent" }),
+						readLog: (id) => {
+							const isAgent = kindOf(id) === "subagent";
+							return { ...readViewerLog(logPath(id), !isAgent), isAgent };
+						},
 					});
 					return sessionWidget;
 				}, { placement: "belowEditor" });

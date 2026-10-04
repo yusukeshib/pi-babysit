@@ -118,11 +118,18 @@ function agentBlocks(raw: string): Block[] {
 		.map((b) => ({ ...b, text: sanitize(b.text) }));
 }
 
+function dateLabel(timestamp: number): string {
+	const date = new Date(timestamp);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `[${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}]`;
+}
+
 export function createLogViewer(options: LogViewerOptions) {
 	let header = "",
 		raw = "",
 		description = "",
 		isAgent = false;
+	let lineTimestamps: (number | undefined)[] | undefined;
 	let cache: string[] | undefined,
 		cacheWidth = -1,
 		cacheTheme: Theme | undefined;
@@ -144,6 +151,22 @@ export function createLogViewer(options: LogViewerOptions) {
 					]
 				: [];
 			for (const b of blocks) {
+				if (!isAgent && lineTimestamps?.some((time) => time !== undefined)) {
+					for (const [index, text] of raw.split(/\r\n|\r|\n/).entries()) {
+						const time = lineTimestamps[index];
+						const label = time === undefined ? "" : dateLabel(time);
+						const indent = label ? visibleWidth(label) + 1 : 0;
+						if (indent && width <= indent + 4) {
+							lines.push(...new Text(theme.fg("muted", label), 0, 0).render(width));
+							lines.push(...new Text(sanitize(text, true), 0, 0).render(width));
+						} else {
+							const wrapped = new Text(sanitize(text, true), 0, 0).render(width - indent);
+							lines.push(...wrapped.map((line, row) =>
+								(row === 0 && label ? theme.fg("muted", label) + " " : " ".repeat(indent)) + line));
+						}
+					}
+					continue;
+				}
 				if (isAgent)
 					lines.push(
 						theme.fg(
@@ -321,9 +344,11 @@ export function createLogViewer(options: LogViewerOptions) {
 		invalidate() {
 			body.invalidate();
 		},
-		update(nextHeader: string, logText: string, agent: boolean, context = "") {
+		update(nextHeader: string, logText: string, agent: boolean, context = "", timestamps?: (number | undefined)[]) {
 			header = nextHeader;
-			if (raw !== logText || isAgent !== agent || description !== context) {
+			if (raw !== logText || isAgent !== agent || description !== context ||
+				JSON.stringify(lineTimestamps) !== JSON.stringify(timestamps)) {
+				lineTimestamps = timestamps;
 				raw = logText;
 				isAgent = agent;
 				description = context;

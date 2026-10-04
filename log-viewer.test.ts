@@ -287,6 +287,52 @@ describe("stock Container log viewer", () => {
 			expect(plain(viewer.render(40))).toContain("(no output available)");
 		}
 	});
+	test("process capture dates are local, muted and wrapped at the text column", () => {
+		const { viewer, resize } = setup();
+		resize(20);
+		const time = new Date(2026, 6, 17, 14, 32, 8).getTime();
+		viewer.update("process", "\x1b[31mabcdefghijklmno\x1b[0m\nlegacy", false, "", [time, undefined]);
+		const rendered = viewer.render(33);
+		const lines = rendered.map(stripTerminalSequences);
+		expect(lines.some((line) => line.startsWith("[2026-07-17 14:32:08] abcdefghij"))).toBe(true);
+		expect(lines.some((line) => line.startsWith(" ".repeat(22) + "klmno"))).toBe(true);
+		expect(plain(rendered)).toContain("legacy");
+		expect(rendered.find((line) => line.includes("2026-07-17"))).toContain(theme.fg("muted", "[2026-07-17 14:32:08]"));
+	});
+	test("timestamp-only updates invalidate cached output and old logs remain unchanged", () => {
+		const { viewer, resize } = setup();
+		resize(20);
+		viewer.update("process", "same output", false);
+		expect(plain(viewer.render(60))).not.toContain("2026-");
+		viewer.update("process", "same output", false, "", [new Date(2026, 0, 2).getTime()]);
+		expect(plain(viewer.render(60))).toContain("[2026-01-02 00:00:00] same output");
+		viewer.update("process", "same output", false);
+		expect(plain(viewer.render(60))).not.toContain("2026-");
+	});
+	test("timestamped logs retain scroll position and follow appended output", () => {
+		const { viewer } = setup();
+		const rows = Array.from({ length: 30 }, (_, i) => `line-${i}`);
+		const times = rows.map(() => 1000);
+		viewer.update("process", rows.join("\n"), false, "", times);
+		expect(plain(viewer.render(80))).toContain("line-29");
+		viewer.scrollView.scrollToStart();
+		rows.push("line-30"); times.push(2000);
+		viewer.update("process", rows.join("\n"), false, "", times);
+		expect(plain(viewer.render(80))).toContain("line-0");
+		expect(viewer.scrollView.scrollTop).toBe(0);
+		viewer.scrollView.scrollToEnd();
+		expect(plain(viewer.render(80))).toContain("line-30");
+	});
+	test("timestamped output remains safe and within narrow viewport widths", () => {
+		const { viewer, resize } = setup();
+		resize(100);
+		viewer.update("process", "hello\x1b[2J\r\n世界\rprogress", false, "", [0, 0, 0]);
+		for (const width of [2, 12, 25, 40]) {
+			const lines = viewer.render(width);
+			expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+			expect(lines.join("\n")).not.toContain("\x1b[2J");
+		}
+	});
 	test("display clipping explicitly reported", () => {
 		const { viewer } = setup();
 		viewer.update(

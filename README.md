@@ -98,6 +98,11 @@ Pi's transcript shortcuts. At the bottom it follows new output; scrolling up
 pauses following until you return to the bottom. The viewer resizes with the
 terminal, leaving room for the editor/status/footer. Agent logs separate
 assistant text, tool calls, and results; process logs show terminal output.
+When babysit provides `output.timestamps.jsonl`, process lines begin with a muted
+local `[YYYY-MM-DD HH:mm:ss]` capture time, with wrapped text aligned beneath the
+message. This is the time babysit received the first byte of the line, not an
+application event time. Narrow views place the date above the text. Old logs and
+lines without capture metadata remain readable without invented timestamps.
 Only the selected log is loaded, bounded to the latest 1 MiB / 2,000 display
 lines with an omission notice; the full log file is unchanged. Empty logs show
 a placeholder. Works in the released Pi 1.0 widget host. Mouse interaction
