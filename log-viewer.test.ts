@@ -316,10 +316,10 @@ describe("stock Container log viewer", () => {
 		viewer.update("agent", raw, true, "", events.map((_, i) => time + i * 1000));
 		const renderedText = () => viewer.render(80).map((line) => stripTerminalSequences(line).replace(/[\s┃│]+$/, "")).join("\n");
 		const text = renderedText();
-		expect(text).toContain("[2026-07-17 14:32:09]\n[assistant]");
-		expect(text).toContain("[2026-07-17 14:32:11]\n[tool]");
-		expect(text).toContain("[2026-07-17 14:32:12]\n[result]");
-		expect(text).toContain("[2026-07-17 14:32:14]\n[error]");
+		expect(text).toContain("[2026-07-17 14:32:09] [assistant] Hello world");
+		expect(text).toContain("[2026-07-17 14:32:11] [tool] read {}");
+		expect(text).toContain("[2026-07-17 14:32:12] [result] result");
+		expect(text).toContain("[2026-07-17 14:32:14] [error] failure");
 		expect(text.match(/Hello world/g)).toHaveLength(1);
 		expect(text.match(/\[result\]/g)).toHaveLength(1);
 		expect(text).not.toContain("2026-07-17 14:32:13");
@@ -328,7 +328,17 @@ describe("stock Container log viewer", () => {
 		viewer.update("agent", raw, true);
 		expect(plain(viewer.render(80))).not.toContain("2026-");
 		viewer.update("agent", raw, true, "", [undefined, undefined, time]);
-		expect(renderedText()).toContain("[2026-07-17 14:32:08]\n[assistant]");
+		expect(renderedText()).toContain("[2026-07-17 14:32:08] [assistant] Hello world");
+	});
+	test("agent multiline content puts capture dates beside every line", () => {
+		const { viewer, resize } = setup();
+		resize(30);
+		const raw = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first line\n\nsecond line" }] } });
+		viewer.update("agent", raw, true, "", [new Date(2026, 6, 17, 14, 32, 8).getTime()]);
+		const lines = viewer.render(80).map(stripTerminalSequences);
+		expect(lines.some((line) => line.startsWith("[2026-07-17 14:32:08] [assistant] first line"))).toBe(true);
+		expect(lines.some((line) => line.startsWith("[2026-07-17 14:32:08] " + " ".repeat(12) + "second line"))).toBe(true);
+		expect(lines.some((line) => /^\[assistant\]/.test(line))).toBe(false);
 	});
 	test("timestamp-only updates invalidate cached output and old logs remain unchanged", () => {
 		const { viewer, resize } = setup();

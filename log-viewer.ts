@@ -174,9 +174,25 @@ export function createLogViewer(options: LogViewerOptions) {
 					}
 					continue;
 				}
+				if (isAgent && b.timestamp !== undefined) {
+					const date = theme.fg("muted", dateLabel(b.timestamp));
+					const kind = theme.fg(b.kind === "error" ? "error" : b.kind === "assistant" ? "accent" : "toolTitle", `[${b.kind}]`);
+					const indent = visibleWidth(date) + 1;
+					const kindIndent = visibleWidth(kind) + 1;
+					if (width <= indent + kindIndent + 4) {
+						lines.push(...new Text(date, 0, 0).render(width));
+						lines.push(...new Text(`${kind} ${b.text}`, 0, 0).render(width));
+					} else {
+						const contentWidth = width - indent - kindIndent;
+						const rendered = b.kind === "assistant"
+							? new Markdown(b.text, 0, 0, getMarkdownTheme()).render(contentWidth)
+							: new Text(b.text, 0, 0).render(contentWidth);
+						lines.push(...rendered.map((line, row) =>
+							`${date} ${row === 0 ? kind + " " : " ".repeat(kindIndent)}${line}`));
+					}
+					continue;
+				}
 				if (isAgent) {
-					if (b.timestamp !== undefined)
-						lines.push(...new Text(theme.fg("muted", dateLabel(b.timestamp)), 0, 0).render(width));
 					lines.push(
 						theme.fg(
 							b.kind === "error"
