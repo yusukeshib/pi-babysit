@@ -299,6 +299,37 @@ describe("stock Container log viewer", () => {
 		expect(plain(rendered)).toContain("legacy");
 		expect(rendered.find((line) => line.includes("2026-07-17"))).toContain(theme.fg("muted", "[2026-07-17 14:32:08]"));
 	});
+	test("agent blocks retain first capture dates through streaming and result deduplication", () => {
+		const { viewer, resize } = setup();
+		resize(50);
+		const time = new Date(2026, 6, 17, 14, 32, 8).getTime();
+		const events = [
+			{ type: "agent_start" },
+			{ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hello" } },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hello world" }] } },
+			{ type: "tool_execution_start", toolName: "read", args: {} },
+			{ type: "tool_execution_end", toolCallId: "t", result: { content: [{ type: "text", text: "result" }] } },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "t", content: [{ type: "text", text: "result" }] } },
+			{ type: "error", message: "failure" },
+		];
+		const raw = events.map((event) => JSON.stringify(event)).join("\r\n");
+		viewer.update("agent", raw, true, "", events.map((_, i) => time + i * 1000));
+		const renderedText = () => viewer.render(80).map((line) => stripTerminalSequences(line).replace(/[\s┃│]+$/, "")).join("\n");
+		const text = renderedText();
+		expect(text).toContain("[2026-07-17 14:32:09]\n[assistant]");
+		expect(text).toContain("[2026-07-17 14:32:11]\n[tool]");
+		expect(text).toContain("[2026-07-17 14:32:12]\n[result]");
+		expect(text).toContain("[2026-07-17 14:32:14]\n[error]");
+		expect(text.match(/Hello world/g)).toHaveLength(1);
+		expect(text.match(/\[result\]/g)).toHaveLength(1);
+		expect(text).not.toContain("2026-07-17 14:32:13");
+		for (const width of [2, 12, 25])
+			expect(viewer.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
+		viewer.update("agent", raw, true);
+		expect(plain(viewer.render(80))).not.toContain("2026-");
+		viewer.update("agent", raw, true, "", [undefined, undefined, time]);
+		expect(renderedText()).toContain("[2026-07-17 14:32:08]\n[assistant]");
+	});
 	test("timestamp-only updates invalidate cached output and old logs remain unchanged", () => {
 		const { viewer, resize } = setup();
 		resize(20);

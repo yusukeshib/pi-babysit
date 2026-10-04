@@ -100,8 +100,10 @@ terminal, leaving room for the editor/status/footer. Agent logs separate
 assistant text, tool calls, and results; process logs show terminal output.
 When babysit provides `output.timestamps.jsonl`, process lines begin with a muted
 local `[YYYY-MM-DD HH:mm:ss]` capture time, with wrapped text aligned beneath the
-message. This is the time babysit received the first byte of the line, not an
-application event time. Narrow views place the date above the text. Old logs and
+message. Agent blocks show the capture time of their first available event above
+the assistant/tool/result/error label; streamed updates and duplicate results keep
+that time. This is the time babysit received the first byte of the event or line,
+not an application event time. Narrow views place the date above the text. Old logs and
 lines without capture metadata remain readable without invented timestamps.
 Only the selected log is loaded, bounded to the latest 1 MiB / 2,000 display
 lines with an omission notice; the full log file is unchanged. Empty logs show

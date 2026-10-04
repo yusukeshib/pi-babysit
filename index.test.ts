@@ -694,6 +694,23 @@ test("session widget passes process capture timestamps to its viewer", () => {
 	expect(widget.render(80).join("\n")).toContain("[2026-07-17 14:32:08] captured");
 });
 
+test("session widget passes agent capture timestamps to formatted blocks", () => {
+	const time = new Date(2026, 6, 17, 14, 32, 8).getTime();
+	const widget = createSessionWidget({
+		getHeight: () => 10, requestRender() {},
+		getTheme: () => ({ fg: (_: string, text: string) => text }) as any,
+		readLog: () => ({
+			text: JSON.stringify({ type: "tool_execution_start", toolName: "read", args: {} }),
+			isAgent: true, lineTimestamps: [time],
+		}),
+	});
+	widget.open("agent");
+	const text = widget.render(80).join("\n");
+	expect(text).toContain("[2026-07-17 14:32:08]");
+	expect(text).toContain("[tool]");
+	expect(text).toContain("read {}");
+});
+
 test("readViewerLog timestamps use absolute byte offsets after tail clipping", () => {
 	const dir = mkdtempSync(path.join(os.tmpdir(), "babysit-times-tail-"));
 	try {

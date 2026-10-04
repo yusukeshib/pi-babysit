@@ -3675,7 +3675,7 @@ export default function (pi: ExtensionAPI) {
 						getTheme: () => ctx.ui.theme,
 						readLog: (id) => {
 							const isAgent = kindOf(id) === "subagent";
-							return { ...readViewerLog(logPath(id), !isAgent), isAgent };
+							return { ...readViewerLog(logPath(id), true), isAgent };
 						},
 					});
 					return sessionWidget;

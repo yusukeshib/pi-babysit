@@ -31,7 +31,7 @@ function sanitize(text: string, sgr = false): string {
 			(s) => (sgr && /^\x1b\[[\d;]*m$/.test(s) ? s : ""),
 		);
 }
-type Block = { kind: "assistant" | "tool" | "result" | "error"; text: string };
+type Block = { kind: "assistant" | "tool" | "result" | "error"; text: string; timestamp?: number };
 function contentText(content: unknown): string {
 	if (typeof content === "string") return content;
 	return Array.isArray(content)
@@ -41,15 +41,17 @@ function contentText(content: unknown): string {
 				.join("")
 		: "";
 }
-function agentBlocks(raw: string): Block[] {
+function agentBlocks(raw: string, timestamps?: (number | undefined)[]): Block[] {
 	const blocks: Block[] = [];
 	let current: Block | undefined;
 	const toolResults = new Map<string, Block>();
-	const assistant = () =>
-		(current ??=
-			(blocks.push({ kind: "assistant", text: "" }),
-			blocks[blocks.length - 1]));
-	for (const line of raw.split("\n")) {
+	const assistant = (timestamp: number | undefined) => {
+		current ??= (blocks.push({ kind: "assistant", text: "", timestamp }), blocks[blocks.length - 1]);
+		current.timestamp ??= timestamp;
+		return current;
+	};
+	for (const [index, line] of raw.split(/\r\n|\r|\n/).entries()) {
+		const timestamp = timestamps?.[index];
 		let e: any;
 		try {
 			e = JSON.parse(line);
@@ -62,28 +64,30 @@ function agentBlocks(raw: string): Block[] {
 		if (["message_start", "message_update", "message_end"].includes(e.type)) {
 			if (e.message?.role === "assistant") {
 				const text = contentText(e.message.content);
-				const b = assistant();
+				const b = assistant(timestamp);
 				if (text) b.text = text; // cumulative/final snapshots replace streamed deltas
 				if (e.message.errorMessage)
-					blocks.push({ kind: "error", text: String(e.message.errorMessage) });
+					blocks.push({ kind: "error", text: String(e.message.errorMessage), timestamp });
 				if (e.type === "message_end") current = undefined;
 			} else if (
 				!e.message &&
 				e.assistantMessageEvent?.type === "text_delta" &&
 				typeof e.assistantMessageEvent.delta === "string"
 			) {
-				assistant().text += e.assistantMessageEvent.delta;
+				assistant(timestamp).text += e.assistantMessageEvent.delta;
 			} else if (e.type === "message_end" && e.message?.role === "toolResult") {
 				const id = e.message.toolCallId;
 				const text = contentText(e.message.content);
 				if (id && toolResults.has(id)) {
 					const b = toolResults.get(id)!;
 					b.text = text;
+					b.timestamp ??= timestamp;
 					b.kind = e.message.isError ? "error" : b.kind;
 				} else {
 					const b: Block = {
 						kind: e.message.isError ? "error" : "result",
 						text,
+						timestamp,
 					};
 					blocks.push(b);
 					if (id) toolResults.set(id, b);
@@ -93,10 +97,12 @@ function agentBlocks(raw: string): Block[] {
 			blocks.push({
 				kind: "tool",
 				text: `${e.toolName ?? "tool"} ${JSON.stringify(e.args ?? {})}`,
+				timestamp,
 			});
 		} else if (e.type === "tool_execution_end") {
 			const b: Block = {
 				kind: e.isError ? "error" : "result",
+				timestamp,
 				text:
 					contentText(e.result?.content) ||
 					String(e.error?.message ?? e.error ?? ""),
@@ -108,6 +114,7 @@ function agentBlocks(raw: string): Block[] {
 		} else if (e.type === "error")
 			blocks.push({
 				kind: "error",
+				timestamp,
 				text: String(
 					e.message ?? e.error?.message ?? e.error ?? "Unknown error",
 				),
@@ -141,7 +148,7 @@ export function createLogViewer(options: LogViewerOptions) {
 			const theme = options.getTheme();
 			if (cache && cacheWidth === width && cacheTheme === theme) return cache;
 			const blocks = isAgent
-				? agentBlocks(raw)
+				? agentBlocks(raw, lineTimestamps)
 				: [{ kind: "result" as const, text: sanitize(raw, true) }];
 			const lines: string[] = description
 				? [
@@ -167,7 +174,9 @@ export function createLogViewer(options: LogViewerOptions) {
 					}
 					continue;
 				}
-				if (isAgent)
+				if (isAgent) {
+					if (b.timestamp !== undefined)
+						lines.push(...new Text(theme.fg("muted", dateLabel(b.timestamp)), 0, 0).render(width));
 					lines.push(
 						theme.fg(
 							b.kind === "error"
@@ -178,6 +187,7 @@ export function createLogViewer(options: LogViewerOptions) {
 							`[${b.kind}]`,
 						),
 					);
+				}
 				lines.push(
 					...(b.kind === "assistant"
 						? new Markdown(b.text, 0, 0, getMarkdownTheme()).render(width)
