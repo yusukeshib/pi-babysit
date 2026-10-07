@@ -33,6 +33,7 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -186,6 +187,8 @@ interface BsSession {
 	note?: string | null;
 	output_bytes?: number;
 	screen_seq?: number | null;
+	host?: string;
+	transportError?: string;
 }
 
 // A worker whose PTY process is gone (alive:false) can still report state
@@ -215,8 +218,17 @@ function bs(
 		cwd?: string;
 		signal?: AbortSignal;
 		env?: Record<string, string | undefined>;
+		host?: string;
 	} = {},
 ): Promise<{ stdout: string; stderr: string; code: number }> {
+	const sessionIndex = args.indexOf("-s");
+	const meta = sessionIndex >= 0 ? readMeta(args[sessionIndex + 1]) : null;
+	const host = opts.host ?? meta?.host;
+	if (host && host !== "local") {
+		args = [...args];
+		if (meta?.remoteId) args[sessionIndex + 1] = meta.remoteId;
+		args.unshift("--host", host);
+	}
 	return new Promise((resolve) => {
 		if (opts.signal?.aborted) {
 			resolve({ stdout: "", stderr: "aborted", code: 130 });
@@ -238,6 +250,8 @@ function bs(
 		opts.signal?.addEventListener("abort", onAbort, { once: true });
 		child.stdout?.on("data", (d) => {
 			stdout += d.toString();
+			// Drain output but bound remote log/screen memory even for a huge single line.
+			if (host && host !== "local" && (args.includes("log") || args.includes("screenshot")) && Buffer.byteLength(stdout) > 32_000) stdout = Buffer.from(stdout).subarray(-32_000).toString("utf8");
 		});
 		child.stderr?.on("data", (d) => {
 			stderr += d.toString();
@@ -321,8 +335,8 @@ async function requireBabysit(): Promise<void> {
 // Error-aware: `babysit list` failing is NOT the same as "no sessions" —
 // callers that show state to the agent must surface the error instead of
 // silently reporting an empty registry (which reads like lost sessions).
-async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }> {
-	const r = await bs(["list", "--json"]);
+async function localSessions(host?: string): Promise<{ sessions: BsSession[]; error?: string }> {
+	const r = await bs(["list", "--json"], { host });
 	if (r.code !== 0) {
 		return {
 			sessions: [],
@@ -338,6 +352,28 @@ async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }
 	}
 }
 
+async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }> {
+	const local = await localSessions();
+	const known = remoteMetadata();
+	await Promise.all([...new Set(known.map(({ meta }) => meta.host!))].map(async (host) => {
+		const remote = await localSessions(host);
+		for (const { id, meta } of known.filter((entry) => entry.meta.host === host)) {
+			const found = remote.sessions.find((session) => session.id === meta.remoteId);
+			if (found && !remote.error) {
+				local.sessions.push({ ...found, id, host });
+				const terminalState = isConfirmedTerminalState(found.state) ? found.state : undefined;
+				if (meta.remoteTerminalState !== terminalState) {
+					writeMeta(id, { ...readMeta(id)!, remoteTerminalState: terminalState });
+				}
+			} else {
+				// Keep unresolved references active for polling/group delivery, never fabricate exit.
+				local.sessions.push({ id, host, state: "running", transportError: remote.error ?? "tracked remote session not found", note: `status unknown on ${host}: ${remote.error ?? "session not found"}` });
+			}
+		}
+	}));
+	return local;
+}
+
 async function lookupStatus(
 	id: string,
 ): Promise<{ session: BsSession | null; error?: string }> {
@@ -346,8 +382,10 @@ async function lookupStatus(
 	// status-then-list pair (two CLI subprocesses for every status lookup).
 	try {
 		const listed = await listSessions();
-		if (listed.error) return { session: null, error: listed.error };
-		return { session: listed.sessions.find((session) => session.id === id) ?? null };
+		const session = listed.sessions.find((session) => session.id === id) ?? null;
+		if (session?.transportError) return { session: null, error: `${session.host}: ${session.transportError}` };
+		if (listed.error && !readMeta(id)?.host) return { session: null, error: listed.error };
+		return { session };
 	} catch (error) {
 		return { session: null, error: error instanceof Error ? error.message : String(error) };
 	}
@@ -409,10 +447,11 @@ async function terminateRunningSessions(): Promise<void> {
 	let listed: Awaited<ReturnType<typeof listSessions>>;
 	try {
 		listed = await listSessions();
-	} catch {
+	} catch (error) {
+		console.error(`Babysit shutdown cleanup unknown: ${error instanceof Error ? error.message : String(error)}`);
 		return;
 	}
-	if (listed.error) return;
+	if (listed.error) console.error(`Local babysit shutdown cleanup unknown: ${listed.error}`);
 
 	// A namespace may contain many independent commands and agents. Terminate
 	// them concurrently so quitting Pi does not wait for serial kill timeouts.
@@ -422,7 +461,13 @@ async function terminateRunningSessions(): Promise<void> {
 			.filter((session) => session.state === "running")
 			.map(async (session) => {
 				const result = await bs(["kill", "-s", session.id, "--json"]);
-				if (result.code !== 0 || validateKillResponse(result.stdout)) return;
+				if (session.host) {
+					const terminal = await awaitConfirmedTermination(session.id);
+					if (!terminal || !isConfirmedTerminalState(terminal.state)) {
+						console.error(`Remote cleanup unverified for ${session.id} on ${session.host}: ${result.stderr || "terminal state unavailable"}`);
+						return;
+					}
+				} else if (result.code !== 0 || validateKillResponse(result.stdout)) return;
 				// A later resume of this Pi session must not turn intentional shutdown
 				// cleanup into a process-completion notification.
 				suppressNotify(session.id, "kill");
@@ -445,6 +490,9 @@ export interface SubagentBudget {
 }
 
 interface Meta {
+	host?: string;
+	remoteId?: string;
+	remoteTerminalState?: string;
 	kind: "process" | "subagent";
 	// process
 	name?: string;
@@ -493,7 +541,21 @@ interface Meta {
 }
 
 const metaDir = () => path.join(ROOT, "meta");
-const logPath = (id: string) => path.join(ROOT, "sessions", id, "output.log");
+const localLogPath = (id: string) => path.join(ROOT, "sessions", id, "output.log");
+const logPath = (id: string) => {
+	const meta = readMeta(id);
+	return meta?.host ? `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} log -s ${shq(meta.remoteId!)}` : localLogPath(id);
+};
+
+function remoteMetadata(): Array<{ id: string; meta: Meta }> {
+	try {
+		return fs.readdirSync(metaDir()).filter((file) => file.endsWith(".json")).flatMap((file) => {
+			const id = file.slice(0, -5);
+			const meta = readMeta(id);
+			return meta?.host && meta.remoteId ? [{ id, meta }] : [];
+		});
+	} catch { return []; }
+}
 
 function writeMeta(id: string, m: Meta): boolean {
 	const target = path.join(metaDir(), `${id}.json`);
@@ -630,6 +692,17 @@ function gcRootIsSafe(root: string): boolean {
 		}
 	}
 
+	// Remote PIDs are meaningless locally. Retain unresolved remote references;
+	// terminal observations are persisted by listSessions, never prune remote data.
+	try {
+		for (const file of fs.readdirSync(path.join(root, "meta"))) {
+			if (!file.endsWith(".json")) continue;
+			const meta = JSON.parse(fs.readFileSync(path.join(root, "meta", file), "utf8")) as Meta;
+			if (meta.host && (!meta.remoteTerminalState || !isConfirmedTerminalState(meta.remoteTerminalState))) return false;
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+	}
 	const sessionsDir = path.join(root, "sessions");
 	let sessionDirs: fs.Dirent[];
 	try {
@@ -1124,6 +1197,10 @@ async function searchLog(
 	signal?: AbortSignal,
 	maxBytes = TAIL_MAX_BYTES,
 ): Promise<{ text: string; error?: string }> {
+	if (readMeta(id)?.host) {
+		const result = await bs(["log", "-s", id, "--grep", pattern, "--tail", String(maxLines)], { signal });
+		return result.code === 0 ? { text: clip(result.stdout.trimEnd(), maxBytes) } : { text: "", error: result.stderr || result.stdout || "Remote log search failed" };
+	}
 	const file = logPath(id);
 	if (!fs.existsSync(file)) return { text: "", error: `Log file is missing: ${file}` };
 	if (signal?.aborted) return { text: "", error: "Log search was interrupted." };
@@ -1196,6 +1273,12 @@ async function inlineOutput(
 	status: BsSession,
 	maxBytes = INLINE_OUTPUT_MAX_BYTES,
 ): Promise<string> {
+	if (readMeta(id)?.host) {
+		const result = await bs(["log", "-s", id, "--tail", "200"]);
+		if (result.code !== 0) return `\nRemote output unavailable: ${clip(result.stderr || result.stdout, maxBytes)}`;
+		const output = clip(result.stdout.trimEnd(), maxBytes);
+		return output ? `\n\nRemote output (200 lines max):\n${output}` : "";
+	}
 	let bytes = status.output_bytes;
 	if (bytes == null) {
 		try {
@@ -1208,7 +1291,9 @@ async function inlineOutput(
 		const size = Number.isFinite(bytes) ? `${bytes} bytes` : "size unavailable";
 		return `\nOutput omitted (${size}; inline limit ${maxBytes}).`;
 	}
-	const output = (await bs(["log", "-s", id])).stdout.trimEnd();
+	const result = await bs(["log", "-s", id]);
+	if (result.code !== 0) return `\nOutput unavailable: ${clip(result.stderr || result.stdout, maxBytes)}`;
+	const output = result.stdout.trimEnd();
 	if (Buffer.byteLength(output) > maxBytes) {
 		return `\nOutput omitted (exceeds inline limit ${maxBytes} bytes).`;
 	}
@@ -1238,7 +1323,9 @@ async function selectedProcessOutput(
 		const body = result.text || `(no output matching /${selection.pattern}/)`;
 		return `\n\nSelected output /${selection.pattern}/:\n${clip(body, maxBytes)}`;
 	}
-	const tail = (await bs(["log", "-s", id, "--tail", String(lines)])).stdout.trimEnd();
+	const result = await bs(["log", "-s", id, "--tail", String(lines)], { signal });
+	if (result.code !== 0) return `\nOutput unavailable: ${clip(result.stderr || result.stdout, maxBytes)}`;
+	const tail = result.stdout.trimEnd();
 	return tail ? `\n\nSelected tail (${lines} lines max):\n${clip(tail, maxBytes)}` : "";
 }
 
@@ -1986,6 +2073,7 @@ const reservedSessionIds = new Set<string>();
 async function reserveUniqueSessionId(name: string): Promise<string> {
 	const base = name.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "proc";
 	const taken = new Set((await listSessions()).sessions.map((s) => s.id));
+	for (const { id } of remoteMetadata()) taken.add(id);
 	for (const id of reservedSessionIds) taken.add(id);
 	let id = base;
 	for (let i = 2; taken.has(id); i++) id = `${base}-${i}`;
@@ -1996,7 +2084,8 @@ async function reserveUniqueSessionId(name: string): Promise<string> {
 interface ProcOpts {
 	name?: string;
 	command: string;
-	cwd: string;
+	cwd?: string;
+	host?: string;
 	env?: Record<string, string | undefined>;
 	timeout?: string; // default: none — dev servers may run indefinitely
 	idleTimeout?: string;
@@ -2017,21 +2106,52 @@ export function processSessionEnvironment(
 	};
 }
 
+// babysit session ids are limited to 64 ASCII characters. Names stay in local
+// metadata; a fixed namespace hash plus full UUID keeps remote ids at 52 bytes.
+export function remoteProcessId(namespace: string): string {
+	return `pi-${createHash("sha256").update(namespace).digest("hex").slice(0, 12)}-${randomUUID()}`;
+}
+
+export function validateProcessHost(host?: string): void {
+	if (host && host !== "local" && (!/^[A-Za-z0-9][A-Za-z0-9_.@:\[\]-]*$/.test(host) || host.startsWith("-"))) {
+		throw new Error("Invalid host: use an SSH destination or config alias, not options or whitespace.");
+	}
+}
+
+export function remoteProcessCommand(command: string, cwd?: string, env: Record<string, string | undefined> = {}): string {
+	const assignments = Object.entries(env).filter(([key, value]) => value !== undefined && key !== "PI_SESSION_FILE" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${shq(value!)}`);
+	return `${cwd !== undefined ? `cd ${shq(cwd)} && ` : ""}exec env ${assignments.join(" ")} sh -c ${shq(command)}`;
+}
+
 async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: string }> {
+	validateProcessHost(opts.host);
+	const remote = !!opts.host && opts.host !== "local";
 	const bsArgs = ["run", "-d", "--json", "--size", "120x40"];
 	if (!opts.pty) bsArgs.push("--no-tty");
 	if (opts.timeout && opts.timeout !== "none") bsArgs.push("--timeout", opts.timeout);
 	if (opts.idleTimeout && opts.idleTimeout !== "none")
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
-	const reservedId = opts.name ? await reserveUniqueSessionId(opts.name) : undefined;
-	if (reservedId) bsArgs.push("--id", reservedId);
-	bsArgs.push("--", SHELL, "-c", opts.command);
+	const reservedId = remote ? await reserveUniqueSessionId(opts.name ?? "remote-proc") : opts.name ? await reserveUniqueSessionId(opts.name) : undefined;
+	const remoteId = remote ? remoteProcessId(ROOT) : undefined;
+	if (reservedId) bsArgs.push("--id", remoteId ?? reservedId);
+	if (remote && !writeMeta(reservedId!, { kind: "process", host: opts.host, remoteId, name: opts.name ?? reservedId, command: opts.command, notificationGroup: opts.notificationGroup, notified: false, startedAt: Date.now() })) {
+		reservedSessionIds.delete(reservedId!);
+		return { error: "Cannot persist remote identity; process was not started." };
+	}
+	bsArgs.push("--", remote ? "sh" : SHELL, "-c", remote ? remoteProcessCommand(opts.command, opts.cwd, opts.env) : opts.command);
 
 	let r: Awaited<ReturnType<typeof bs>>;
 	try {
-		r = await bs(bsArgs, { cwd: opts.cwd, env: opts.env });
+		r = await bs(bsArgs, { cwd: remote ? undefined : opts.cwd, env: remote ? undefined : opts.env, host: opts.host });
 	} finally {
 		if (reservedId) reservedSessionIds.delete(reservedId);
+	}
+	if (remote) {
+		if (r.code !== 0) return { error: `Remote launch on ${opts.host} is unverified: ${r.stderr || r.stdout}. Tracked id: ${reservedId}; use check/kill to reconcile. Do not blindly retry.` };
+		try {
+			if (JSON.parse(r.stdout).id !== remoteId) throw new Error("unexpected remote id");
+		} catch { return { error: `Remote launch response is unverified on ${opts.host}; tracked id: ${reservedId}. Use check/kill to reconcile; do not retry.` }; }
+		return { id: reservedId! };
 	}
 	if (r.code !== 0) {
 		return {
@@ -2690,6 +2810,10 @@ function readTailLines(file: string, lines: number, maxBytes = 64_000): string[]
 	}
 }
 
+const remoteTails = new Map<string, string[]>();
+// Running previews are not final. Only a successful post-terminal fetch is reusable.
+const remoteTerminalTails = new Set<string>();
+
 // Trailing lines to show for a session (sanitized, unprefixed).
 // Process tails are read directly from the bounded end of output.log, avoiding
 // one `babysit log` subprocess per visible process.
@@ -2700,6 +2824,7 @@ export function widgetTail(
 	lines = WIDGET_COLLAPSED_TAIL_LINES,
 ): string[] {
 	let raw: string[];
+	if (readMeta(id)?.host) return remoteTails.get(id) ?? ["Remote output unavailable; use babysit_check."];
 	if (!isSub) {
 		raw = readTailLines(logPath(id), lines);
 	} else {
@@ -2729,6 +2854,8 @@ export function widgetTail(
 // process interactively (detach with Ctrl-\ Ctrl-\). `/babysit` shows this as a
 // hint alongside an inline snapshot instead of spawning a tmux window itself.
 function attachCmd(id: string): string {
+	const meta = readMeta(id);
+	if (meta?.host) return `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} attach -s ${shq(meta.remoteId!)}`;
 	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} attach -s ${shq(id)}`;
 }
 
@@ -3526,6 +3653,8 @@ export default function (pi: ExtensionAPI) {
 		const notices = prepared.flatMap((notice) => {
 			const current = readMeta(notice.id);
 			if (!shouldDeliverProcessCompletion(current)) return [];
+			const latest = finalSessions.find((session) => session.id === notice.id);
+			if (!latest || latest.transportError || latest.state === "running") return [];
 			if (!isNotificationGroupReady(current, finalSessions, readMeta)) return [];
 			metadataById.set(notice.id, current);
 			return [{ ...notice, command: current.command }];
@@ -3625,6 +3754,12 @@ export default function (pi: ExtensionAPI) {
 
 		const theme = ctx.ui.theme;
 		const summaryLines = renderWidgetLines(procs, subs.length - idle, idle, theme);
+		await Promise.all(ordered.filter((session) => session.host && (session.state === "running" || !remoteTerminalTails.has(session.id))).map(async (session) => {
+			remoteTerminalTails.delete(session.id);
+			const result = await bs(["log", "-s", session.id, "--tail", String(WIDGET_COLLAPSED_TAIL_LINES)]);
+			remoteTails.set(session.id, result.code === 0 ? clip(result.stdout, TAIL_MAX_BYTES).trimEnd().split("\n").map(sanitizeTailLine) : [`Remote output unavailable on ${session.host}: ${clip(result.stderr, 200)}`]);
+			if (result.code === 0 && !session.transportError && (isConfirmedTerminalState(session.state) || session.state === "dead")) remoteTerminalTails.add(session.id);
+		}));
 		const tails = await Promise.all(
 			active.map((session) => {
 				const isSubagent = kindOf(session.id) === "subagent";
@@ -3647,11 +3782,12 @@ export default function (pi: ExtensionAPI) {
 					...(meta?.launchCommand ? [theme.bold(escapeCommandForDisplay(readableLaunchCommand(meta.launchCommand)))] : []),
 				]
 				: meta?.command ? [theme.bold(escapeCommandForDisplay(meta.command))] : [];
+			if (meta?.host) details.unshift(`host: ${meta.host}${session.transportError ? " (status unknown)" : ""} · ${attachCmd(id)}`);
 			if (session.state === "running") {
 				const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
 				return {
 					id,
-					header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme),
+					header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme) + (session.transportError ? " · status unknown" : ""),
 					tail: activeTails.get(id) ?? [],
 					viewable: true,
 					active: true,
@@ -3689,6 +3825,7 @@ export default function (pi: ExtensionAPI) {
 						requestRender: () => tui.requestRender(),
 						getTheme: () => ctx.ui.theme,
 						readLog: (id) => {
+							if (readMeta(id)?.host) return { text: `Remote full-history viewer is unavailable.\nLog: ${logPath(id)}\nTake over: ${attachCmd(id)}\n\n${(remoteTails.get(id) ?? []).join("\n")}`, isAgent: false };
 							const isAgent = kindOf(id) === "subagent";
 							return { file: logPath(id), isAgent };
 						},
@@ -3821,6 +3958,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		taskProgressCache.clear();
 		searchLogCache.clear();
+		remoteTails.clear();
+		remoteTerminalTails.clear();
 		pollNeeded = true;
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
@@ -3961,6 +4100,8 @@ export default function (pi: ExtensionAPI) {
 			return prepareBabysitRunArguments(args) as never;
 		},
 		parameters: Type.Object({
+			host: Type.Optional(Type.String({ description: "Process SSH destination/config alias (default local). Remote subagents are unsupported." })),
+			cwd: Type.Optional(Type.String({ description: "Process working directory. Remote default is login home; never inferred from local cwd." })),
 			command: Type.Optional(
 				Type.String({
 					description: "Shell command to run (process mode). Mutually exclusive with profile/task.",
@@ -4091,6 +4232,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			await requireBabysit();
 			const isSubagent = params.profile === "subagent";
+			validateProcessHost(params.host);
+			if (isSubagent && (params.cwd !== undefined || (params.host && params.host !== "local"))) throw new Error("host/cwd are process-only options; remote subagents are not supported.");
+			if (params.host && params.host !== "local" && params.retryOnWorkerDeath) throw new Error("Remote automatic launch retries are unsupported; reconcile the tracked session explicitly.");
 			if (isSubagent && !params.task) {
 				return {
 					content: [{ type: "text", text: "profile 'subagent' requires `task`." }],
@@ -4195,7 +4339,8 @@ export default function (pi: ExtensionAPI) {
 				const spawnOpts: ProcOpts = {
 					name: params.name,
 					command: params.command as string,
-					cwd: ctx.cwd,
+					host: params.host,
+					cwd: params.cwd ?? (params.host && params.host !== "local" ? undefined : ctx.cwd),
 					timeout: params.timeout,
 					idleTimeout: params.idleTimeout,
 					pty: params.pty ?? true,
@@ -4571,7 +4716,7 @@ export default function (pi: ExtensionAPI) {
 							: "";
 					const what = (kind === "subagent" ? meta?.task : meta?.command) ?? "";
 					const preview = what.length > 60 ? `${what.slice(0, 57)}…` : what;
-					return `${s.id}  [${kind}] ${s.state}${ec}${depth}${flag}${preview ? `  — ${preview}` : ""}`;
+					return `${s.id}  [${kind}${s.host ? ` host=${s.host}` : ""}] ${s.transportError ? "unknown" : s.state}${ec}${depth}${flag}${preview ? `  — ${preview}` : ""}`;
 				});
 				const hidden = sessions.length - selected.length;
 				const suffix = hidden > 0 ? `\n… ${hidden} session(s) hidden${revealHint}.` : "";
@@ -4581,7 +4726,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const st = await statusOf(params.id);
+			const lookup = await lookupStatus(params.id);
+			if (lookup.error) throw new Error(`Status unknown for ${params.id}: ${lookup.error}`);
+			const st = lookup.session;
 			if (!st) {
 				return {
 					content: [{ type: "text", text: `No such session: ${params.id}` }],
@@ -4616,7 +4763,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				const kind = meta?.kind ?? "process";
-				const header = `[${kind}] state=${st.state}\nlog: ${logPath(params.id)}`;
+				const header = `[${kind}${meta?.host ? ` host=${meta.host}` : ""}] state=${st.state}\nlog: ${logPath(params.id)}`;
 				const body = result.text
 					? `--- latest matches /${params.pattern}/ ---\n${result.text}`
 					: `(no output matching /${params.pattern}/)`;
@@ -4629,7 +4776,7 @@ export default function (pi: ExtensionAPI) {
 			// --- process ---
 			if (meta?.kind !== "subagent") {
 				const parts: string[] = [];
-				let header = `[process] state=${st.state}`;
+				let header = `[process${meta?.host ? ` host=${meta.host}` : ""}] state=${st.state}`;
 				if (st.state === "running") {
 					const el = elapsedOf(params.id);
 					if (el) header += ` elapsed=${el}`;
@@ -4641,10 +4788,13 @@ export default function (pi: ExtensionAPI) {
 				parts.push(header);
 				if (params.screen) {
 					const sc = await bs(["screenshot", "-s", params.id, "--trim"]);
+					if (sc.code !== 0) throw new Error(sc.stderr || sc.stdout || "Screenshot unavailable");
 					parts.push(`--- screen ---\n${clip(sc.stdout.trimEnd(), checkMaxBytes) || "(blank screen)"}`);
 				} else {
+					const result = await bs(["log", "-s", params.id, "--tail", String(nLines)]);
+					if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Log unavailable");
 					const tail = clip(
-						(await bs(["log", "-s", params.id, "--tail", String(nLines)])).stdout.trimEnd(),
+						result.stdout.trimEnd(),
 						checkMaxBytes,
 					);
 					parts.push(tail ? `--- recent output ---\n${tail}` : "(no output yet)");
@@ -4739,7 +4889,9 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params) {
 			await requireBabysit();
-			const st = await statusOf(params.id);
+			const lookup = await lookupStatus(params.id);
+			if (lookup.error) throw new Error(`Status unknown for ${params.id}: ${lookup.error}`);
+			const st = lookup.session;
 			if (!st || st.state !== "running") {
 				return {
 					content: [
@@ -5296,12 +5448,12 @@ export default function (pi: ExtensionAPI) {
 				// For a LIVE process show the CURRENT rendered screen (TUIs redraw in
 				// place, so the raw stream isn't representative); for a finished one
 				// the recorded tail is enough.
-				const screen = running
-					? (await bs(["screenshot", "-s", picked.id, "--trim"])).stdout.trimEnd()
-					: "";
-				const tail = (await bs(["log", "-s", picked.id, "--tail", "30"])).stdout.trimEnd();
+				const screenResult = running ? await bs(["screenshot", "-s", picked.id, "--trim"]) : undefined;
+				const screen = screenResult ? screenResult.code === 0 ? screenResult.stdout.trimEnd() : `Screen unavailable: ${screenResult.stderr || screenResult.stdout}` : "";
+				const tailResult = await bs(["log", "-s", picked.id, "--tail", "30"]);
+				const tail = tailResult.code === 0 ? tailResult.stdout.trimEnd() : `Output unavailable: ${tailResult.stderr || tailResult.stdout}`;
 				const title =
-					`${picked.id} ${picked.state}${elapsedSuffix}` +
+					`${picked.id}${meta?.host ? ` @${meta.host}` : ""} ${picked.transportError ? "unknown" : picked.state}${elapsedSuffix}` +
 					(picked.exit_code != null ? ` (exit=${picked.exit_code})` : "");
 				const body =
 					(meta?.command ? `\`${meta.command}\`\n\n` : "") +

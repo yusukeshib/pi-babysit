@@ -71,6 +71,47 @@ calls if another extension or preset re-enables `bash`, including shell
 backgrounding (`… &`, `nohup`, `setsid`, `disown`). Set
 `PI_BABYSIT_ALLOW_BASH=1` to retain direct `bash` explicitly.
 
+## Remote processes over SSH
+
+Install a `babysit` CLI with `--host` support on both machines (tested with
+local 0.14.5 and remote 0.14.6), and configure non-interactive SSH access.
+SSH aliases, keys, known hosts, and ProxyJump are handled by babysit/SSH;
+pi-babysit does not install remote software or copy credentials.
+
+```text
+babysit_run { host: "yusuke-t4", cwd: "/home/yusuke/project", command: "bun test", foreground: true, returnLines: 30 }
+babysit_run { host: "user@server", command: "python3 -i", name: "remote-repl", continueAfterStart: true }
+babysit_check { id: "remote-repl", screen: true }
+babysit_send { id: "remote-repl", text: "print(42)" }
+babysit_kill { id: "remote-repl" }
+```
+
+`host` omitted (or `"local"`) preserves local behavior. `cwd` is process-only:
+local default is Pi's cwd; remote default is the remote login home, **never**
+the local checkout. Remote commands use POSIX `sh`, with quoted cwd and Pi
+metadata environment values; the local `PI_SESSION_FILE` and shell path are
+not forwarded. Remote subagents and `retryOnWorkerDeath` are explicitly unsupported.
+
+The returned Pi id persists a host and unique, Pi-namespaced remote worker id.
+Check/send/wait/kill, PTY screens/keys, completion notifications, and mixed-host
+waits use this mapping; manual remote sessions are never adopted or killed.
+Resume the same Pi session to reconnect. Remote logs stay remote: results show
+an executable `babysit --host … log -s …` locator instead of a local file path.
+Remote output is a bounded tail (200 lines by default) or CLI `--grep` search
+(no local line numbers). The widget shows host/state and a small tail; its
+remote full-history viewer is unavailable and instead shows log/attach hints.
+
+An SSH failure is **unknown status**, not process exit. Remote workers may
+survive disconnects. An uncertain launch keeps its identity and reports the
+tracked id: reconcile it with check/kill rather than blindly retrying. Attached
+foreground interruption explicitly kills the remote worker and claims cleanup
+only after terminal-state confirmation; unreachable cleanup is reported as
+unverified. Detached waits do not own the worker. Pi quit attempts cleanup of
+tracked workers, reporting unverified remote cleanup to stderr. Local GC retains
+roots with unresolved remote identities; it never deletes/prunes remote logs.
+After reconnecting, check or kill tracked workers to establish terminal status
+before local retention can collect their metadata.
+
 ## Commands (human)
 
 | Command | What it does |
@@ -126,7 +167,8 @@ with Pi's tool-output toggle (`Ctrl+O` by default).
 ## Logs without context flooding
 
 `babysit_run`, `babysit_wait`, and automatic completion notifications always
-return lifecycle metadata and the absolute path to the complete `output.log`.
+return lifecycle metadata and the absolute path to the complete local `output.log`
+(or a remote CLI log locator for SSH processes).
 Explicit run/wait results inline complete output up to 8 KB; unsolicited
 completion notifications use a stricter 2 KB per-process output cap and an 8 KB
 aggregate message cap. Process exits observed in one poll share one message and
