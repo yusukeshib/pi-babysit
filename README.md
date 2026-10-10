@@ -98,13 +98,18 @@ waits use this mapping; manual remote sessions are never adopted or killed.
 Resume the same Pi session to reconnect. Remote logs stay remote: results show
 an executable `babysit --host … log -s …` locator instead of a local file path.
 Remote output is a bounded tail (200 lines by default) or CLI `--grep` search
-(no local line numbers). The widget shows host/state and a small tail; its
-remote full-history viewer is unavailable and instead shows log/attach hints.
+(no local line numbers). The widget shows host/state and a small tail. Opening
+a remote session in the widget viewer shows its full history: while the viewer
+is open, pi-babysit incrementally mirrors the remote raw log (`log --since
+--raw --json`) into the local session root and pages it like a local log; a
+replaced or truncated remote log rebuilds the mirror, and a finished log stops
+syncing once its final output has been read.
 
 An SSH failure is **unknown status**, not process exit. Remote workers may
 survive disconnects. An uncertain launch keeps its identity and reports the
 tracked id: reconcile it with check/kill rather than blindly retrying. Attached
-foreground interruption explicitly kills the remote worker and claims cleanup
+foreground interruption stops the local SSH transport immediately (the CLI runs
+in its own process group), then explicitly kills the remote worker and claims cleanup
 only after terminal-state confirmation; unreachable cleanup is reported as
 unverified. Detached waits do not own the worker. Pi quit attempts cleanup of
 tracked workers, reporting unverified remote cleanup to stderr. Local GC retains

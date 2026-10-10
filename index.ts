@@ -219,6 +219,8 @@ function bs(
 		signal?: AbortSignal;
 		env?: Record<string, string | undefined>;
 		host?: string;
+		/** Return complete stdout even for remote log reads (log mirroring). */
+		unboundedStdout?: boolean;
 	} = {},
 ): Promise<{ stdout: string; stderr: string; code: number }> {
 	const sessionIndex = args.indexOf("-s");
@@ -240,34 +242,59 @@ function bs(
 			else env[name] = value;
 		}
 		env.BABYSIT_DIR = ROOT;
+		// Own a process group: remote commands run `ssh` as a grandchild that
+		// shares our pipes, so signalling only the CLI would leave the transport
+		// alive and `close` (and therefore cancellation) blocked on it.
 		const child = spawn(BABYSIT_BIN, args, {
 			cwd: opts.cwd,
 			env,
+			detached: true,
 		});
 		let stdout = "";
 		let stderr = "";
-		const onAbort = () => child.kill("SIGTERM");
+		let settled = false;
+		const settle = (result: { stdout: string; stderr: string; code: number }) => {
+			if (settled) return;
+			settled = true;
+			opts.signal?.removeEventListener("abort", onAbort);
+			resolve(result);
+		};
+		const onAbort = () => {
+			try {
+				if (child.pid) process.kill(-child.pid, "SIGTERM");
+				else child.kill("SIGTERM");
+			} catch {
+				child.kill("SIGTERM");
+			}
+		};
 		opts.signal?.addEventListener("abort", onAbort, { once: true });
+		const boundStdout = host && host !== "local" && !opts.unboundedStdout && (args.includes("log") || args.includes("screenshot"));
 		child.stdout?.on("data", (d) => {
 			stdout += d.toString();
 			// Drain output but bound remote log/screen memory even for a huge single line.
-			if (host && host !== "local" && (args.includes("log") || args.includes("screenshot")) && Buffer.byteLength(stdout) > 32_000) stdout = Buffer.from(stdout).subarray(-32_000).toString("utf8");
+			if (boundStdout && Buffer.byteLength(stdout) > 32_000) stdout = Buffer.from(stdout).subarray(-32_000).toString("utf8");
 		});
 		child.stderr?.on("data", (d) => {
 			stderr += d.toString();
 		});
 		child.on("error", (e) => {
-			opts.signal?.removeEventListener("abort", onAbort);
 			const installHint = babysitSpawnInstallHint(e);
 			if (installHint) {
 				babysitPreflightError = installHint;
 				babysitPreflightCheckedAt = Date.now();
 			}
-			resolve({ stdout, stderr: installHint ?? stderr + String(e), code: 1 });
+			settle({ stdout, stderr: installHint ?? stderr + String(e), code: 1 });
+		});
+		child.on("exit", (code) => {
+			// After cancellation, a descendant that escaped the process group must
+			// not keep the caller blocked on inherited pipes.
+			if (!opts.signal?.aborted) return;
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			settle({ stdout, stderr: stderr || "aborted", code: code ?? 130 });
 		});
 		child.on("close", (code) => {
-			opts.signal?.removeEventListener("abort", onAbort);
-			resolve({ stdout, stderr, code: code ?? 1 });
+			settle({ stdout, stderr, code: code ?? 1 });
 		});
 	});
 }
@@ -2690,6 +2717,12 @@ export function createSessionWidget(options: {
 	}
 	return {
 		open,
+		/** Re-read the open viewer's log source (e.g. after a remote mirror sync). */
+		refresh() {
+			if (!selectedId) return;
+			refreshViewer();
+			options.requestRender();
+		},
 		update(summary: string[], sessions: WidgetSessionDisplay[]) {
 			displays = sessions;
 			list = createWidgetComponent(summary, sessions, open, listState);
@@ -2813,6 +2846,139 @@ function readTailLines(file: string, lines: number, maxBytes = 64_000): string[]
 const remoteTails = new Map<string, string[]>();
 // Running previews are not final. Only a successful post-terminal fetch is reusable.
 const remoteTerminalTails = new Set<string>();
+
+// Remote logs stay on the remote host; the widget viewer reads a local,
+// append-only mirror built from incremental `log --since --raw --json` reads.
+// The cursor records the remote raw-byte offset and the local mirror size it
+// corresponds to, so an interrupted append is truncated instead of duplicated.
+type RemoteLogCursor = { remoteOffset: number; localBytes: number; complete: boolean };
+type RemoteLogSyncState = { inFlight?: Promise<boolean>; lastSyncAt: number; lastChanged: boolean; error?: string };
+const remoteLogSyncs = new Map<string, RemoteLogSyncState>();
+const REMOTE_LOG_SYNC_INTERVAL_MS = 1000;
+
+export function remoteLogMirrorPath(id: string): string {
+	return path.join(ROOT, "remote-logs", id, "output.log");
+}
+
+function remoteLogCursorPath(id: string): string {
+	return path.join(path.dirname(remoteLogMirrorPath(id)), "cursor.json");
+}
+
+function readRemoteLogCursor(id: string): RemoteLogCursor {
+	const file = remoteLogMirrorPath(id);
+	let cursor: RemoteLogCursor = { remoteOffset: 0, localBytes: 0, complete: false };
+	try {
+		const parsed = JSON.parse(fs.readFileSync(remoteLogCursorPath(id), "utf8"));
+		if (Number.isSafeInteger(parsed.remoteOffset) && Number.isSafeInteger(parsed.localBytes) && parsed.remoteOffset >= 0 && parsed.localBytes >= 0) {
+			cursor = { remoteOffset: parsed.remoteOffset, localBytes: parsed.localBytes, complete: parsed.complete === true };
+		}
+	} catch {}
+	let size = 0;
+	try {
+		size = fs.statSync(file).size;
+	} catch {}
+	if (size < cursor.localBytes) return { remoteOffset: 0, localBytes: 0, complete: false };
+	if (size > cursor.localBytes) fs.truncateSync(file, cursor.localBytes);
+	return cursor;
+}
+
+function writeRemoteLogCursor(id: string, cursor: RemoteLogCursor): void {
+	const target = remoteLogCursorPath(id);
+	const temp = `${target}.${process.pid}.tmp`;
+	fs.writeFileSync(temp, JSON.stringify(cursor));
+	fs.renameSync(temp, target);
+}
+
+/** Fetch new remote output into the local mirror. Resolves true when it grew or completed. */
+export async function syncRemoteLog(id: string): Promise<boolean> {
+	const state = remoteLogSyncs.get(id) ?? { lastSyncAt: 0, lastChanged: false };
+	remoteLogSyncs.set(id, state);
+	if (state.inFlight) return state.inFlight;
+	state.inFlight = (async () => {
+		const file = remoteLogMirrorPath(id);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		if (!fs.existsSync(file)) fs.writeFileSync(file, "");
+		const cursor = readRemoteLogCursor(id);
+		if (cursor.complete) return false;
+		const result = await bs(["log", "-s", id, "--since", String(cursor.remoteOffset), "--raw", "--json"], { unboundedStdout: true });
+		if (result.code !== 0) {
+			const error = clip(result.stderr.trim() || result.stdout.trim() || `babysit log exited ${result.code}`, 500);
+			const changed = state.error !== error;
+			state.error = error;
+			return changed;
+		}
+		let response: { text?: unknown; offset?: unknown; done?: unknown };
+		try {
+			response = JSON.parse(result.stdout);
+		} catch {
+			state.error = `invalid remote log response: ${clip(result.stdout, 200)}`;
+			return true;
+		}
+		if (typeof response.text !== "string" || !Number.isSafeInteger(response.offset) || (response.offset as number) < 0) {
+			state.error = `invalid remote log response: ${clip(result.stdout, 200)}`;
+			return true;
+		}
+		if ((response.offset as number) < cursor.remoteOffset) {
+			// The remote log was replaced or truncated (e.g. restart); rebuild the mirror.
+			fs.truncateSync(file, 0);
+			writeRemoteLogCursor(id, { remoteOffset: 0, localBytes: 0, complete: false });
+			return true;
+		}
+		const hadError = state.error !== undefined;
+		state.error = undefined;
+		const bytes = Buffer.from(response.text, "utf8");
+		if (bytes.length > 0) fs.appendFileSync(file, bytes);
+		const advanced = (response.offset as number) > cursor.remoteOffset || bytes.length > 0;
+		// `done` is reported before the worker's final flush, so completion
+		// requires a terminal read that returned nothing new.
+		const complete = response.done === true && !advanced;
+		writeRemoteLogCursor(id, { remoteOffset: response.offset as number, localBytes: cursor.localBytes + bytes.length, complete });
+		return advanced || complete || hadError;
+	})().then((changed) => {
+		state.lastChanged = changed;
+		return changed;
+	}, (error) => {
+		state.error = error instanceof Error ? error.message : String(error);
+		state.lastChanged = true;
+		return true;
+	}).finally(() => {
+		state.lastSyncAt = Date.now();
+		state.inFlight = undefined;
+	});
+	return state.inFlight;
+}
+
+/**
+ * Schedule a background mirror sync for an open viewer. Catch-up continues
+ * immediately while output keeps arriving; otherwise reads are throttled.
+ */
+function scheduleRemoteLogSync(id: string, onChange: () => void): void {
+	const state = remoteLogSyncs.get(id);
+	if (state?.inFlight) return;
+	if (state && !state.lastChanged && Date.now() - state.lastSyncAt < REMOTE_LOG_SYNC_INTERVAL_MS) return;
+	if (state && !state.error && readRemoteLogCursor(id).complete) return;
+	// Always re-render: the first read may replace a loading placeholder even
+	// when the remote log is still empty. Re-entry is throttled above.
+	void syncRemoteLog(id).then(() => onChange());
+}
+
+function remoteLogViewerSource(id: string, onChange: () => void): { text?: string; file?: string; isAgent: boolean } {
+	const file = remoteLogMirrorPath(id);
+	scheduleRemoteLogSync(id, onChange);
+	const error = remoteLogSyncs.get(id)?.error;
+	let size = 0;
+	try {
+		size = fs.statSync(file).size;
+	} catch {}
+	if (size > 0) return { file, isAgent: false };
+	const meta = readMeta(id);
+	return {
+		text: error
+			? `Remote output unavailable on ${meta?.host}: ${error}\nLog: ${logPath(id)}\nTake over: ${attachCmd(id)}`
+			: remoteLogSyncs.get(id)?.inFlight ? `Loading remote output from ${meta?.host}…` : "",
+		isAgent: false,
+	};
+}
 
 // Trailing lines to show for a session (sanitized, unprefixed).
 // Process tails are read directly from the bounded end of output.log, avoiding
@@ -3825,7 +3991,7 @@ export default function (pi: ExtensionAPI) {
 						requestRender: () => tui.requestRender(),
 						getTheme: () => ctx.ui.theme,
 						readLog: (id) => {
-							if (readMeta(id)?.host) return { text: `Remote full-history viewer is unavailable.\nLog: ${logPath(id)}\nTake over: ${attachCmd(id)}\n\n${(remoteTails.get(id) ?? []).join("\n")}`, isAgent: false };
+							if (readMeta(id)?.host) return remoteLogViewerSource(id, () => sessionWidget?.refresh());
 							const isAgent = kindOf(id) === "subagent";
 							return { file: logPath(id), isAgent };
 						},
@@ -3960,6 +4126,7 @@ export default function (pi: ExtensionAPI) {
 		searchLogCache.clear();
 		remoteTails.clear();
 		remoteTerminalTails.clear();
+		remoteLogSyncs.clear();
 		pollNeeded = true;
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
