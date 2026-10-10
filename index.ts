@@ -2851,13 +2851,19 @@ const remoteTerminalTails = new Set<string>();
 // append-only mirror built from incremental `log --since --raw --json` reads.
 // The cursor records the remote raw-byte offset and the local mirror size it
 // corresponds to, so an interrupted append is truncated instead of duplicated.
-type RemoteLogCursor = { remoteOffset: number; localBytes: number; complete: boolean };
+type RemoteLogCursor = { remoteOffset: number; localBytes: number; timestampBytes: number; complete: boolean };
 type RemoteLogSyncState = { inFlight?: Promise<boolean>; lastSyncAt: number; lastChanged: boolean; error?: string };
 const remoteLogSyncs = new Map<string, RemoteLogSyncState>();
 const REMOTE_LOG_SYNC_INTERVAL_MS = 1000;
+// Hosts whose babysit predates `log --timestamps`; their mirrors have no dates.
+const remoteLogTimestampUnsupported = new Set<string>();
 
 export function remoteLogMirrorPath(id: string): string {
 	return path.join(ROOT, "remote-logs", id, "output.log");
+}
+
+function remoteLogTimestampsPath(id: string): string {
+	return path.join(path.dirname(remoteLogMirrorPath(id)), "output.timestamps.jsonl");
 }
 
 function remoteLogCursorPath(id: string): string {
@@ -2866,19 +2872,34 @@ function remoteLogCursorPath(id: string): string {
 
 function readRemoteLogCursor(id: string): RemoteLogCursor {
 	const file = remoteLogMirrorPath(id);
-	let cursor: RemoteLogCursor = { remoteOffset: 0, localBytes: 0, complete: false };
+	const sidecar = remoteLogTimestampsPath(id);
+	const empty: RemoteLogCursor = { remoteOffset: 0, localBytes: 0, timestampBytes: 0, complete: false };
+	let cursor = empty;
 	try {
 		const parsed = JSON.parse(fs.readFileSync(remoteLogCursorPath(id), "utf8"));
-		if (Number.isSafeInteger(parsed.remoteOffset) && Number.isSafeInteger(parsed.localBytes) && parsed.remoteOffset >= 0 && parsed.localBytes >= 0) {
-			cursor = { remoteOffset: parsed.remoteOffset, localBytes: parsed.localBytes, complete: parsed.complete === true };
+		const valid = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+		if (valid(parsed.remoteOffset) && valid(parsed.localBytes)) {
+			cursor = { remoteOffset: parsed.remoteOffset, localBytes: parsed.localBytes, timestampBytes: valid(parsed.timestampBytes) ? parsed.timestampBytes : 0, complete: parsed.complete === true };
 		}
 	} catch {}
-	let size = 0;
-	try {
-		size = fs.statSync(file).size;
-	} catch {}
-	if (size < cursor.localBytes) return { remoteOffset: 0, localBytes: 0, complete: false };
+	const sizeOf = (target: string) => {
+		try {
+			return fs.statSync(target).size;
+		} catch {
+			return 0;
+		}
+	};
+	const size = sizeOf(file);
+	const sidecarSize = sizeOf(sidecar);
+	if (size < cursor.localBytes || sidecarSize < cursor.timestampBytes) {
+		// Committed data is missing; restart the mirror from scratch.
+		if (size > 0) fs.truncateSync(file, 0);
+		if (sidecarSize > 0) fs.truncateSync(sidecar, 0);
+		return empty;
+	}
+	// Drop an append that was interrupted before its cursor was committed.
 	if (size > cursor.localBytes) fs.truncateSync(file, cursor.localBytes);
+	if (sidecarSize > cursor.timestampBytes) fs.truncateSync(sidecar, cursor.timestampBytes);
 	return cursor;
 }
 
@@ -2900,14 +2921,23 @@ export async function syncRemoteLog(id: string): Promise<boolean> {
 		if (!fs.existsSync(file)) fs.writeFileSync(file, "");
 		const cursor = readRemoteLogCursor(id);
 		if (cursor.complete) return false;
-		const result = await bs(["log", "-s", id, "--since", String(cursor.remoteOffset), "--raw", "--json"], { unboundedStdout: true });
+		const host = readMeta(id)?.host ?? "";
+		const readArgs = ["log", "-s", id, "--since", String(cursor.remoteOffset), "--raw", "--json"];
+		let withTimestamps = !remoteLogTimestampUnsupported.has(host);
+		let result = await bs(withTimestamps ? [...readArgs, "--timestamps"] : readArgs, { unboundedStdout: true });
+		if (withTimestamps && result.code !== 0 && /--timestamps/.test(result.stderr)) {
+			// Older remote babysit: keep mirroring text, without capture dates.
+			remoteLogTimestampUnsupported.add(host);
+			withTimestamps = false;
+			result = await bs(readArgs, { unboundedStdout: true });
+		}
 		if (result.code !== 0) {
 			const error = clip(result.stderr.trim() || result.stdout.trim() || `babysit log exited ${result.code}`, 500);
 			const changed = state.error !== error;
 			state.error = error;
 			return changed;
 		}
-		let response: { text?: unknown; offset?: unknown; done?: unknown };
+		let response: { text?: unknown; offset?: unknown; done?: unknown; timestamps?: unknown };
 		try {
 			response = JSON.parse(result.stdout);
 		} catch {
@@ -2921,18 +2951,38 @@ export async function syncRemoteLog(id: string): Promise<boolean> {
 		if ((response.offset as number) < cursor.remoteOffset) {
 			// The remote log was replaced or truncated (e.g. restart); rebuild the mirror.
 			fs.truncateSync(file, 0);
-			writeRemoteLogCursor(id, { remoteOffset: 0, localBytes: 0, complete: false });
+			fs.rmSync(remoteLogTimestampsPath(id), { force: true });
+			writeRemoteLogCursor(id, { remoteOffset: 0, localBytes: 0, timestampBytes: 0, complete: false });
 			return true;
 		}
 		const hadError = state.error !== undefined;
 		state.error = undefined;
 		const bytes = Buffer.from(response.text, "utf8");
 		if (bytes.length > 0) fs.appendFileSync(file, bytes);
+		const remoteStart = cursor.remoteOffset;
+		const remoteEnd = response.offset as number;
+		let timestampBytes = cursor.timestampBytes;
+		// Remote rows use remote raw offsets. They map 1:1 onto the mirror only
+		// when the chunk arrived byte-for-byte; a lossy UTF-8 replacement shifts
+		// offsets, so that chunk is left undated rather than mis-dated.
+		if (withTimestamps && Array.isArray(response.timestamps) && bytes.length === remoteEnd - remoteStart) {
+			const rows = response.timestamps.flatMap((row) => {
+				if (!Array.isArray(row) || row.length !== 3 || !row.every((value) => Number.isSafeInteger(value) && value >= 0)) return [];
+				const [start, length, time] = row as number[];
+				const begin = Math.max(start, remoteStart);
+				const end = Math.min(start + length, remoteEnd);
+				return end > begin ? [`[${cursor.localBytes + begin - remoteStart},${end - begin},${time}]\n`] : [];
+			}).join("");
+			if (rows) {
+				fs.appendFileSync(remoteLogTimestampsPath(id), rows);
+				timestampBytes += Buffer.byteLength(rows);
+			}
+		}
 		const advanced = (response.offset as number) > cursor.remoteOffset || bytes.length > 0;
 		// `done` is reported before the worker's final flush, so completion
 		// requires a terminal read that returned nothing new.
 		const complete = response.done === true && !advanced;
-		writeRemoteLogCursor(id, { remoteOffset: response.offset as number, localBytes: cursor.localBytes + bytes.length, complete });
+		writeRemoteLogCursor(id, { remoteOffset: remoteEnd, localBytes: cursor.localBytes + bytes.length, timestampBytes, complete });
 		return advanced || complete || hadError;
 	})().then((changed) => {
 		state.lastChanged = changed;
@@ -4127,6 +4177,7 @@ export default function (pi: ExtensionAPI) {
 		remoteTails.clear();
 		remoteTerminalTails.clear();
 		remoteLogSyncs.clear();
+		remoteLogTimestampUnsupported.clear();
 		pollNeeded = true;
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
