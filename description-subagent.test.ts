@@ -53,6 +53,9 @@ try {
  await call('wait',{id,timeout:'5s',description:'Wait for followup fake task'}); unchanged();
  await call('kill',{id,description:'Stop fake worker'}); unchanged();
  const requests=fs.readFileSync(process.env.FAKE_PI_CAPTURE,'utf8').trim().split('\\n').map(line=>JSON.parse(line));
+ const argv=requests.find(request=>request.argv).argv;
+ assert.deepEqual(argv.slice(0,2),['--mode','rpc']);
+ assert(!argv.includes('--no-session'),'Subagents must retain Pi session persistence');
  const prompt=requests.find(request=>request.type==='prompt');
  assert.equal(prompt.message,'Task: Execute ONLY the actual fake task.');
  assert.equal(requests.filter(request=>request.type==='prompt').at(-1).message,'Follow up ONLY with this exact text.');

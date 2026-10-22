@@ -235,6 +235,10 @@ targeted pattern over a broad tail, and do not read a potentially large log file
 in full. Subagent crashes return structured errors plus the full log path, never
 a raw RPC JSON tail.
 
+Subagents run in RPC mode with normal Pi session persistence enabled, using
+Pi's configured session storage (by default `~/.pi/agent/sessions/`). Each worker
+has its own Pi session, separate from the parent and from babysit's output log.
+
 Subagent logs compact Pi's streaming `message_update` events before they are
 recorded. Pi repeats the complete growing assistant message and partial snapshot
 on every token; pi-babysit retains only the incremental delta. Compact RPC

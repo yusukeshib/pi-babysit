@@ -2319,7 +2319,7 @@ async function spawnSubagent(
 	// Long-lived RPC worker: the task is NOT passed as argv — it is injected
 	// below as an RPC `prompt` command, whose response we validate so spawn
 	// failures (bad model, missing API key) are loud instead of a silent exit=1.
-	const piArgs: string[] = ["--mode", "rpc", "--no-session"];
+	const piArgs: string[] = ["--mode", "rpc"];
 	const model = opts.model ?? opts.agent?.model;
 	if (model) piArgs.push("--model", model);
 	const tools = opts.tools ?? opts.agent?.tools;
