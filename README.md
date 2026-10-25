@@ -131,12 +131,8 @@ waits use this mapping; manual remote sessions are never adopted or killed.
 Resume the same Pi session to reconnect. Remote logs stay remote: results show
 an executable `babysit --host … log -s …` locator instead of a local file path.
 Remote output is a bounded tail (200 lines by default) or CLI `--grep` search
-(no local line numbers). The widget shows host/state and a small tail. Opening
-a remote session in the widget viewer shows its full history: while the viewer
-is open, pi-babysit incrementally mirrors the remote raw log (`log --since
---raw --json`) into the local session root and pages it like a local log; a
-replaced or truncated remote log rebuilds the mirror, and a finished log stops
-syncing once its final output has been read.
+(no local line numbers). The passive widget shows host/state and the session
+description; it never fetches or mirrors remote output.
 
 An SSH failure is **unknown status**, not process exit. Remote workers may
 survive disconnects. An uncertain launch keeps its identity and reports the
@@ -155,56 +151,18 @@ before local retention can collect their metadata.
 | Command | What it does |
 | ------- | ------------ |
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
-| `/babysit view` | Keyboard picker to open a session in the widget log viewer (Pi TUI) |
+| `/babysit-log` | Pick any process or agent (running or finished) and put its shell-quoted `babysit log` command in Pi's input buffer for copying. Includes the local session namespace or remote host/worker ID. Does not execute the command or write to the clipboard |
 | `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; old empty roots are eligible once their lease is gone. Deletion uses a GC lock and atomic rename |
 
-A widget below the editor separates session **kind** from task **state** at a glance:
-summary counts use `RUNNING` / `IDLE`, and every row is labeled
-`PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`. In fullscreen mode, the
-`babysits(n running)` list shows live sessions (including idle agents) by default.
-Click the header to toggle to `babysits(n all)`, which also shows finished and failed
-sessions, and click again to return to running-only. Both modes show newest first,
-ten per page; `< 1/4 >` shows the current/total page when needed. Click the
-arrows to page. Rows occupy one line, previewing the description (or the command
-for older processes and task for older agents), with `…` when clipped. Click an
-AGENT or PROCESS row to expand a **log viewer directly below that row**. The summary
-title, list header, and all other rows remain visible with their original colors.
-Only one row is expanded at a time; selecting another closes the previous one.
-The viewer is capped at ten lines including its existing row header and footer;
-all saved history remains available by scrolling. Click the same row again to
-collapse it, preserving the list's mode and page.
-There is no separate Close button or Esc binding. The viewer uses Pi's `ScrollView` for
-scroll position and follow behavior, with a widget-local scrollbar styled using
-Pi's scrollbar theme. Wheel, scrollbar drag/track clicks, and ↑/↓ navigate the
-log without requiring any Pi core changes. Home/End and PageUp/PageDown remain
-Pi's transcript shortcuts. At the bottom it follows new output; scrolling up
-pauses following until you return to the bottom. The viewer resizes with the
-terminal, leaving room for the editor/status/footer. Agent logs separate
-assistant text, tool calls, and results; process logs show terminal output.
-When babysit provides `output.timestamps.jsonl`, process lines begin with a muted
-local `[YYYY-MM-DD HH:mm:ss]` capture time, with wrapped text aligned beneath the
-message. Agent lines show the capture time of their block's first available event
-in the same left column, with the assistant/tool/result/error label beside the
-first content line; streamed updates and duplicate results keep that time. This
-is the time babysit received the first byte of the event or line, not an
-application event time. Narrow views place the date above the text. Old logs and
-lines without capture metadata remain readable without invented timestamps.
-Only the selected log is loaded: the viewer starts at the tail and lazily reads
-older/newer pages as you scroll to the loaded window's edges. The scrollbar
-represents that window, not the entire file; the footer shows its byte range.
-Normally a small sliding window of roughly 64 KiB pages is retained. Page limits
-are soft for oversized records and individual assistant-response/tool-result
-groups (streaming snapshots and duplicate results stay together), and for pages
-intersecting the viewport. Agent tasks are split at assistant-message boundaries,
-not loaded as a whole; older logs lacking those events can form larger groups.
-All saved history remains reachable, with no log records discarded or modified.
-Capture-time sidecars are sought by byte range rather than read in full. Empty
-logs show a placeholder. Works in the released Pi 1.0 widget host. Mouse interaction
-requires fullscreen mode; `/babysit view` opens the viewer using a keyboard
-picker, and `/babysit` still provides a snapshot. The displayed `age` is total
-session age, not time spent in the current state. Transcript details
-from tool results, snapshots, and completion notifications collapse or expand
-with Pi's tool-output toggle (`Ctrl+O` by default).
+The read-only widget below the editor lists all running sessions, newest first,
+including reusable idle agents. Summary counts use `RUNNING` / `IDLE`; rows show
+`PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`, total session age, remote host
+and unknown-status indicators when applicable, and a colored one-line description.
+Older sessions fall back to their command or task. Rows truncate to terminal width
+with `…`; there is no paging, mouse interaction, keyboard handling, or log fetching.
+Finished sessions disappear from the widget. Use `/babysit` for snapshots or the
+babysit tools to inspect output. Transcript details from tool results, snapshots,
+and completion notifications still use Pi's tool-output toggle (`Ctrl+O` by default).
 
 ## Logs without context flooding
 

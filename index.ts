@@ -44,9 +44,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { createLogViewer } from "./log-viewer";
-import { FileLogSource } from "./log-source";
+import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2530,16 +2528,14 @@ async function spawnSubagent(
 }
 
 // ---------------------------------------------------------------------------
-// widget (live counts and browsable sessions)
+// widget (passive running-session list)
 // ---------------------------------------------------------------------------
 
 export function widgetSessionGroups(sessions: BsSession[], startedAt: (id: string) => number) {
 	const active = sessions.filter((session) => session.state === "running");
-	const started = new Map(sessions.map((session) => [session.id, startedAt(session.id)]));
-	const newestFirst = (a: BsSession, b: BsSession) =>
-		(started.get(b.id) ?? 0) - (started.get(a.id) ?? 0) || b.id.localeCompare(a.id);
-	const finished = sessions.filter((session) => session.state !== "running").sort(newestFirst);
-	return { active, finished, all: [...sessions].sort(newestFirst) };
+	const started = new Map(active.map((session) => [session.id, startedAt(session.id)]));
+	active.sort((a, b) => (started.get(b.id) ?? 0) - (started.get(a.id) ?? 0) || b.id.localeCompare(a.id));
+	return { active };
 }
 
 // A subagent whose task is done stays alive as an idle RPC worker (for
@@ -2597,566 +2593,23 @@ function renderWidgetSessionHeader(
 	return `  ${icon} ${id} ${kindLabel} ${stateLabel}${elapsed ? theme.fg("dim", ` age ${elapsed}`) : ""}`;
 }
 
-// How many trailing output lines to show per session in the widget.
-const WIDGET_COLLAPSED_TAIL_LINES = 1;
-const WIDGET_SESSION_PAGE_SIZE = 10;
-const WIDGET_VIEWER_MAX_LINES = 10;
-
-export interface WidgetSessionListState {
-	mode: "running" | "all";
-	page: number;
-}
-
 export interface WidgetSessionDisplay {
 	id: string;
-	description?: string;
 	header: string;
-	tail: string[];
-	viewable: boolean;
-	active?: boolean;
-	details?: string[];
+	description?: string;
 }
 
-interface WidgetMouseEvent {
-	type: string;
-	button: string;
-	y: number;
-	x?: number;
-}
-
-/**
- * Compact session list. Item presses toggle the session's inline viewer.
- */
-export function createWidgetComponent(
-	summaryLines: string[],
-	sessions: WidgetSessionDisplay[],
-	onOpen: (id: string) => void,
-	listState?: WidgetSessionListState,
-) {
-	type Target = { type: "session"; id: string } | { type: "sessions"; endX: number; prevX?: number; nextX?: number };
-	let targetByLine: Array<Target | undefined> = [];
-
+/** Passive running-session list; no input handlers or log reads. */
+export function createWidgetComponent(summaryLines: string[], sessions: WidgetSessionDisplay[]) {
 	return {
 		render(width: number): string[] {
-			const lines: string[] = [];
-			targetByLine = [];
-			const push = (text: string, target?: Target, ellipsis = "") => {
-				lines.push(truncateToWidth(text, Math.max(0, width), ellipsis));
-				targetByLine.push(target);
-			};
-			const pushSession = (session: WidgetSessionDisplay) => {
-				const target = session.viewable ? { type: "session" as const, id: session.id } : undefined;
-				const detail = session.details?.[0];
-				const preview = session.description ?? (detail?.startsWith("task: ") ? detail.slice(6) : detail ?? session.tail.at(-1));
-				push(`${session.header}${preview ? ` ${preview}` : ""}`, target, "…");
-			};
-
-			for (const line of summaryLines.slice(0, -1)) push(line);
-			const summary = summaryLines.at(-1);
-			if (listState && sessions.length) {
-				const visible = listState.mode === "running" ? sessions.filter((session) => session.active) : sessions;
-				const pageCount = Math.max(1, Math.ceil(visible.length / WIDGET_SESSION_PAGE_SIZE));
-				listState.page = Math.min(Math.max(0, listState.page), pageCount - 1);
-				const label = ` babysits(${visible.length} ${listState.mode})`;
-				const showArrows = pageCount > 1;
-				const suffix = `${label}${showArrows ? ` < ${listState.page + 1}/${pageCount} >` : ""}`;
-				// Keep the count clickable on narrow terminals by moving it to its own row.
-				const inline = summary !== undefined && visibleWidth(summary) + visibleWidth(suffix) <= width;
-				if (summary !== undefined && !inline) {
-					push(summary, { type: "sessions", endX: Math.min(visibleWidth(summary), Math.max(0, width)) });
-				}
-				const prefix = inline ? summary ?? "" : "";
-				const prefixWidth = visibleWidth(prefix);
-				push(`${prefix}${suffix}`, {
-					type: "sessions",
-					endX: Math.min(prefixWidth + visibleWidth(suffix), Math.max(0, width)),
-					prevX: showArrows ? prefixWidth + suffix.indexOf("<") : undefined,
-					nextX: showArrows ? prefixWidth + suffix.indexOf(">") : undefined,
-				});
-				const start = listState.page * WIDGET_SESSION_PAGE_SIZE;
-				for (const session of visible.slice(start, start + WIDGET_SESSION_PAGE_SIZE)) {
-					pushSession(session);
-				}
-			} else {
-				if (summary !== undefined) push(summary);
-				for (const session of sessions) pushSession(session);
-			}
-			return lines;
+			return [
+				...summaryLines,
+				...sessions.map((session) => `${session.header}${session.description ? ` ${session.description}` : ""}`),
+			].map((line) => truncateToWidth(line, Math.max(0, width), "…"));
 		},
-		getSessionLine(id: string) {
-			return targetByLine.findIndex((target) => target?.type === "session" && target.id === id);
-		},
-		handleMouse(event: WidgetMouseEvent) {
-			if (event.button !== "left") return undefined;
-			const target = targetByLine[event.y];
-			if (!target) return undefined;
-			if (target.type === "sessions" && (event.x === undefined || event.x < 0 || event.x >= target.endX)) return undefined;
-			// Toggle on press so a terminal that omits release still works.
-			if (event.type === "press") {
-				if (target.type === "session") {
-					onOpen(target.id);
-				} else if (listState) {
-					const count = listState.mode === "running" ? sessions.filter((session) => session.active).length : sessions.length;
-					const pageCount = Math.max(1, Math.ceil(count / WIDGET_SESSION_PAGE_SIZE));
-					if (event.x === target.prevX && target.prevX !== undefined) {
-						listState.page = (listState.page - 1 + pageCount) % pageCount;
-					} else if (event.x === target.nextX && target.nextX !== undefined) {
-						listState.page = (listState.page + 1) % pageCount;
-					} else {
-						listState.mode = listState.mode === "running" ? "all" : "running";
-						listState.page = 0;
-					}
-				}
-				return { handled: true, render: true };
-			}
-			// Consume Pi's synthesized click without toggling a second time.
-			if (event.type === "click") return { handled: true, render: false };
-			return undefined;
-		},
-		invalidate() {
-			targetByLine = [];
-		},
+		invalidate() {},
 	};
-}
-
-export function createSessionWidget(options: {
-	getHeight: () => number;
-	requestRender: () => void;
-	getTheme: () => Theme;
-	readLog: (id: string) => { text?: string; file?: string; isAgent: boolean; clipped?: boolean; lineTimestamps?: (number | undefined)[] };
-}) {
-	const listState: WidgetSessionListState = { mode: "running", page: 0 };
-	let selectedId: string | undefined;
-	let displays: WidgetSessionDisplay[] = [];
-	let viewer: ReturnType<typeof createLogViewer> | undefined;
-	let source: FileLogSource | undefined;
-	let summaryLines: string[] = [];
-	let listHeight = 0;
-	let viewerRow = -1;
-	let viewerLines = 0;
-	let dragging = false;
-	let list = createWidgetComponent([], [], toggle, listState);
-	function rebuildList() {
-		list = createWidgetComponent(summaryLines, displays, toggle, listState);
-	}
-	function toggle(id: string) {
-		if (selectedId === id) close();
-		else open(id);
-	}
-	function refreshViewer() {
-		if (!selectedId || !viewer) return;
-		const log = options.readLog(selectedId);
-		const session = displays.find((session) => session.id === selectedId);
-		const header = session?.header ?? selectedId;
-		const context = (session?.details ?? [])
-			.map((detail) => detail.startsWith("task: ") ? detail.slice(6) : detail)
-			.join("\n");
-		if (log.file) {
-			if (!source || source.file !== log.file || source.isAgent !== log.isAgent)
-				source = new FileLogSource(log.file, log.isAgent);
-			viewer.updateSource(header, source, context);
-		} else {
-			viewer.update(header, log.text ?? "", log.isAgent, context, log.lineTimestamps);
-			source = undefined;
-		}
-	}
-	function close() {
-		selectedId = undefined;
-		viewerRow = -1;
-		viewerLines = 0;
-		dragging = false;
-		viewer?.dispose();
-		viewer = undefined;
-		source = undefined;
-		options.requestRender();
-	}
-	function open(id: string) {
-		if (!displays.some((session) => session.id === id)) {
-			displays = [...displays, { id, header: id, tail: [], viewable: true, active: true }];
-		}
-		if (listState.mode === "running" && !displays.find((session) => session.id === id)?.active)
-			listState.mode = "all";
-		const visible = listState.mode === "running" ? displays.filter((session) => session.active) : displays;
-		listState.page = Math.floor(visible.findIndex((session) => session.id === id) / WIDGET_SESSION_PAGE_SIZE);
-		rebuildList();
-		dragging = false;
-		viewer?.dispose();
-		source = undefined;
-		selectedId = id;
-		viewer = createLogViewer({
-			...options,
-			getHeight: () => Math.max(3, Math.min(WIDGET_VIEWER_MAX_LINES, options.getHeight() - listHeight + 1)),
-			onClose: close,
-		});
-		refreshViewer();
-		options.requestRender();
-	}
-	return {
-		open,
-		/** Re-read the open viewer's log source (e.g. after a remote mirror sync). */
-		refresh() {
-			if (!selectedId) return;
-			refreshViewer();
-			options.requestRender();
-		},
-		update(summary: string[], sessions: WidgetSessionDisplay[]) {
-			displays = sessions;
-			summaryLines = summary;
-			rebuildList();
-			if (selectedId && !sessions.some((session) => session.id === selectedId && (listState.mode === "all" || session.active))) close();
-			refreshViewer();
-			options.requestRender();
-		},
-		render(width: number) {
-			const lines = list.render(width);
-			listHeight = lines.length;
-			viewerRow = selectedId ? list.getSessionLine(selectedId) : -1;
-			viewerLines = 0;
-			if (viewer && viewerRow >= 0) {
-				// Keep the original styled row as the toggle header.
-				const body = viewer.render(width).slice(1);
-				viewerLines = body.length;
-				lines.splice(viewerRow + 1, 0, ...body);
-			}
-			return lines;
-		},
-		handleMouse(event: TuiMouseEvent) {
-			if (viewer && viewerRow >= 0 && (dragging || (event.y > viewerRow && event.y <= viewerRow + viewerLines))) {
-				const result = viewer.handleMouse({ ...event, y: event.y - viewerRow });
-				if (result && "capture" in result && result.capture) dragging = true;
-				if (event.type === "release") dragging = false;
-				return result;
-			}
-			const mode = listState.mode, page = listState.page;
-			const result = list.handleMouse({ ...event, y: event.y > viewerRow && viewerRow >= 0 ? event.y - viewerLines : event.y });
-			if (mode !== listState.mode || page !== listState.page) close();
-			return result;
-		},
-		handleKey(data: string) { return viewer?.handleKey(data) ?? false; },
-		invalidate() { list.invalidate(); viewer?.invalidate(); },
-	};
-}
-
-/** Capture times are optional: old logs and incomplete sidecars remain readable. */
-function readLineTimestamps(file: string, data: Buffer, offset: number): (number | undefined)[] {
-	const metadata = readViewerLog(path.join(path.dirname(file), "output.timestamps.jsonl")).text;
-	const ranges: { start: number; end: number; time: number }[] = [];
-	for (const line of metadata.split("\n")) {
-		try {
-			const record = JSON.parse(line);
-			if (!Array.isArray(record) || record.length !== 3) continue;
-			const [start, length, time] = record;
-			if (!Number.isSafeInteger(start) || start < 0 ||
-				!Number.isSafeInteger(length) || length <= 0 ||
-				!Number.isSafeInteger(start + length) ||
-				!Number.isSafeInteger(time) || time < 0 || time > 8640000000000000 ||
-				start < (ranges.at(-1)?.end ?? 0)) continue;
-			ranges.push({ start, end: start + length, time });
-		} catch { /* A partial or malformed record has no trustworthy time. */ }
-	}
-	let range = 0;
-	const timestamps: (number | undefined)[] = [];
-	const addLine = (position: number) => {
-		const absolute = offset + position;
-		while (range < ranges.length && ranges[range].end <= absolute) range++;
-		const entry = ranges[range];
-		timestamps.push(position < data.length && entry && entry.start <= absolute ? entry.time : undefined);
-	};
-	addLine(0);
-	for (let i = 0; i < data.length; i++) {
-		if (data[i] !== 10 && data[i] !== 13) continue;
-		if (data[i] === 13 && data[i + 1] === 10) i++;
-		addLine(i + 1);
-	}
-	return timestamps;
-}
-
-/** Only the selected session is read; bounded snapshots never affect worker logs. */
-export function readViewerLog(file: string, withTimestamps = false): {
-	text: string; clipped: boolean; lineTimestamps?: (number | undefined)[];
-} {
-	try {
-		const fd = fs.openSync(file, "r");
-		try {
-			const size = fs.fstatSync(fd).size;
-			const start = Math.max(0, size - 1024 * 1024);
-			const buffer = Buffer.alloc(size - start);
-			const bytes = fs.readSync(fd, buffer, 0, buffer.length, start);
-			let data = buffer.subarray(0, bytes);
-			let offset = start;
-			if (start > 0) {
-				const skip = data.indexOf(10) + 1;
-				data = data.subarray(skip);
-				offset += skip;
-			}
-			const text = data.toString("utf8");
-			return {
-				text, clipped: start > 0,
-				...(withTimestamps ? { lineTimestamps: readLineTimestamps(file, data, offset) } : {}),
-			};
-		} finally { fs.closeSync(fd); }
-	} catch {
-		return { text: "", clipped: false };
-	}
-}
-
-// Strip ANSI/control escapes and clamp width so raw PTY output can't wrap or
-// corrupt the widget area.
-function sanitizeTailLine(s: string): string {
-	// PTY progress bars often redraw one logical line with carriage returns.
-	// Keep the latest frame rather than concatenating every historical frame.
-	const terminalFrame = s.split("\r").filter(Boolean).at(-1) ?? "";
-	const clean = terminalFrame
-		// CSI / OSC / other escape sequences
-		.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-		.replace(/\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-		// remaining non-printable control chars (keep tab)
-		.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
-	return clean;
-}
-
-function readTailLines(file: string, lines: number, maxBytes = 64_000): string[] {
-	try {
-		const size = fs.statSync(file).size;
-		const start = Math.max(0, size - maxBytes);
-		const length = size - start;
-		const bytes = Buffer.allocUnsafe(length);
-		const fd = fs.openSync(file, "r");
-		let read = 0;
-		try {
-			while (read < length) {
-				const count = fs.readSync(fd, bytes, read, length - read, start + read);
-				if (count === 0) break;
-				read += count;
-			}
-		} finally {
-			fs.closeSync(fd);
-		}
-		const parts = bytes.subarray(0, read).toString("utf8").split("\n");
-		if (start > 0) parts.shift(); // first fragment may begin mid-line
-		return parts.slice(-Math.max(1, lines + 1));
-	} catch {
-		return [];
-	}
-}
-
-const remoteTails = new Map<string, string[]>();
-// Running previews are not final. Only a successful post-terminal fetch is reusable.
-const remoteTerminalTails = new Set<string>();
-
-// Remote logs stay on the remote host; the widget viewer reads a local,
-// append-only mirror built from incremental `log --since --raw --json` reads.
-// The cursor records the remote raw-byte offset and the local mirror size it
-// corresponds to, so an interrupted append is truncated instead of duplicated.
-type RemoteLogCursor = { remoteOffset: number; localBytes: number; timestampBytes: number; complete: boolean };
-type RemoteLogSyncState = { inFlight?: Promise<boolean>; lastSyncAt: number; lastChanged: boolean; error?: string };
-const remoteLogSyncs = new Map<string, RemoteLogSyncState>();
-const REMOTE_LOG_SYNC_INTERVAL_MS = 1000;
-// Hosts whose babysit predates `log --timestamps`; their mirrors have no dates.
-const remoteLogTimestampUnsupported = new Set<string>();
-
-export function remoteLogMirrorPath(id: string): string {
-	return path.join(ROOT, "remote-logs", id, "output.log");
-}
-
-function remoteLogTimestampsPath(id: string): string {
-	return path.join(path.dirname(remoteLogMirrorPath(id)), "output.timestamps.jsonl");
-}
-
-function remoteLogCursorPath(id: string): string {
-	return path.join(path.dirname(remoteLogMirrorPath(id)), "cursor.json");
-}
-
-function readRemoteLogCursor(id: string): RemoteLogCursor {
-	const file = remoteLogMirrorPath(id);
-	const sidecar = remoteLogTimestampsPath(id);
-	const empty: RemoteLogCursor = { remoteOffset: 0, localBytes: 0, timestampBytes: 0, complete: false };
-	let cursor = empty;
-	try {
-		const parsed = JSON.parse(fs.readFileSync(remoteLogCursorPath(id), "utf8"));
-		const valid = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
-		if (valid(parsed.remoteOffset) && valid(parsed.localBytes)) {
-			cursor = { remoteOffset: parsed.remoteOffset, localBytes: parsed.localBytes, timestampBytes: valid(parsed.timestampBytes) ? parsed.timestampBytes : 0, complete: parsed.complete === true };
-		}
-	} catch {}
-	const sizeOf = (target: string) => {
-		try {
-			return fs.statSync(target).size;
-		} catch {
-			return 0;
-		}
-	};
-	const size = sizeOf(file);
-	const sidecarSize = sizeOf(sidecar);
-	if (size < cursor.localBytes || sidecarSize < cursor.timestampBytes) {
-		// Committed data is missing; restart the mirror from scratch.
-		if (size > 0) fs.truncateSync(file, 0);
-		if (sidecarSize > 0) fs.truncateSync(sidecar, 0);
-		return empty;
-	}
-	// Drop an append that was interrupted before its cursor was committed.
-	if (size > cursor.localBytes) fs.truncateSync(file, cursor.localBytes);
-	if (sidecarSize > cursor.timestampBytes) fs.truncateSync(sidecar, cursor.timestampBytes);
-	return cursor;
-}
-
-function writeRemoteLogCursor(id: string, cursor: RemoteLogCursor): void {
-	const target = remoteLogCursorPath(id);
-	const temp = `${target}.${process.pid}.tmp`;
-	fs.writeFileSync(temp, JSON.stringify(cursor));
-	fs.renameSync(temp, target);
-}
-
-/** Fetch new remote output into the local mirror. Resolves true when it grew or completed. */
-export async function syncRemoteLog(id: string): Promise<boolean> {
-	const state = remoteLogSyncs.get(id) ?? { lastSyncAt: 0, lastChanged: false };
-	remoteLogSyncs.set(id, state);
-	if (state.inFlight) return state.inFlight;
-	state.inFlight = (async () => {
-		const file = remoteLogMirrorPath(id);
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		if (!fs.existsSync(file)) fs.writeFileSync(file, "");
-		const cursor = readRemoteLogCursor(id);
-		if (cursor.complete) return false;
-		const host = readMeta(id)?.host ?? "";
-		const readArgs = ["log", "-s", id, "--since", String(cursor.remoteOffset), "--raw", "--json"];
-		let withTimestamps = !remoteLogTimestampUnsupported.has(host);
-		let result = await bs(withTimestamps ? [...readArgs, "--timestamps"] : readArgs, { unboundedStdout: true });
-		if (withTimestamps && result.code !== 0 && /--timestamps/.test(result.stderr)) {
-			// Older remote babysit: keep mirroring text, without capture dates.
-			remoteLogTimestampUnsupported.add(host);
-			withTimestamps = false;
-			result = await bs(readArgs, { unboundedStdout: true });
-		}
-		if (result.code !== 0) {
-			const error = clip(result.stderr.trim() || result.stdout.trim() || `babysit log exited ${result.code}`, 500);
-			const changed = state.error !== error;
-			state.error = error;
-			return changed;
-		}
-		let response: { text?: unknown; offset?: unknown; done?: unknown; timestamps?: unknown };
-		try {
-			response = JSON.parse(result.stdout);
-		} catch {
-			state.error = `invalid remote log response: ${clip(result.stdout, 200)}`;
-			return true;
-		}
-		if (typeof response.text !== "string" || !Number.isSafeInteger(response.offset) || (response.offset as number) < 0) {
-			state.error = `invalid remote log response: ${clip(result.stdout, 200)}`;
-			return true;
-		}
-		if ((response.offset as number) < cursor.remoteOffset) {
-			// The remote log was replaced or truncated (e.g. restart); rebuild the mirror.
-			fs.truncateSync(file, 0);
-			fs.rmSync(remoteLogTimestampsPath(id), { force: true });
-			writeRemoteLogCursor(id, { remoteOffset: 0, localBytes: 0, timestampBytes: 0, complete: false });
-			return true;
-		}
-		const hadError = state.error !== undefined;
-		state.error = undefined;
-		const bytes = Buffer.from(response.text, "utf8");
-		if (bytes.length > 0) fs.appendFileSync(file, bytes);
-		const remoteStart = cursor.remoteOffset;
-		const remoteEnd = response.offset as number;
-		let timestampBytes = cursor.timestampBytes;
-		// Remote rows use remote raw offsets. They map 1:1 onto the mirror only
-		// when the chunk arrived byte-for-byte; a lossy UTF-8 replacement shifts
-		// offsets, so that chunk is left undated rather than mis-dated.
-		if (withTimestamps && Array.isArray(response.timestamps) && bytes.length === remoteEnd - remoteStart) {
-			const rows = response.timestamps.flatMap((row) => {
-				if (!Array.isArray(row) || row.length !== 3 || !row.every((value) => Number.isSafeInteger(value) && value >= 0)) return [];
-				const [start, length, time] = row as number[];
-				const begin = Math.max(start, remoteStart);
-				const end = Math.min(start + length, remoteEnd);
-				return end > begin ? [`[${cursor.localBytes + begin - remoteStart},${end - begin},${time}]\n`] : [];
-			}).join("");
-			if (rows) {
-				fs.appendFileSync(remoteLogTimestampsPath(id), rows);
-				timestampBytes += Buffer.byteLength(rows);
-			}
-		}
-		const advanced = (response.offset as number) > cursor.remoteOffset || bytes.length > 0;
-		// `done` is reported before the worker's final flush, so completion
-		// requires a terminal read that returned nothing new.
-		const complete = response.done === true && !advanced;
-		writeRemoteLogCursor(id, { remoteOffset: remoteEnd, localBytes: cursor.localBytes + bytes.length, timestampBytes, complete });
-		return advanced || complete || hadError;
-	})().then((changed) => {
-		state.lastChanged = changed;
-		return changed;
-	}, (error) => {
-		state.error = error instanceof Error ? error.message : String(error);
-		state.lastChanged = true;
-		return true;
-	}).finally(() => {
-		state.lastSyncAt = Date.now();
-		state.inFlight = undefined;
-	});
-	return state.inFlight;
-}
-
-/**
- * Schedule a background mirror sync for an open viewer. Catch-up continues
- * immediately while output keeps arriving; otherwise reads are throttled.
- */
-function scheduleRemoteLogSync(id: string, onChange: () => void): void {
-	const state = remoteLogSyncs.get(id);
-	if (state?.inFlight) return;
-	if (state && !state.lastChanged && Date.now() - state.lastSyncAt < REMOTE_LOG_SYNC_INTERVAL_MS) return;
-	if (state && !state.error && readRemoteLogCursor(id).complete) return;
-	// Always re-render: the first read may replace a loading placeholder even
-	// when the remote log is still empty. Re-entry is throttled above.
-	void syncRemoteLog(id).then(() => onChange());
-}
-
-function remoteLogViewerSource(id: string, onChange: () => void): { text?: string; file?: string; isAgent: boolean } {
-	const file = remoteLogMirrorPath(id);
-	scheduleRemoteLogSync(id, onChange);
-	const error = remoteLogSyncs.get(id)?.error;
-	let size = 0;
-	try {
-		size = fs.statSync(file).size;
-	} catch {}
-	if (size > 0) return { file, isAgent: false };
-	const meta = readMeta(id);
-	return {
-		text: error
-			? `Remote output unavailable on ${meta?.host}: ${error}\nLog: ${logPath(id)}\nTake over: ${attachCmd(id)}`
-			: remoteLogSyncs.get(id)?.inFlight ? `Loading remote output from ${meta?.host}…` : "",
-		isAgent: false,
-	};
-}
-
-// Trailing lines to show for a session (sanitized, unprefixed).
-// Process tails are read directly from the bounded end of output.log, avoiding
-// one `babysit log` subprocess per visible process.
-export function widgetTail(
-	id: string,
-	isSub: boolean,
-	subagentProgress?: Progress,
-	lines = WIDGET_COLLAPSED_TAIL_LINES,
-): string[] {
-	let raw: string[];
-	if (readMeta(id)?.host) return remoteTails.get(id) ?? ["Remote output unavailable; use babysit_check."];
-	if (!isSub) {
-		raw = readTailLines(logPath(id), lines);
-	} else {
-		const progress = subagentProgress ?? taskProgressOf(id).progress;
-		if (progress.logText) {
-			raw = progress.logText.split("\n");
-		} else if (progress.streamingText.trim()) {
-			raw = progress.streamingText.split("\n");
-		} else if (progress.finalText.trim()) {
-			raw = progress.finalText.split("\n");
-		} else if (progress.toolCalls.length > 0) {
-			raw = progress.toolCalls.map((tool) => tool.summary);
-		} else {
-			raw = progress.errorMsg ? [`⚠ ${progress.errorMsg}`] : [];
-		}
-	}
-	return raw
-		.map(sanitizeTailLine)
-		.slice(-lines);
 }
 
 // ---------------------------------------------------------------------------
@@ -3166,10 +2619,14 @@ export function widgetTail(
 // The command a human can run in their OWN terminal/pane to take over a live
 // process interactively (detach with Ctrl-\ Ctrl-\). `/babysit` shows this as a
 // hint alongside an inline snapshot instead of spawning a tmux window itself.
-function attachCmd(id: string): string {
+function sessionCliCommand(id: string, command: "log" | "attach"): string {
 	const meta = readMeta(id);
-	if (meta?.host) return `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} attach -s ${shq(meta.remoteId!)}`;
-	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} attach -s ${shq(id)}`;
+	if (meta?.host) return `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} ${command} -s ${shq(meta.remoteId!)}`;
+	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} ${command} -s ${shq(id)}`;
+}
+
+function attachCmd(id: string): string {
+	return sessionCliCommand(id, "attach");
 }
 
 // ---------------------------------------------------------------------------
@@ -4054,13 +3511,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	let sessionWidget: ReturnType<typeof createSessionWidget> | undefined;
-	let unsubscribeWidgetInput: (() => void) | undefined;
-
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
 		const all = snapshot ?? (await listSessions()).sessions;
-		const { active, all: ordered } = widgetSessionGroups(all, (id) => readMeta(id)?.startedAt ?? 0);
+		const { active } = widgetSessionGroups(all, (id) => readMeta(id)?.startedAt ?? 0);
 		const subs = active.filter((session) => kindOf(session.id) === "subagent");
 		const procs = active.length - subs.length;
 		const progressById = new Map<string, Progress>();
@@ -4075,101 +3529,25 @@ export default function (pi: ExtensionAPI) {
 
 		const theme = ctx.ui.theme;
 		const summaryLines = renderWidgetLines(procs, subs.length - idle, idle, theme);
-		await Promise.all(ordered.filter((session) => session.host && (session.state === "running" || !remoteTerminalTails.has(session.id))).map(async (session) => {
-			remoteTerminalTails.delete(session.id);
-			const result = await bs(["log", "-s", session.id, "--tail", String(WIDGET_COLLAPSED_TAIL_LINES)]);
-			remoteTails.set(session.id, result.code === 0 ? clip(result.stdout, TAIL_MAX_BYTES).trimEnd().split("\n").map(sanitizeTailLine) : [`Remote output unavailable on ${session.host}: ${clip(result.stderr, 200)}`]);
-			if (result.code === 0 && !session.transportError && (isConfirmedTerminalState(session.state) || session.state === "dead")) remoteTerminalTails.add(session.id);
-		}));
-		const tails = await Promise.all(
-			active.map((session) => {
-				const isSubagent = kindOf(session.id) === "subagent";
-				return widgetTail(
-					session.id,
-					isSubagent,
-					isSubagent ? progressById.get(session.id) : undefined,
-					WIDGET_COLLAPSED_TAIL_LINES,
-				);
-			}),
-		);
-		const activeTails = new Map(active.map((session, index) => [session.id, tails[index]]));
-		const displays = ordered.map((session): WidgetSessionDisplay => {
+		const displays = active.map((session): WidgetSessionDisplay => {
 			const id = session.id;
 			const meta = readMeta(id);
 			const isSubagent = meta?.kind === "subagent";
-			const description = meta?.description?.trim()
-				? theme.fg("warning", theme.bold(escapeCommandForDisplay(meta.description.trim())))
-				: undefined;
-			const details = isSubagent
-				? [
-					...(meta?.task ? [theme.fg("muted", `task: ${escapeCommandForDisplay(meta.task)}`)] : []),
-					...(meta?.launchCommand ? [theme.fg("muted", escapeCommandForDisplay(readableLaunchCommand(meta.launchCommand)))] : []),
-				]
-				: meta?.command ? [theme.fg("muted", escapeCommandForDisplay(meta.command))] : [];
-			if (description) details.unshift(description);
-			if (meta?.host) details.unshift(`host: ${meta.host}${session.transportError ? " (status unknown)" : ""} · ${attachCmd(id)}`);
-			if (session.state === "running") {
-				const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
-				return {
-					id,
-					header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme) + (session.transportError ? " · status unknown" : ""),
-					tail: activeTails.get(id) ?? [],
-					description,
-					viewable: true,
-					active: true,
-					details,
-				};
-			}
+			const state: WidgetSessionState = isSubagent && progressById.get(id)?.done ? "idle" : "running";
+			const description = meta?.description?.trim() || (isSubagent ? meta?.task : meta?.command);
+			const host = session.host ?? meta?.host;
 			return {
 				id,
-				header: renderWidgetSessionHeader(
-					id,
-					isSubagent ? "agent" : "process",
-					session.state === "exited" && session.exit_code === 0 ? "finished" : "failed",
-					"",
-					theme,
-				),
-				details,
-				description,
-				// Only read/parse visible sessions on demand.
-				get tail() {
-					try {
-						return widgetTail(id, isSubagent, undefined, WIDGET_COLLAPSED_TAIL_LINES);
-					} catch {
-						return [];
-					}
-				},
-				viewable: true,
+				header: renderWidgetSessionHeader(id, isSubagent ? "agent" : "process", state, elapsedOf(id), theme)
+					+ (host ? ` · host: ${host}` : "")
+					+ (session.transportError ? " · status unknown" : ""),
+				description: description ? theme.fg("warning", theme.bold(escapeCommandForDisplay(description))) : undefined,
 			};
 		});
-
-		if (ctx.mode === "tui") {
-			if (!sessionWidget) {
-				ctx.ui.setWidget("pi-babysit", (tui) => {
-					sessionWidget = createSessionWidget({
-						// Keep the viewer bounded while leaving room for editor/status/footer.
-						getHeight: () => Math.max(3, tui.terminal.rows - 8),
-						requestRender: () => tui.requestRender(),
-						getTheme: () => ctx.ui.theme,
-						readLog: (id) => {
-							if (readMeta(id)?.host) return remoteLogViewerSource(id, () => sessionWidget?.refresh());
-							const isAgent = kindOf(id) === "subagent";
-							return { file: logPath(id), isAgent };
-						},
-					});
-					return sessionWidget;
-				}, { placement: "belowEditor" });
-				unsubscribeWidgetInput = ctx.ui.onTerminalInput((data) =>
-					sessionWidget?.handleKey(data) ? { consume: true } : undefined);
-			}
-			sessionWidget?.update(summaryLines, displays);
-		} else {
-			const activeIds = new Set(active.map((session) => session.id));
-			const component = createWidgetComponent(summaryLines, displays.filter((session) => activeIds.has(session.id)), () => {});
-			ctx.ui.setWidget("pi-babysit", component.render(10_000), {
-				placement: "belowEditor",
-			});
-		}
+		const component = createWidgetComponent(summaryLines, displays);
+		ctx.ui.setWidget("pi-babysit", ctx.mode === "tui" ? () => component : component.render(10_000), {
+			placement: "belowEditor",
+		});
 	};
 
 	type DisplayStatus = "started" | "running" | "idle" | "success" | "failed" | "terminated";
@@ -4287,10 +3665,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		taskProgressCache.clear();
 		searchLogCache.clear();
-		remoteTails.clear();
-		remoteTerminalTails.clear();
-		remoteLogSyncs.clear();
-		remoteLogTimestampUnsupported.clear();
 		pollNeeded = true;
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
@@ -4353,9 +3727,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
-		unsubscribeWidgetInput?.();
-		unsubscribeWidgetInput = undefined;
-		sessionWidget = undefined;
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = undefined;
 		// Pi also emits session_shutdown while hot-reloading and switching sessions.
@@ -5671,16 +5042,58 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const pickSession = async (ctx: ExtensionContext): Promise<BsSession | undefined> => {
+		if (!(await babysitAvailable())) {
+			ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "error");
+			return;
+		}
+		const sessions = (await listSessions()).sessions.sort((a, b) =>
+			a.state === b.state ? 0 : a.state === "running" ? -1 : 1,
+		);
+		if (sessions.length === 0) {
+			ctx.ui.notify("No babysit sessions.", "info");
+			return;
+		}
+		const labels = sessions.map((s) => {
+			const meta = readMeta(s.id);
+			const kind = kindOf(s.id);
+			const icon = s.state === "running" ? "⏳" : s.exit_code === 0 ? "✓" : "✗";
+			const ec = s.exit_code != null ? ` exit=${s.exit_code}` : "";
+			const flag = s.note ? " ⚑" : "";
+			const what = escapeCommandForDisplay(sessionPreview(meta).replace(/\s+/g, " ").trim());
+			const preview = what.length > 60 ? `${what.slice(0, 57)}…` : what;
+			return `${icon} ${s.id}${flag} [${kind}] ${s.state}${ec}${preview ? `  — ${preview}` : ""}`;
+		});
+		const choice = await ctx.ui.select("Babysit sessions:", labels);
+		if (!choice) return;
+		return sessions[labels.indexOf(choice)];
+	};
+
+	pi.registerCommand("babysit-log", {
+		description: "Pick a session and put its babysit log command in the input buffer (does not execute it)",
+		handler: async (args, ctx) => {
+			if (args.trim()) {
+				ctx.ui.notify("Usage: /babysit-log", "error");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify("/babysit-log requires an interactive UI.", "error");
+				return;
+			}
+			const picked = await pickSession(ctx);
+			if (picked) ctx.ui.setEditorText(sessionCliCommand(picked.id, "log"));
+		},
+	});
+
 	// ----- /babysit -----------------------------------------------------------
 	// Arrow up/down picker over all sessions (like /stash). Renders an INLINE
 	// snapshot (no tmux): running process → current rendered screen + recent
 	// output + a copy-paste `babysit attach` take-over hint; running subagent →
 	// read-only progress; finished → summary. Re-run to refresh.
 	pi.registerCommand("babysit", {
-		description: "Pick a session to inspect; /babysit view opens its log viewer; /babysit gc [days] removes old terminal roots",
+		description: "Pick a session to inspect; /babysit gc [days] removes old terminal roots",
 		handler: async (args, ctx) => {
-			const view = args.trim() === "view";
-			const command = view ? "" : args.trim();
+			const command = args.trim();
 			if (command === "gc" || command.startsWith("gc ")) {
 				const daysText = command.slice(2).trim();
 				const days = daysText ? Number(daysText) : 14;
@@ -5715,46 +5128,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (command) {
-				ctx.ui.notify("Usage: /babysit, /babysit view, or /babysit gc [days]", "error");
+				ctx.ui.notify("Usage: /babysit or /babysit gc [days]", "error");
 				return;
 			}
-			if (!(await babysitAvailable())) {
-				ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "error");
-				return;
-			}
-			const sessions = (await listSessions()).sessions.sort((a, b) =>
-				a.state === b.state ? 0 : a.state === "running" ? -1 : 1,
-			);
-			if (sessions.length === 0) {
-				ctx.ui.notify("No babysit sessions.", "info");
-				return;
-			}
-
-			const whatOf = (s: BsSession): string => {
-				const meta = readMeta(s.id);
-				return escapeCommandForDisplay(sessionPreview(meta).replace(/\s+/g, " ").trim());
-			};
-
-			// Labels must be unique for index mapping; the id makes them unique.
-			const labels = sessions.map((s) => {
-				const kind = kindOf(s.id);
-				const icon = s.state === "running" ? "⏳" : s.exit_code === 0 ? "✓" : "✗";
-				const ec = s.exit_code != null ? ` exit=${s.exit_code}` : "";
-				const flag = s.note ? " ⚑" : "";
-				const what = whatOf(s);
-				const preview = what.length > 60 ? `${what.slice(0, 57)}…` : what;
-				return `${icon} ${s.id}${flag} [${kind}] ${s.state}${ec}${preview ? `  — ${preview}` : ""}`;
-			});
-
-			const choice = await ctx.ui.select("Babysit sessions:", labels);
-			if (!choice) return;
-			const picked = sessions[labels.indexOf(choice)];
+			const picked = await pickSession(ctx);
 			if (!picked) return;
-			if (view && ctx.mode === "tui") {
-				await refreshWidget(ctx);
-				sessionWidget?.open(picked.id);
-				return;
-			}
 			const kind = kindOf(picked.id);
 			const elapsed = picked.state === "running" ? elapsedOf(picked.id) : null;
 			const elapsedSuffix = elapsed ? ` ${elapsed}` : "";

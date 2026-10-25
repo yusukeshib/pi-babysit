@@ -36,10 +36,11 @@ save();
  writeFileSync(script, `
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import extension, {gcBabysitRoots,remoteLogMirrorPath,remoteProcessCommand,remoteProcessId,syncRemoteLog,validateProcessHost,widgetTail} from ${JSON.stringify(path.join(import.meta.dir, "index.ts"))};
+import extension, {gcBabysitRoots,remoteProcessCommand,remoteProcessId,validateProcessHost} from ${JSON.stringify(path.join(import.meta.dir, "index.ts"))};
 const tools=new Map(); const hooks=new Map(); const messages=[];
 extension({registerTool:t=>tools.set(t.name,t),on:(n,h)=>hooks.set(n,h),registerCommand(){},registerMessageRenderer(){},getActiveTools:()=>[],getThinkingLevel:()=> 'low',sendMessage:m=>messages.push(m)});
-const ctx={hasUI:true,ui:{setWidget(){},theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s}},cwd:'/local/does-not-exist',isIdle:()=>true, sessionManager:{getSessionId:()=> 'fake',getSessionFile:()=> '/local/pi-session.jsonl'},model:{provider:'test',id:'test'}};
+let widget; let inputHooks=0;
+const ctx={hasUI:true,mode:'tui',ui:{setWidget(_name,factory){widget=typeof factory==='function'?factory():undefined;},onTerminalInput(){inputHooks++;},theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s}},cwd:'/local/does-not-exist',isIdle:()=>true, sessionManager:{getSessionId:()=> 'fake',getSessionFile:()=> '/local/pi-session.jsonl'},model:{provider:'test',id:'test'}};
 const call=async(name,args,signal)=>{args={description:'Verify remote '+name+' behavior',...args}; try {return await tools.get('babysit_'+name).execute('call',args,signal,undefined,ctx);} catch(e){return {isError:true,content:[{text:e.message}],details:{}};}};
 const read=()=>JSON.parse(fs.readFileSync(process.env.FAKE_STATE,'utf8'));
 const set=(values)=>fs.writeFileSync(process.env.FAKE_STATE,JSON.stringify({...read(),...values}));
@@ -73,24 +74,15 @@ set({hangWait:true}); const controller=new AbortController(); const hangStarted=
 const detached=await call('run',{host:'alpha',name:'detached',command:'sleep 10',foreground:true,lifecycle:'detached'},AbortSignal.abort()); assert(detached.isError); assert(!meta('detached').remoteTerminalState); assert(!(await call('kill',{id:'detached'})).isError);
 set({unconfirmed:true}); const unverified=await call('run',{host:'alpha',name:'unverified',command:'sleep 10',foreground:true},AbortSignal.abort()); assert(unverified.isError); assert(unverified.content[0].text.includes('could not be verified')); assert(!meta('unverified').killNotificationSuppressed); set({unconfirmed:false}); assert(!(await call('kill',{id:'unverified'})).isError);
 set({malformed:true}); const malformed=await call('run',{host:'alpha',name:'malformed',command:'true',continueAfterStart:true}); assert(malformed.isError); assert(meta('malformed').remoteId); set({malformed:false}); assert(!(await call('kill',{id:'malformed'})).isError);
-// A running preview must be replaced by a final tail; failed terminal reads
-// must retry until a successful terminal read becomes reusable.
-set({logText:'running preview'}); const tailProc=await call('run',{host:'alpha',name:'tail-cache',command:'sleep 10',continueAfterStart:true}); assert(!tailProc.isError); assert(widgetTail('tail-cache',false).join('').includes('running preview'));
-set({logText:'final tail',logFail:true}); assert(!(await call('kill',{id:'tail-cache'})).isError); assert(widgetTail('tail-cache',false).join('').includes('unavailable'));
-set({logFail:false}); assert(!(await call('kill',{id:'tail-cache'})).isError); assert(widgetTail('tail-cache',false).join('').includes('final tail'));
-const finalRemoteId=meta('tail-cache').remoteId; const finalReads=()=>read().calls.filter(c=>c.args.includes('log') && c.args.includes(finalRemoteId)).length; const cachedReads=finalReads(); assert(!(await call('kill',{id:'tail-cache'})).isError); assert.equal(finalReads(),cachedReads);
-const restarted=read(); Object.assign(restarted.sessions.alpha[finalRemoteId],{state:'running',alive:true,exit_code:null}); fs.writeFileSync(process.env.FAKE_STATE,JSON.stringify(restarted)); assert(!(await call('check',{id:'tail-cache'})).isError); assert.equal(meta('tail-cache').remoteTerminalState,undefined); assert(!(await call('kill',{id:'tail-cache'})).isError); set({logText:undefined});
-// The widget viewer reads a local mirror of the full remote log, synced incrementally.
-set({logText:'first\\n'}); const mirrored=await call('run',{host:'alpha',name:'mirror',command:'sleep 10',continueAfterStart:true}); assert(!mirrored.isError,JSON.stringify(mirrored));
-const mirrorText=()=>fs.readFileSync(remoteLogMirrorPath('mirror'),'utf8'); const mirrorReads=()=>read().calls.filter(c=>c.args.includes('log')&&c.args.includes('--json'));
-const mirrorDates=()=>fs.readFileSync(remoteLogMirrorPath('mirror').replace(/output\.log$/,'output.timestamps.jsonl'),'utf8');
-assert(await syncRemoteLog('mirror')); assert.equal(mirrorText(),'first\\n'); assert.equal(mirrorDates(),'[0,6,1000]\\n'); assert.equal(mirrorReads().at(-1).args[mirrorReads().at(-1).args.indexOf('--since')+1],'0'); assert(mirrorReads().at(-1).args.includes(meta('mirror').remoteId));
-set({logText:'first\\nsecond\\n'}); assert(await syncRemoteLog('mirror')); assert.equal(mirrorText(),'first\\nsecond\\n'); assert.equal(mirrorDates(),'[0,6,1000]\\n[6,7,1001]\\n'); assert.equal(mirrorReads().at(-1).args[mirrorReads().at(-1).args.indexOf('--since')+1],'6');
-assert(!(await syncRemoteLog('mirror'))); assert.equal(mirrorText(),'first\\nsecond\\n');
-set({logText:'restarted\\n'}); assert(await syncRemoteLog('mirror')); assert(await syncRemoteLog('mirror')); assert.equal(mirrorText(),'restarted\\n'); assert.equal(mirrorDates(),'[0,10,1000]\\n');
-// An older remote babysit without --timestamps still mirrors text, undated.
-set({logText:'restarted\\nold host\\n',noTimestamps:true}); assert(await syncRemoteLog('mirror')); assert.equal(mirrorText(),'restarted\\nold host\\n'); assert.equal(mirrorDates(),'[0,10,1000]\\n'); const plainReads=mirrorReads().length; set({logText:'restarted\\nold host\\nmore\\n'}); assert(await syncRemoteLog('mirror')); assert.equal(mirrorReads().length,plainReads+1); assert(!mirrorReads().at(-1).args.includes('--timestamps')); set({noTimestamps:false}); set({logText:'restarted\\nold host\\nmore\\n'});
-assert(!(await call('kill',{id:'mirror'})).isError); assert(await syncRemoteLog('mirror')); const completedReads=mirrorReads().length; assert(!(await syncRemoteLog('mirror'))); assert.equal(mirrorReads().length,completedReads); assert.equal(mirrorText(),'restarted\\nold host\\nmore\\n'); set({logText:undefined});
+// Widget refreshes are passive: no log commands, input hooks, or terminal rows.
+const logReads=()=>read().calls.filter(c=>c.args.includes('log')).length;
+const beforeWidget=logReads();
+const passive=await call('run',{host:'alpha',name:'passive-list',description:'Check passive remote list',command:'sleep 10',continueAfterStart:true}); assert(!passive.isError,JSON.stringify(passive));
+assert.equal(logReads(),beforeWidget); assert.equal(inputHooks,0); assert.deepEqual(Object.keys(widget).sort(),['invalidate','render']);
+assert(widget.render(200).join('\\n').includes('host: alpha')); assert(widget.render(200).join('\\n').includes('Check passive remote list'));
+assert(!(await call('kill',{id:'passive-list'})).isError); assert.equal(logReads(),beforeWidget); assert(!widget.render(200).join('\\n').includes('passive-list'));
+// A restarted remote session clears its previously persisted terminal state.
+const finalRemoteId=meta('passive-list').remoteId; const restarted=read(); Object.assign(restarted.sessions.alpha[finalRemoteId],{state:'running',alive:true,exit_code:null}); fs.writeFileSync(process.env.FAKE_STATE,JSON.stringify(restarted)); assert(!(await call('check',{id:'passive-list'})).isError); assert.equal(meta('passive-list').remoteTerminalState,undefined); assert(!(await call('kill',{id:'passive-list'})).isError);
 // Legacy metadata without a description remains readable.
 const legacy=meta(id); delete legacy.description; fs.writeFileSync(process.env.PI_BABYSIT_DIR+'/meta/'+id+'.json',JSON.stringify(legacy)); assert(!(await call('check',{id})).isError);
 const bad=await call('run',{host:'--help',command:'true'}); assert(bad.isError); const sub=await call('run',{host:'alpha',profile:'subagent',task:'x'}); assert(sub.isError);
