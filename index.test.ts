@@ -224,7 +224,7 @@ test("widget preserves colored descriptions without keyboard or log-viewer APIs"
 	expect(widget.render(120)).toEqual([
 		"RUNNING 1 process", "described PROCESS RUNNING · host: alpha \x1b[33mCheck remote build\x1b[0m",
 	]);
-	expect(Object.keys(widget).sort()).toEqual(["handleMouse", "invalidate", "render"]);
+	expect(Object.keys(widget).sort()).toEqual(["dispose", "handleMouse", "invalidate", "render", "update"]);
 	widget.invalidate();
 	expect(widget.render(120)).toHaveLength(2);
 });

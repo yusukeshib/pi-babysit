@@ -2603,11 +2603,49 @@ export interface WidgetSessionDisplay {
 export function createWidgetComponent(
 	summaryLines: string[],
 	sessions: WidgetSessionDisplay[],
-	onCopy?: (id: string) => void,
+	onCopy?: (id: string) => void | Promise<void>,
+	requestRender: () => void = () => {},
 ) {
 	let renderedWidth = 0;
+	let disposed = false;
 	const copyTargets = new Map<number, string>();
+	const feedback = new Map<string, { icon: string; timer?: ReturnType<typeof setTimeout> }>();
+	const clearFeedback = (id: string) => {
+		clearTimeout(feedback.get(id)?.timer);
+		feedback.delete(id);
+	};
+	const copy = (id: string) => {
+		if (!onCopy || feedback.get(id)?.icon === "…") return;
+		clearFeedback(id);
+		const state: { icon: string; timer?: ReturnType<typeof setTimeout> } = { icon: "…" };
+		feedback.set(id, state);
+		requestRender();
+		const finish = (icon: string) => {
+			if (disposed || feedback.get(id) !== state) return;
+			state.icon = icon;
+			state.timer = setTimeout(() => {
+				if (feedback.get(id) !== state) return;
+				feedback.delete(id);
+				requestRender();
+			}, 2000);
+			state.timer.unref?.();
+			requestRender();
+		};
+		try {
+			void Promise.resolve(onCopy(id)).then(() => finish("✓"), () => finish("!"));
+		} catch {
+			finish("!");
+		}
+	};
 	return {
+		update(summary: string[], rows: WidgetSessionDisplay[]) {
+			summaryLines = summary;
+			sessions = rows;
+			copyTargets.clear();
+			const ids = new Set(rows.map((row) => row.id));
+			for (const id of feedback.keys()) if (!ids.has(id)) clearFeedback(id);
+			requestRender();
+		},
 		render(width: number): string[] {
 			renderedWidth = Math.max(0, width);
 			copyTargets.clear();
@@ -2617,7 +2655,7 @@ export function createWidgetComponent(
 				if (onCopy && renderedWidth >= 3) {
 					const content = truncateToWidth(text, renderedWidth - 2, "…");
 					copyTargets.set(lines.length, session.id);
-					lines.push(`${content}${" ".repeat(renderedWidth - 1 - visibleWidth(content))}⧉`);
+					lines.push(`${content}${" ".repeat(renderedWidth - 1 - visibleWidth(content))}${feedback.get(session.id)?.icon ?? "⧉"}`);
 				} else {
 					lines.push(truncateToWidth(text, renderedWidth, "…"));
 				}
@@ -2625,19 +2663,24 @@ export function createWidgetComponent(
 			return lines;
 		},
 		handleMouse(event: TuiMouseEvent) {
-			if (!onCopy || event.width !== renderedWidth || event.x !== renderedWidth - 1 ||
+			if (disposed || !onCopy || event.width !== renderedWidth || event.x !== renderedWidth - 1 ||
 				event.button !== "left" || event.shift || event.alt || event.ctrl) return undefined;
 			const id = copyTargets.get(event.y);
 			if (!id) return undefined;
 			if (event.type === "press") {
-				onCopy(id);
-				return { handled: true, render: false };
+				copy(id);
+				return { handled: true, render: true };
 			}
 			// Pi synthesizes a click after press/release; do not copy twice.
 			if (event.type === "click" || event.type === "release") return { handled: true, render: false };
 			return undefined;
 		},
 		invalidate() { copyTargets.clear(); },
+		dispose() {
+			disposed = true;
+			copyTargets.clear();
+			for (const id of feedback.keys()) clearFeedback(id);
+		},
 	};
 }
 
@@ -3540,6 +3583,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	let sessionWidget: ReturnType<typeof createWidgetComponent> | undefined;
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
 		if (!ctx.hasUI) return;
 		const all = snapshot ?? (await listSessions()).sessions;
@@ -3573,16 +3617,22 @@ export default function (pi: ExtensionAPI) {
 				description: description ? theme.fg("warning", theme.bold(escapeCommandForDisplay(description))) : undefined,
 			};
 		});
-		const component = createWidgetComponent(summaryLines, displays, ctx.mode === "tui" ? (id) => {
-			const command = sessionCliCommand(id, "log");
-			void copyToClipboard(command).then(
-				() => ctx.ui.notify(`Log command copied for ${id}.`, "info"),
-				(error) => ctx.ui.notify(`Could not copy log command: ${error}\n${command}`, "error"),
-			);
-		} : undefined);
-		ctx.ui.setWidget("pi-babysit", ctx.mode === "tui" ? () => component : component.render(10_000), {
-			placement: "belowEditor",
-		});
+		if (ctx.mode === "tui") {
+			if (!sessionWidget) {
+				ctx.ui.setWidget("pi-babysit", (tui) => {
+					sessionWidget = createWidgetComponent(summaryLines, displays,
+						(id) => copyToClipboard(sessionCliCommand(id, "log")),
+						() => tui.requestRender());
+					return sessionWidget;
+				}, { placement: "belowEditor" });
+			} else {
+				sessionWidget.update(summaryLines, displays);
+			}
+		} else {
+			ctx.ui.setWidget("pi-babysit", createWidgetComponent(summaryLines, displays).render(10_000), {
+				placement: "belowEditor",
+			});
+		}
 	};
 
 	type DisplayStatus = "started" | "running" | "idle" | "success" | "failed" | "terminated";
@@ -3762,6 +3812,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		sessionWidget?.dispose();
+		sessionWidget = undefined;
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = undefined;
 		// Pi also emits session_shutdown while hot-reloading and switching sessions.

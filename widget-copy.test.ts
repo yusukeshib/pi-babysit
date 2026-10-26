@@ -7,7 +7,7 @@ function fixture() {
 	const rows = Array.from({ length: 12 }, (_, i) => ({
 		id: `job-${i}`, header: `\x1b[32m日本語 job-${i} AGENT IDLE\x1b[0m`, description: "Review changes ".repeat(8),
 	}));
-	const widget = createWidgetComponent(["RUNNING", "IDLE"], rows, (id) => copied.push(id));
+	const widget = createWidgetComponent(["RUNNING", "IDLE"], rows, (id) => { copied.push(id); });
 	const host = new Container();
 	host.addChild(widget);
 	let width = 40;
@@ -21,7 +21,7 @@ function fixture() {
 }
 
 test("single copy icon stays at the right edge and copies only the selected row once", () => {
-	const { copied, rows, render, mouse } = fixture();
+	const { widget, copied, rows, render, mouse } = fixture();
 	const lines = render();
 	expect(lines).toHaveLength(rows.length + 2);
 	for (const line of lines.slice(2)) {
@@ -34,7 +34,9 @@ test("single copy icon stays at the right edge and copies only the selected row 
 	mouse({ type: "release", y: 13 });
 	mouse({ type: "click", y: 13 });
 	expect(copied).toEqual(["job-11"]);
-	expect(render()).toEqual(lines);
+	expect(render().slice(0, 13)).toEqual(lines.slice(0, 13));
+	expect(render()[13].endsWith("…")).toBe(true);
+	widget.dispose();
 });
 
 test("row text, summary, modifiers, non-left buttons and wheel remain unhandled", () => {
@@ -63,7 +65,7 @@ test("resize and invalidation discard stale icon targets; narrow rows stay bound
 		if (width < 3) {
 			expect(lines.join("")).not.toContain("⧉");
 			expect(mouse({})).toBeUndefined();
-		} else expect(lines.slice(2).every((line) => line.endsWith("⧉"))).toBe(true);
+		} else expect(lines.slice(2).every((line) => /[⧉…✓!]$/.test(line))).toBe(true);
 	}
 });
 

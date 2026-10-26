@@ -40,7 +40,7 @@ import extension, {gcBabysitRoots,remoteProcessCommand,remoteProcessId,validateP
 const tools=new Map(); const hooks=new Map(); const messages=[];
 extension({registerTool:t=>tools.set(t.name,t),on:(n,h)=>hooks.set(n,h),registerCommand(){},registerMessageRenderer(){},getActiveTools:()=>[],getThinkingLevel:()=> 'low',sendMessage:m=>messages.push(m)});
 let widget; let inputHooks=0;
-const ctx={hasUI:true,mode:'tui',ui:{setWidget(_name,factory){widget=typeof factory==='function'?factory():undefined;},onTerminalInput(){inputHooks++;},theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s}},cwd:'/local/does-not-exist',isIdle:()=>true, sessionManager:{getSessionId:()=> 'fake',getSessionFile:()=> '/local/pi-session.jsonl'},model:{provider:'test',id:'test'}};
+const ctx={hasUI:true,mode:'tui',ui:{setWidget(_name,factory){widget=typeof factory==='function'?factory({requestRender(){}}):undefined;},onTerminalInput(){inputHooks++;},theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s}},cwd:'/local/does-not-exist',isIdle:()=>true, sessionManager:{getSessionId:()=> 'fake',getSessionFile:()=> '/local/pi-session.jsonl'},model:{provider:'test',id:'test'}};
 const call=async(name,args,signal)=>{args={description:'Verify remote '+name+' behavior',...args}; try {return await tools.get('babysit_'+name).execute('call',args,signal,undefined,ctx);} catch(e){return {isError:true,content:[{text:e.message}],details:{}};}};
 const read=()=>JSON.parse(fs.readFileSync(process.env.FAKE_STATE,'utf8'));
 const set=(values)=>fs.writeFileSync(process.env.FAKE_STATE,JSON.stringify({...read(),...values}));
@@ -78,7 +78,7 @@ set({malformed:true}); const malformed=await call('run',{host:'alpha',name:'malf
 const logReads=()=>read().calls.filter(c=>c.args.includes('log')).length;
 const beforeWidget=logReads();
 const passive=await call('run',{host:'alpha',name:'passive-list',description:'Check passive remote list',command:'sleep 10',continueAfterStart:true}); assert(!passive.isError,JSON.stringify(passive));
-assert.equal(logReads(),beforeWidget); assert.equal(inputHooks,0); assert.deepEqual(Object.keys(widget).sort(),['handleMouse','invalidate','render']);
+assert.equal(logReads(),beforeWidget); assert.equal(inputHooks,0); assert.deepEqual(Object.keys(widget).sort(),['dispose','handleMouse','invalidate','render','update']);
 assert(widget.render(200).join('\\n').includes('host: alpha')); assert(widget.render(200).join('\\n').includes('Check passive remote list'));
 assert(!(await call('kill',{id:'passive-list'})).isError); assert.equal(logReads(),beforeWidget); assert(!widget.render(200).join('\\n').includes('passive-list'));
 // A restarted remote session clears its previously persisted terminal state.

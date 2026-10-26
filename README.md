@@ -161,9 +161,10 @@ Older sessions fall back to their command or task. Rows truncate to terminal wid
 with `…`. In fullscreen mode, click the single `⧉` icon at the right edge of a row
 to copy that session's shell-quoted `babysit log` command. It includes the local
 `BABYSIT_DIR` or remote host/worker ID, without executing the command or changing
-the input buffer. Copy failures are reported instead of claiming success. Only
-the icon is clickable; rows never expand. There is no paging, all/running toggle,
-keyboard handling, or log fetching. Very narrow widgets omit the icon.
+the input buffer. The icon changes in place: `…` while copying, `✓` on success,
+or `!` on failure. The result stays visible for two seconds before returning to
+`⧉`, including across list refreshes. Only the icon is clickable; rows never expand.
+There is no paging, all/running toggle, keyboard handling, or log fetching. Very narrow widgets omit the icon.
 Finished sessions disappear from the widget. Without mouse support, or for finished
 sessions, use the keyboard picker `/babysit`; its snapshot includes the log command
 for manual copying. The babysit tools also remain available to inspect output.

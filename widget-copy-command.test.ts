@@ -48,17 +48,18 @@ const {default:extension}=await import(${JSON.stringify(path.join(import.meta.di
 const commands=new Map(), tools=new Map(), messages=[];
 extension({registerTool:t=>tools.set(t.name,t),on(){},registerMessageRenderer(){},registerCommand:(n,c)=>commands.set(n,c),getActiveTools:()=>[],getThinkingLevel:()=> 'low',sendMessage:m=>messages.push(m)});
 const read=()=>JSON.parse(fs.readFileSync(process.env.FAKE_LOG_STATE,'utf8'));
-let widget, editorEdits=0, notices=[], selected;
-const ctx={hasUI:true,mode:'tui',cwd:${JSON.stringify(import.meta.dir)},ui:{setWidget:(_name,value)=>{widget=typeof value==='function'?value():value;},setEditorText:()=>editorEdits++,notify:(text,kind)=>notices.push({text,kind}),theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s},select:async(_title,labels)=>labels.find(label=>label.includes(selected))},sessionManager:{getSessionId:()=> 'copy-test',getSessionFile:()=>undefined}};
+let widget, editorEdits=0, notices=[], selected, renderRequests=0;
+const ctx={hasUI:true,mode:'tui',cwd:${JSON.stringify(import.meta.dir)},ui:{setWidget:(_name,value)=>{widget=typeof value==='function'?value({requestRender(){renderRequests++;}}):value;},setEditorText:()=>editorEdits++,notify:(text,kind)=>notices.push({text,kind}),theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s},select:async(_title,labels)=>labels.find(label=>label.includes(selected))},sessionManager:{getSessionId:()=> 'copy-test',getSessionFile:()=>undefined}};
 const refresh=async()=>{const result=await tools.get('babysit_run').execute('test',{description:'Refresh widget fixture',name:'fixture',command:'true',continueAfterStart:true},undefined,undefined,ctx);assert(!result.isError,JSON.stringify(result));};
 assert(!commands.has('babysit-log'));
 await refresh();
 assert(!read().calls.some(c=>c.args.includes('log')),'refresh must not read logs');
 const click=async id=>{
  const lines=widget.render(200), y=lines.findIndex(line=>line.includes(id));
- assert(y>=0,id+' not in widget'); assert(lines[y].endsWith('⧉'));
+ assert(y>=0,id+' not in widget'); assert(/[⧉✓!]$/.test(lines[y]));
  const event={type:'press',button:'left',x:199,y,width:200,height:lines.length,shift:false,alt:false,ctrl:false};
  assert(widget.handleMouse(event).handled);
+ assert(widget.render(200)[y].endsWith('…'),'copy must show immediate pending feedback');
  widget.handleMouse({...event,type:'release'}); widget.handleMouse({...event,type:'click'});
  await new Promise(resolve=>setImmediate(resolve));
 };
@@ -71,21 +72,22 @@ for(const [id,expectedArgs,local] of [
  await click(id);
  assert.equal(clipboard.length,previousCopies+1);
  assert.equal(read().calls.filter(c=>c.args.includes('log')).length,previousLogCalls,'copy must not execute logs');
- assert.equal(notices.at(-1).kind,'info');
+ assert(widget.render(200).find(line=>line.includes(id)).endsWith('✓'),'successful copy must show a checkmark');
  const command=clipboard.at(-1);
  const result=spawnSync('sh',['-c',command],{encoding:'utf8'});
  assert.equal(result.status,0,result.stderr); assert.equal(result.stdout.trim(),'selected log');
  const call=read().calls.at(-1); assert.deepEqual(call.args,expectedArgs);
  if(local) assert.equal(call.root,process.env.PI_BABYSIT_DIR);
 }
-assert.equal(editorEdits,0);
+assert.equal(editorEdits,0); assert(renderRequests>=6);
+const originalWidget=widget; await refresh(); assert.equal(widget,originalWidget,'poll refresh must preserve feedback state'); assert(widget.render(200).find(line=>line.includes(${JSON.stringify(localId)})).endsWith('✓'));
 rejectCopy=true; const previousCopies=clipboard.length; await click(${JSON.stringify(localId)});
-assert.equal(clipboard.length,previousCopies); assert.equal(notices.at(-1).kind,'error'); assert(notices.at(-1).text.includes('clipboard denied')); assert.equal(editorEdits,0);
+assert.equal(clipboard.length,previousCopies); assert(widget.render(200).find(line=>line.includes(${JSON.stringify(localId)})).endsWith('!')); assert.equal(editorEdits,0);
 // The existing keyboard picker exposes the same command for manual copying.
 for(const [id,expected] of [[${JSON.stringify(localId)},clipboard[0]],[${JSON.stringify(agentId)},clipboard[1]],[${JSON.stringify(remoteId)},clipboard[2]]]) {
  selected=id; await commands.get('babysit').handler('',ctx); assert(messages.at(-1).details.body.includes(expected));
 }
-ctx.mode='rpc'; await refresh(); assert(Array.isArray(widget)); assert(!widget.join('').includes('⧉'));
+originalWidget.dispose(); ctx.mode='rpc'; await refresh(); assert(Array.isArray(widget)); assert(!widget.join('').includes('⧉'));
 `);
 	try {
 		const result = spawnSync(process.execPath, [script], {
