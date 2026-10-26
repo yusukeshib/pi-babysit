@@ -151,18 +151,24 @@ before local retention can collect their metadata.
 | Command | What it does |
 | ------- | ------------ |
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
-| `/babysit-log` | Pick any process or agent (running or finished) and put its shell-quoted `babysit log` command in Pi's input buffer for copying. Includes the local session namespace or remote host/worker ID. Does not execute the command or write to the clipboard |
 | `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; old empty roots are eligible once their lease is gone. Deletion uses a GC lock and atomic rename |
 
-The read-only widget below the editor lists all running sessions, newest first,
+The widget below the editor lists all running sessions, newest first,
 including reusable idle agents. Summary counts use `RUNNING` / `IDLE`; rows show
 `PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`, total session age, remote host
 and unknown-status indicators when applicable, and a colored one-line description.
 Older sessions fall back to their command or task. Rows truncate to terminal width
-with `…`; there is no paging, mouse interaction, keyboard handling, or log fetching.
-Finished sessions disappear from the widget. Use `/babysit` for snapshots or the
-babysit tools to inspect output. Transcript details from tool results, snapshots,
-and completion notifications still use Pi's tool-output toggle (`Ctrl+O` by default).
+with `…`. In fullscreen mode, click the single `⧉` icon at the right edge of a row
+to copy that session's shell-quoted `babysit log` command. It includes the local
+`BABYSIT_DIR` or remote host/worker ID, without executing the command or changing
+the input buffer. Copy failures are reported instead of claiming success. Only
+the icon is clickable; rows never expand. There is no paging, all/running toggle,
+keyboard handling, or log fetching. Very narrow widgets omit the icon.
+Finished sessions disappear from the widget. Without mouse support, or for finished
+sessions, use the keyboard picker `/babysit`; its snapshot includes the log command
+for manual copying. The babysit tools also remain available to inspect output.
+Transcript details from tool results, snapshots, and completion notifications still
+use Pi's tool-output toggle (`Ctrl+O` by default).
 
 ## Logs without context flooding
 

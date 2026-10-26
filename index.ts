@@ -43,8 +43,8 @@ import type {
 	Theme,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { copyToClipboard, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
@@ -2599,16 +2599,45 @@ export interface WidgetSessionDisplay {
 	description?: string;
 }
 
-/** Passive running-session list; no input handlers or log reads. */
-export function createWidgetComponent(summaryLines: string[], sessions: WidgetSessionDisplay[]) {
+/** Running-session list with an optional copy-log icon; never reads logs. */
+export function createWidgetComponent(
+	summaryLines: string[],
+	sessions: WidgetSessionDisplay[],
+	onCopy?: (id: string) => void,
+) {
+	let renderedWidth = 0;
+	const copyTargets = new Map<number, string>();
 	return {
 		render(width: number): string[] {
-			return [
-				...summaryLines,
-				...sessions.map((session) => `${session.header}${session.description ? ` ${session.description}` : ""}`),
-			].map((line) => truncateToWidth(line, Math.max(0, width), "…"));
+			renderedWidth = Math.max(0, width);
+			copyTargets.clear();
+			const lines = summaryLines.map((line) => truncateToWidth(line, renderedWidth, "…"));
+			for (const session of sessions) {
+				const text = `${session.header}${session.description ? ` ${session.description}` : ""}`;
+				if (onCopy && renderedWidth >= 3) {
+					const content = truncateToWidth(text, renderedWidth - 2, "…");
+					copyTargets.set(lines.length, session.id);
+					lines.push(`${content}${" ".repeat(renderedWidth - 1 - visibleWidth(content))}⧉`);
+				} else {
+					lines.push(truncateToWidth(text, renderedWidth, "…"));
+				}
+			}
+			return lines;
 		},
-		invalidate() {},
+		handleMouse(event: TuiMouseEvent) {
+			if (!onCopy || event.width !== renderedWidth || event.x !== renderedWidth - 1 ||
+				event.button !== "left" || event.shift || event.alt || event.ctrl) return undefined;
+			const id = copyTargets.get(event.y);
+			if (!id) return undefined;
+			if (event.type === "press") {
+				onCopy(id);
+				return { handled: true, render: false };
+			}
+			// Pi synthesizes a click after press/release; do not copy twice.
+			if (event.type === "click" || event.type === "release") return { handled: true, render: false };
+			return undefined;
+		},
+		invalidate() { copyTargets.clear(); },
 	};
 }
 
@@ -3544,7 +3573,13 @@ export default function (pi: ExtensionAPI) {
 				description: description ? theme.fg("warning", theme.bold(escapeCommandForDisplay(description))) : undefined,
 			};
 		});
-		const component = createWidgetComponent(summaryLines, displays);
+		const component = createWidgetComponent(summaryLines, displays, ctx.mode === "tui" ? (id) => {
+			const command = sessionCliCommand(id, "log");
+			void copyToClipboard(command).then(
+				() => ctx.ui.notify(`Log command copied for ${id}.`, "info"),
+				(error) => ctx.ui.notify(`Could not copy log command: ${error}\n${command}`, "error"),
+			);
+		} : undefined);
 		ctx.ui.setWidget("pi-babysit", ctx.mode === "tui" ? () => component : component.render(10_000), {
 			placement: "belowEditor",
 		});
@@ -5069,22 +5104,6 @@ export default function (pi: ExtensionAPI) {
 		return sessions[labels.indexOf(choice)];
 	};
 
-	pi.registerCommand("babysit-log", {
-		description: "Pick a session and put its babysit log command in the input buffer (does not execute it)",
-		handler: async (args, ctx) => {
-			if (args.trim()) {
-				ctx.ui.notify("Usage: /babysit-log", "error");
-				return;
-			}
-			if (!ctx.hasUI) {
-				ctx.ui.notify("/babysit-log requires an interactive UI.", "error");
-				return;
-			}
-			const picked = await pickSession(ctx);
-			if (picked) ctx.ui.setEditorText(sessionCliCommand(picked.id, "log"));
-		},
-	});
-
 	// ----- /babysit -----------------------------------------------------------
 	// Arrow up/down picker over all sessions (like /stash). Renders an INLINE
 	// snapshot (no tmux): running process → current rendered screen + recent
@@ -5151,7 +5170,8 @@ export default function (pi: ExtensionAPI) {
 						`(no structured output; full log: ${logPath(picked.id)})`) +
 					(picked.state === "running"
 						? "\n\n_Live subagent (read-only). Re-run `/babysit` to refresh this snapshot._"
-						: "");
+						: "") +
+					`\n\n**Log command**\n\`\`\`sh\n${sessionCliCommand(picked.id, "log")}\n\`\`\``;
 				const title =
 					`${picked.id} ${picked.state}${elapsedSuffix}` +
 					(picked.exit_code != null ? ` (exit=${picked.exit_code})` : "") +
@@ -5198,7 +5218,8 @@ export default function (pi: ExtensionAPI) {
 							: "(no output)") +
 					(running
 						? `\n\n_Take over in your own terminal:_ \`${attachCmd(picked.id)}\` _(detach: Ctrl-\\ Ctrl-\\)._ Re-run \`/babysit\` to refresh this snapshot.`
-						: "");
+						: "") +
+					`\n\n**Log command**\n\`\`\`sh\n${sessionCliCommand(picked.id, "log")}\n\`\`\``;
 				const status: DisplayStatus = running
 					? "running"
 					: picked.exit_code === 0

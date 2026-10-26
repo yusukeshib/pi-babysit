@@ -216,7 +216,7 @@ test("session previews prefer trimmed descriptions with legacy payload fallbacks
 	expect(sessionPreview(undefined)).toBe("");
 });
 
-test("passive widget preserves colored descriptions and has no input or open API", () => {
+test("widget preserves colored descriptions without keyboard or log-viewer APIs", () => {
 	const widget = createWidgetComponent(["RUNNING 1 process"], [{
 		id: "described", header: "described PROCESS RUNNING · host: alpha",
 		description: "\x1b[33mCheck remote build\x1b[0m",
@@ -224,7 +224,7 @@ test("passive widget preserves colored descriptions and has no input or open API
 	expect(widget.render(120)).toEqual([
 		"RUNNING 1 process", "described PROCESS RUNNING · host: alpha \x1b[33mCheck remote build\x1b[0m",
 	]);
-	expect(Object.keys(widget).sort()).toEqual(["invalidate", "render"]);
+	expect(Object.keys(widget).sort()).toEqual(["handleMouse", "invalidate", "render"]);
 	widget.invalidate();
 	expect(widget.render(120)).toHaveLength(2);
 });

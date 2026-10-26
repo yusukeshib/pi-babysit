@@ -78,7 +78,7 @@ set({malformed:true}); const malformed=await call('run',{host:'alpha',name:'malf
 const logReads=()=>read().calls.filter(c=>c.args.includes('log')).length;
 const beforeWidget=logReads();
 const passive=await call('run',{host:'alpha',name:'passive-list',description:'Check passive remote list',command:'sleep 10',continueAfterStart:true}); assert(!passive.isError,JSON.stringify(passive));
-assert.equal(logReads(),beforeWidget); assert.equal(inputHooks,0); assert.deepEqual(Object.keys(widget).sort(),['invalidate','render']);
+assert.equal(logReads(),beforeWidget); assert.equal(inputHooks,0); assert.deepEqual(Object.keys(widget).sort(),['handleMouse','invalidate','render']);
 assert(widget.render(200).join('\\n').includes('host: alpha')); assert(widget.render(200).join('\\n').includes('Check passive remote list'));
 assert(!(await call('kill',{id:'passive-list'})).isError); assert.equal(logReads(),beforeWidget); assert(!widget.render(200).join('\\n').includes('passive-list'));
 // A restarted remote session clears its previously persisted terminal state.
