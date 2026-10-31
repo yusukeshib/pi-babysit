@@ -32,6 +32,10 @@ import extension, {
 	deliverProcessCompletionMessage,
 	gcBabysitRoots,
 	isAllowedDirectBash,
+	isSettledSession,
+	pollDeferredUntil,
+	remoteBackoffDelayMs,
+	runGcWorker,
 	isConfirmedTerminalState,
 	isNotificationGroupReady,
 	isSupportedBabysitVersion,
@@ -1699,7 +1703,7 @@ test("completion notification eligibility separates process exits and uncollecte
 	expect(shouldDeliverSubagentCompletion({ kind: "process" })).toBe(false);
 });
 
-test("GC removes only old roots without live supervisors", () => {
+test("GC removes only old roots without live supervisors", async () => {
 	const rootBase = mkdtempSync(path.join(os.tmpdir(), "pi-babysit-gc-"));
 	const currentRoot = path.join(rootBase, "current");
 	mkdirSync(currentRoot, { recursive: true });
@@ -1767,13 +1771,17 @@ test("GC removes only old roots without live supervisors", () => {
 	createRoot("fresh", "exited", 0, 1);
 	createRoot("unknown-state", "mystery", 0, 30);
 	try {
-		const preview = gcBabysitRoots({
+		// The preview runs through the child-process worker used by Pi.
+		const preview = await runGcWorker({
 			rootBase,
 			currentRoot,
 			olderThanMs: 14 * 86_400_000,
 			dryRun: true,
 			now,
 		});
+		expect(preview).toEqual(
+			gcBabysitRoots({ rootBase, currentRoot, olderThanMs: 14 * 86_400_000, dryRun: true, now }),
+		);
 		expect(preview.candidates.sort()).toEqual(["empty-old", "locked", "old", "stale-running"]);
 		expect(preview.skippedLive.sort()).toEqual([
 			"child-live",
@@ -2429,4 +2437,73 @@ test("process checks bound huge command metadata without crowding out recent out
 	expect(text).toContain("CHECK-TAIL-MARKER");
 	expect(text).toContain("command:");
 	expect(Buffer.byteLength(text)).toBeLessThan(1_000);
+});
+
+test("pending finished subagents keep their parsed progress across polls", () => {
+	const cache = new Map([
+		["working", 1],
+		["pending", 2],
+		["settled", 3],
+	]);
+	const removed = pruneTerminalSessionCache(
+		cache,
+		[
+			{ id: "working", state: "running" },
+			{ id: "pending", state: "exited" },
+			{ id: "settled", state: "exited" },
+		],
+		new Set(["pending"]),
+	);
+	expect(removed).toBe(1);
+	expect([...cache.keys()]).toEqual(["working", "pending"]);
+});
+
+test("settled sessions have nothing left to notify or collect", () => {
+	expect(isSettledSession(null)).toBe(true);
+	expect(isSettledSession({ kind: "process", notified: true })).toBe(true);
+	expect(isSettledSession({ kind: "process", notificationPaused: true })).toBe(true);
+	expect(isSettledSession({ kind: "process" })).toBe(false);
+	expect(isSettledSession({ kind: "subagent", promptOffset: 7, subagentCollectedOffset: 7 })).toBe(true);
+	expect(isSettledSession({ kind: "subagent", promptOffset: 7, subagentCollectedOffset: 3 })).toBe(false);
+});
+
+test("remote host backoff is free for transient failures, then exponential and capped", () => {
+	expect([1, 2, 3, 4, 5, 6, 7, 20].map(remoteBackoffDelayMs)).toEqual([
+		0, 0, 5_000, 10_000, 20_000, 40_000, 60_000, 60_000,
+	]);
+});
+
+test("poller sleeps only when every pending session is on a backed-off host", () => {
+	const meta = (id: string) =>
+		({
+			"done": { kind: "process" as const, notified: true },
+			"remote-a": { kind: "process" as const, host: "a" },
+			"remote-b": { kind: "process" as const, host: "b" },
+		})[id] ?? null;
+	const backoff = (host: string) => ({ a: 2_000, b: 5_000 })[host];
+	const unknown = (id: string, host: string) => ({ id, host, state: "running", transportError: "down" });
+	expect(pollDeferredUntil([], meta, backoff, 1_000)).toBe(0);
+	expect(
+		pollDeferredUntil([unknown("remote-a", "a"), unknown("remote-b", "b"), { id: "done", state: "exited" }], meta, backoff, 1_000),
+	).toBe(2_000);
+	// A local running session or an expired backoff means normal polling.
+	expect(pollDeferredUntil([unknown("remote-a", "a"), { id: "local", state: "running" }], meta, backoff, 1_000)).toBe(0);
+	expect(pollDeferredUntil([unknown("remote-a", "a")], meta, backoff, 2_000)).toBe(0);
+	// Reachable remote sessions are polled normally even if the host had failures before.
+	expect(pollDeferredUntil([{ id: "remote-a", host: "a", state: "running" }], meta, backoff, 1_000)).toBe(0);
+});
+
+test("delta-only message_update lines pass through the RPC proxy unchanged", () => {
+	const delta =
+		'{"type":"message_update","usage":{"output":1},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"say \\"message\\": and \\"partial\\": verbatim"}}';
+	expect(compactRpcLine(delta)).toBe(delta);
+	const cumulative = JSON.stringify({
+		type: "message_update",
+		message: { role: "assistant", content: [] },
+		assistantMessageEvent: { type: "text_delta", delta: "x", partial: { content: [] } },
+	});
+	expect(JSON.parse(compactRpcLine(cumulative))).toEqual({
+		type: "message_update",
+		assistantMessageEvent: { type: "text_delta", delta: "x" },
+	});
 });

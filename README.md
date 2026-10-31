@@ -146,6 +146,14 @@ roots with unresolved remote identities; it never deletes/prunes remote logs.
 After reconnecting, check or kill tracked workers to establish terminal status
 before local retention can collect their metadata.
 
+The background poller only contacts hosts that still have unsettled tracked
+sessions. When a host keeps failing (SSH error, or none of its tracked
+sessions can be found), the poller retries it with backoff (free for two
+consecutive failures, then 5s doubling up to 60s) and sleeps while such sessions
+are the only pending work. Their status stays "unknown"; it is never
+reported as an exit. Explicit `babysit_check`/`wait`/`kill` calls always query
+the host.
+
 ## Commands (human)
 
 | Command | What it does |
@@ -265,6 +273,9 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   an explicit `notificationGroup` overrides this. Group members wait for every
   currently running member to stop and then share one notification even when
   their exits span multiple polls.
+  Finished sessions with nothing left to deliver are skipped by later polls,
+  and metadata reads are cached (revalidated by file identity), so a Pi session
+  with hundreds of finished workers stays cheap to poll.
   `babysit_kill` and an exit already reported by `babysit_wait` suppress the
   notification. Kill results are reconciled with persisted terminal state, so
   a backend escalation warning that arrives after the child has already exited
@@ -316,7 +327,7 @@ session totals.
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
 | `PI_BABYSIT_BUDGET_GRACE` | `90s` | grace after a subagent budget is exceeded before verified termination |
 | `PI_BABYSIT_RPC_LOG_MODE` | `compact` | `compact` removes duplicate RPC lifecycle payloads; `standard` opts into legacy payloads |
-| `PI_BABYSIT_RETENTION_DAYS` | `3` | at most once per day, remove safe terminal roots older than this; set `0` to disable automatic retention |
+| `PI_BABYSIT_RETENTION_DAYS` | `3` | at most once per day, remove safe terminal roots older than this (in a background child process, so session start never waits); set `0` to disable automatic retention |
 | `PI_BABYSIT_TAIL_MAX_BYTES` | `4000` | default cap for explicit log tails/screens returned by `babysit_check`; override per call with `maxBytes` |
 | `PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES` | `8000` | cap for complete process output and aggregate multi-wait results |
 | `PI_BABYSIT_NOTIFY_OUTPUT_MAX_BYTES` | `2000` | per-process output cap for unsolicited completion notifications (`0` omits all output) |

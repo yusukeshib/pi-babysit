@@ -48,6 +48,18 @@ import { Box, Markdown, Text, truncateToWidth, visibleWidth, type TuiMouseEvent 
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents";
+import {
+	ACTIVE_LEASE_PREFIX,
+	AUTOMATIC_GC_INTERVAL_MS,
+	type BabysitGcOptions,
+	type BabysitGcResult,
+	GC_LOCK_FILE,
+	GC_STAMP_FILE,
+	gcBabysitRoots,
+	isConfirmedTerminalState,
+} from "./gc.mjs";
+
+export { type BabysitGcResult, gcBabysitRoots, isConfirmedTerminalState };
 
 const descriptionSchema = Type.String({
 	minLength: 1,
@@ -389,14 +401,58 @@ async function localSessions(host?: string): Promise<{ sessions: BsSession[]; er
 	}
 }
 
-async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }> {
-	const local = await localSessions();
-	const known = remoteMetadata();
+// Remote status costs an SSH round trip per host. The background poller backs
+// off hosts that keep failing (transport error, or none of the tracked
+// sessions found) so an unreachable host or a lost remote session cannot make
+// it SSH every POLL_MS forever. Explicit tool calls always query.
+export const REMOTE_BACKOFF_FREE_FAILURES = 2;
+export const REMOTE_BACKOFF_MAX_MS = 60_000;
+export function remoteBackoffDelayMs(failures: number): number {
+	if (failures <= REMOTE_BACKOFF_FREE_FAILURES) return 0;
+	return Math.min(POLL_MS * 2 ** (failures - REMOTE_BACKOFF_FREE_FAILURES), REMOTE_BACKOFF_MAX_MS);
+}
+const remoteHostBackoff = new Map<string, { failures: number; nextAt: number; error: string }>();
+const remoteBackoffUntil = (host: string): number | undefined => remoteHostBackoff.get(host)?.nextAt;
+
+const unknownRemoteSession = (id: string, host: string, error: string): BsSession => ({
+	id,
+	host,
+	state: "running",
+	transportError: error,
+	note: `status unknown on ${host}: ${error}`,
+});
+
+/**
+ * List local sessions plus tracked remote sessions. With `poll: true` (the
+ * background poller), settled sessions are skipped, hosts with only settled
+ * sessions are not contacted, and failing hosts are retried with backoff.
+ * `ids` limits which tracked remote sessions (and therefore hosts) are queried;
+ * `local: false` skips the local registry.
+ */
+async function listSessions(
+	options: { poll?: boolean; ids?: readonly string[]; local?: boolean } = {},
+): Promise<{ sessions: BsSession[]; error?: string }> {
+	const local: { sessions: BsSession[]; error?: string } =
+		options.local === false ? { sessions: [] } : await localSessions();
+	const known = remoteMetadata().filter(
+		({ id }) => (!options.poll || !settledSessionIds.has(id)) && (!options.ids || options.ids.includes(id)),
+	);
 	await Promise.all([...new Set(known.map(({ meta }) => meta.host!))].map(async (host) => {
+		const tracked = known.filter((entry) => entry.meta.host === host);
+		const backoff = remoteHostBackoff.get(host);
+		if (options.poll && backoff && Date.now() < backoff.nextAt) {
+			const retry = Math.ceil((backoff.nextAt - Date.now()) / 1000);
+			for (const { id } of tracked) {
+				local.sessions.push(unknownRemoteSession(id, host, `${backoff.error} (retrying in ${retry}s)`));
+			}
+			return;
+		}
 		const remote = await localSessions(host);
-		for (const { id, meta } of known.filter((entry) => entry.meta.host === host)) {
+		let foundCount = 0;
+		for (const { id, meta } of tracked) {
 			const found = remote.sessions.find((session) => session.id === meta.remoteId);
 			if (found && !remote.error) {
+				foundCount++;
 				local.sessions.push({ ...found, id, host });
 				const terminalState = isConfirmedTerminalState(found.state) ? found.state : undefined;
 				if (meta.remoteTerminalState !== terminalState) {
@@ -404,11 +460,42 @@ async function listSessions(): Promise<{ sessions: BsSession[]; error?: string }
 				}
 			} else {
 				// Keep unresolved references active for polling/group delivery, never fabricate exit.
-				local.sessions.push({ id, host, state: "running", transportError: remote.error ?? "tracked remote session not found", note: `status unknown on ${host}: ${remote.error ?? "session not found"}` });
+				local.sessions.push(unknownRemoteSession(id, host, remote.error ?? "tracked remote session not found"));
 			}
+		}
+		if (foundCount > 0) {
+			remoteHostBackoff.delete(host);
+		} else if (options.poll) {
+			const failures = (backoff?.failures ?? 0) + 1;
+			remoteHostBackoff.set(host, {
+				failures,
+				nextAt: Date.now() + remoteBackoffDelayMs(failures),
+				error: remote.error ?? "tracked remote session not found",
+			});
 		}
 	}));
 	return local;
+}
+
+/**
+ * When every reason to keep polling is a remote session on a backed-off host,
+ * return the earliest retry time so the poller can sleep until then (0 = poll
+ * normally).
+ */
+export function pollDeferredUntil(
+	sessions: Array<{ id: string; state: string; host?: string; transportError?: string }>,
+	metaFor: (id: string) => Meta | null,
+	backoffUntil: (host: string) => number | undefined,
+	now = Date.now(),
+): number {
+	let earliest = Infinity;
+	for (const session of sessions) {
+		if (!shouldKeepPolling([session], metaFor)) continue;
+		const until = session.host && session.transportError ? backoffUntil(session.host) : undefined;
+		if (until === undefined || until <= now) return 0;
+		earliest = Math.min(earliest, until);
+	}
+	return Number.isFinite(earliest) ? earliest : 0;
 }
 
 async function lookupStatus(
@@ -418,7 +505,10 @@ async function lookupStatus(
 	// including `alive` and `note`. Using it directly avoids the old
 	// status-then-list pair (two CLI subprocesses for every status lookup).
 	try {
-		const listed = await listSessions();
+		// Only contact the registry that owns this session: a local lookup must not
+		// SSH to every remote host, and a remote one needs no local list.
+		const remote = Boolean(readMeta(id)?.host);
+		const listed = await listSessions({ ids: [id], local: !remote });
 		const session = listed.sessions.find((session) => session.id === id) ?? null;
 		if (session?.transportError) return { session: null, error: `${session.host}: ${session.transportError}` };
 		if (listed.error && !readMeta(id)?.host) return { session: null, error: listed.error };
@@ -430,10 +520,6 @@ async function lookupStatus(
 
 async function statusOf(id: string): Promise<BsSession | null> {
 	return (await lookupStatus(id)).session;
-}
-
-export function isConfirmedTerminalState(state: string): boolean {
-	return state === "killed" || state === "exited";
 }
 
 export function validateKillResponse(stdout: string): string | null {
@@ -591,19 +677,56 @@ const logPath = (id: string) => {
 	return meta?.host ? `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} log -s ${shq(meta.remoteId!)}` : localLogPath(id);
 };
 
+// Which sessions are remote is fixed when their metadata is created, and every
+// writeMeta creates + renames a file in the meta directory, which changes the
+// directory's mtime. Rescan the directory only when it changed; the metadata
+// itself is still read through the stat-validated readMeta cache.
+let remoteIndex: { dir: string; stat: FileIdentity; ids: string[] } | undefined;
+
 function remoteMetadata(): Array<{ id: string; meta: Meta }> {
+	const dir = metaDir();
+	let stat: fs.Stats;
 	try {
-		return fs.readdirSync(metaDir()).filter((file) => file.endsWith(".json")).flatMap((file) => {
-			const id = file.slice(0, -5);
-			const meta = readMeta(id);
-			return meta?.host && meta.remoteId ? [{ id, meta }] : [];
-		});
-	} catch { return []; }
+		stat = fs.statSync(dir);
+	} catch {
+		return [];
+	}
+	if (!remoteIndex || remoteIndex.dir !== dir || !sameFile(remoteIndex.stat, stat)) {
+		let files: string[];
+		try {
+			files = fs.readdirSync(dir);
+		} catch {
+			return [];
+		}
+		const ids = files
+			.filter((file) => file.endsWith(".json"))
+			.map((file) => file.slice(0, -5))
+			.filter((id) => {
+				const meta = readMeta(id);
+				return Boolean(meta?.host && meta.remoteId);
+			});
+		remoteIndex = { dir, stat: { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino }, ids };
+	}
+	return remoteIndex.ids.flatMap((id) => {
+		const meta = readMeta(id);
+		return meta?.host && meta.remoteId ? [{ id, meta }] : [];
+	});
 }
+
+/**
+ * Terminal sessions with nothing left to deliver (completion notified, kill
+ * suppressed, or subagent result collected). The poller skips them so a long
+ * Pi session with hundreds of finished workers does not re-read every
+ * metadata file each tick. A restarted session reports `running` again and is
+ * therefore never filtered out; any metadata write re-evaluates the session.
+ */
+const settledSessionIds = new Set<string>();
 
 function writeMeta(id: string, m: Meta): boolean {
 	const target = path.join(metaDir(), `${id}.json`);
 	const temp = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+	metaCache.delete(target);
+	settledSessionIds.delete(id);
 	try {
 		fs.mkdirSync(metaDir(), { recursive: true });
 		fs.writeFileSync(temp, JSON.stringify(m));
@@ -635,34 +758,34 @@ export function claimFileOnce(file: string, payload: string): boolean {
 	return true;
 }
 
+// The poller and tool paths read metadata many times per tick. Cache parsed
+// metadata per file and revalidate with a stat: writeMeta always renames a new
+// temp file into place, so any write (from this or another Pi process sharing
+// the root) changes the inode and mtime. Callers mutate the returned object
+// before writing it back, so every read returns a private copy.
+interface FileIdentity {
+	mtimeMs: number;
+	size: number;
+	ino: number;
+}
+const sameFile = (a: FileIdentity, b: FileIdentity) =>
+	a.mtimeMs === b.mtimeMs && a.size === b.size && a.ino === b.ino;
+const metaCache = new Map<string, { stat: FileIdentity; meta: Meta }>();
+
 function readMeta(id: string): Meta | null {
+	const file = path.join(metaDir(), `${id}.json`);
 	try {
-		return JSON.parse(fs.readFileSync(path.join(metaDir(), `${id}.json`), "utf-8"));
+		const stat = fs.statSync(file);
+		const cached = metaCache.get(file);
+		if (cached && sameFile(cached.stat, stat)) return structuredClone(cached.meta);
+		const meta = JSON.parse(fs.readFileSync(file, "utf-8")) as Meta;
+		metaCache.set(file, { stat: { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino }, meta });
+		return structuredClone(meta);
 	} catch {
+		metaCache.delete(file);
 		return null;
 	}
 }
-
-export interface BabysitGcResult {
-	candidates: string[];
-	deleted: string[];
-	bytes: number;
-	skippedLive: string[];
-}
-
-function processIsAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-const GC_LOCK_FILE = ".pi-babysit-gc.lock";
-const GC_STAMP_FILE = ".pi-babysit-gc.last";
-const AUTOMATIC_GC_INTERVAL_MS = 24 * 60 * 60 * 1_000;
-const ACTIVE_LEASE_PREFIX = ".pi-babysit-active-";
 
 function automaticGcDue(now = Date.now()): boolean {
 	try {
@@ -679,118 +802,6 @@ function markAutomaticGc(now = new Date()): void {
 	} catch {
 		/* best-effort; GC safety does not depend on this throttle stamp */
 	}
-}
-
-function scanTreeStats(root: string, rootMtimeMs?: number): { bytes: number; newestMtimeMs: number } {
-	let bytes = 0;
-	let newestMtimeMs: number;
-	try {
-		// The collector's own lock file updates the root mtime; use the
-		// pre-lock age when rescanning, but still include fresh descendants.
-		newestMtimeMs = rootMtimeMs ?? fs.lstatSync(root).mtimeMs;
-	} catch {
-		return { bytes: 0, newestMtimeMs: Infinity };
-	}
-	const pending = [root];
-	while (pending.length > 0) {
-		const current = pending.pop() as string;
-		let entries: fs.Dirent[];
-		try {
-			entries = fs.readdirSync(current, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-		for (const entry of entries) {
-			if (entry.name === GC_LOCK_FILE) continue;
-			const fullPath = path.join(current, entry.name);
-			try {
-				const stat = fs.lstatSync(fullPath);
-				newestMtimeMs = Math.max(newestMtimeMs, stat.mtimeMs);
-				if (entry.isDirectory()) pending.push(fullPath);
-				else if (entry.isFile()) bytes += stat.size;
-			} catch {
-				/* raced with cleanup */
-			}
-		}
-	}
-	return { bytes, newestMtimeMs };
-}
-
-function gcRootIsSafe(root: string): boolean {
-	let rootEntries: fs.Dirent[];
-	try {
-		rootEntries = fs.readdirSync(root, { withFileTypes: true });
-	} catch {
-		return false;
-	}
-	for (const entry of rootEntries) {
-		if (!entry.isFile() || !entry.name.startsWith(ACTIVE_LEASE_PREFIX)) continue;
-		try {
-			const lease = JSON.parse(fs.readFileSync(path.join(root, entry.name), "utf8")) as {
-				pid?: number;
-			};
-			if (!Number.isSafeInteger(lease.pid) || (lease.pid as number) <= 0) return false;
-			if (processIsAlive(lease.pid as number)) return false;
-		} catch {
-			return false;
-		}
-	}
-
-	// Remote PIDs are meaningless locally. Retain unresolved remote references;
-	// terminal observations are persisted by listSessions, never prune remote data.
-	try {
-		for (const file of fs.readdirSync(path.join(root, "meta"))) {
-			if (!file.endsWith(".json")) continue;
-			const meta = JSON.parse(fs.readFileSync(path.join(root, "meta", file), "utf8")) as Meta;
-			if (meta.host && (!meta.remoteTerminalState || !isConfirmedTerminalState(meta.remoteTerminalState))) return false;
-		}
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
-	}
-	const sessionsDir = path.join(root, "sessions");
-	let sessionDirs: fs.Dirent[];
-	try {
-		sessionDirs = fs.readdirSync(sessionsDir, { withFileTypes: true });
-	} catch (error) {
-		// session_start acquires a lease before the first worker exists. Once that
-		// lease is gone, an old root with no sessions is safe to collect.
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
-	}
-	if (!sessionDirs.some((entry) => entry.isDirectory())) return true;
-	let sawStatus = false;
-	for (const sessionEntry of sessionDirs) {
-		if (!sessionEntry.isDirectory()) continue;
-		const sessionDir = path.join(sessionsDir, sessionEntry.name);
-		try {
-			const status = JSON.parse(
-				fs.readFileSync(path.join(sessionDir, "status.json"), "utf8"),
-			) as { state?: string; child_pid?: number | null };
-			sawStatus = true;
-			if (status.state !== "running") {
-				if (!status.state || (!isConfirmedTerminalState(status.state) && status.state !== "dead")) {
-					return false;
-				}
-				continue;
-			}
-			const supervisorPid = Number(
-				(JSON.parse(fs.readFileSync(path.join(sessionDir, "meta.json"), "utf8")) as {
-					babysit_pid?: number;
-				}).babysit_pid,
-			);
-			const childPid = Number(status.child_pid);
-			if (
-				!Number.isSafeInteger(supervisorPid) ||
-				supervisorPid <= 0 ||
-				processIsAlive(supervisorPid) ||
-				(Number.isSafeInteger(childPid) && childPid > 0 && processIsAlive(childPid))
-			) {
-				return false;
-			}
-		} catch {
-			return false;
-		}
-	}
-	return sawStatus;
 }
 
 function acquireRootLease(root: string): string | null {
@@ -828,81 +839,37 @@ function releaseRootLease(leasePath: string | undefined): void {
 	}
 }
 
-export function gcBabysitRoots(options: {
-	rootBase: string;
-	currentRoot: string;
-	olderThanMs: number;
-	dryRun?: boolean;
-	now?: number;
-}): BabysitGcResult {
-	const now = options.now ?? Date.now();
-	const current = path.resolve(options.currentRoot);
-	const result: BabysitGcResult = { candidates: [], deleted: [], bytes: 0, skippedLive: [] };
-	let roots: fs.Dirent[];
-	try {
-		roots = fs.readdirSync(options.rootBase, { withFileTypes: true });
-	} catch {
-		return result;
-	}
-
-	for (const entry of roots) {
-		if (!entry.isDirectory() || entry.name.startsWith(".pi-babysit-gc-")) continue;
-		const root = path.join(options.rootBase, entry.name);
-		if (path.resolve(root) === current) continue;
-		if (!gcRootIsSafe(root)) {
-			result.skippedLive.push(entry.name);
-			continue;
-		}
-		const stats = scanTreeStats(root);
-		if (now - stats.newestMtimeMs < options.olderThanMs) continue;
-		result.candidates.push(entry.name);
-		if (options.dryRun !== false) {
-			result.bytes += stats.bytes;
-			continue;
-		}
-
-		const lockPath = path.join(root, GC_LOCK_FILE);
-		let lockFd: number | undefined;
-		let tombstone: string | undefined;
-		try {
-			lockFd = fs.openSync(lockPath, "wx");
-			// Compatible Pi processes acquire an active lease around this same lock.
-			// Revalidate after locking, then atomically rename the root so a resume
-			// racing deletion creates a fresh namespace instead of writing into rmSync.
-			if (!gcRootIsSafe(root)) {
-				result.skippedLive.push(entry.name);
-				continue;
-			}
-			const refreshedStats = scanTreeStats(root, stats.newestMtimeMs);
-			if (now - refreshedStats.newestMtimeMs < options.olderThanMs) continue;
-			tombstone = path.join(
-				options.rootBase,
-				`.pi-babysit-gc-${entry.name}-${process.pid}-${Date.now()}`,
-			);
-			fs.closeSync(lockFd);
-			lockFd = undefined;
-			fs.renameSync(root, tombstone);
-			fs.rmSync(tombstone, { recursive: true, force: true });
-			result.deleted.push(entry.name);
-			result.bytes += refreshedStats.bytes;
-		} catch {
-			/* report only roots whose atomic removal completed */
-		} finally {
-			if (lockFd != null) {
-				try {
-					fs.closeSync(lockFd);
-				} catch {
-					/* best-effort */
-				}
+/**
+ * Run a GC pass in a child process. Collection walks every file under every
+ * root (hundreds of milliseconds for a large ~/.pi-babysit), so it must not run
+ * on Pi's event loop. The lease/lock protocol in gc.mjs is cross-process.
+ */
+export function runGcWorker(options: BabysitGcOptions): Promise<BabysitGcResult> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, [path.join(EXT_DIR, "gc.mjs"), JSON.stringify(options)], {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout?.on("data", (data) => {
+			stdout += data;
+		});
+		child.stderr?.on("data", (data) => {
+			stderr += data;
+		});
+		child.on("error", reject);
+		child.on("close", (code) => {
+			if (code !== 0) {
+				reject(new Error(stderr.trim() || `babysit GC worker exited with code ${code}`));
+				return;
 			}
 			try {
-				fs.rmSync(lockPath, { force: true });
+				resolve(JSON.parse(stdout) as BabysitGcResult);
 			} catch {
-				/* root may already have been atomically renamed */
+				reject(new Error(`babysit GC worker returned invalid output: ${stdout.slice(0, 200)}`));
 			}
-		}
-	}
-	return result;
+		});
+	});
 }
 
 function cleanupMessageTempDirs(id: string, meta: Meta, agentEnds: number): void {
@@ -938,6 +905,11 @@ export function shouldDeliverSubagentCompletion(meta: Meta | null): meta is Meta
 		meta.subagentCollectedOffset !== offset &&
 		meta.subagentNotifiedOffset !== offset
 	);
+}
+
+/** A finished session whose metadata leaves nothing to notify or collect. */
+export function isSettledSession(meta: Meta | null): boolean {
+	return !shouldDeliverProcessCompletion(meta) && !shouldDeliverSubagentCompletion(meta);
 }
 
 export function isNotificationGroupReady(
@@ -2057,16 +2029,21 @@ interface TaskProgressCache {
 }
 const taskProgressCache = new Map<string, TaskProgressCache>();
 
+/**
+ * Drop cached state for sessions that are no longer running, except `keep`
+ * (finished sessions whose result has not been delivered or collected yet).
+ */
 export function pruneTerminalSessionCache<T>(
 	cache: Map<string, T>,
 	sessions: Array<{ id: string; state: string }>,
+	keep: ReadonlySet<string> = new Set(),
 ): number {
 	const running = new Set(
 		sessions.filter((session) => session.state === "running").map((session) => session.id),
 	);
 	let removed = 0;
 	for (const id of cache.keys()) {
-		if (running.has(id)) continue;
+		if (running.has(id) || keep.has(id)) continue;
 		cache.delete(id);
 		removed++;
 	}
@@ -2134,7 +2111,8 @@ const reservedSessionIds = new Set<string>();
 
 async function reserveUniqueSessionId(name: string): Promise<string> {
 	const base = name.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "proc";
-	const taken = new Set((await listSessions()).sessions.map((s) => s.id));
+	// Remote ids come from local metadata; querying remote hosts adds nothing here.
+	const taken = new Set((await listSessions({ ids: [] })).sessions.map((s) => s.id));
 	for (const { id } of remoteMetadata()) taken.add(id);
 	for (const id of reservedSessionIds) taken.add(id);
 	let id = base;
@@ -3287,6 +3265,17 @@ export function resolveSubagentSendMode(
 export default function (pi: ExtensionAPI) {
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
 	let pollNeeded = true;
+	// Earliest time the poller should run again when every pending session is a
+	// remote one whose host is in backoff (0 = poll every POLL_MS).
+	let pollDeferredUntilMs = 0;
+	// Bumped by every re-arm so a tick that started before a new session was
+	// created cannot switch polling off based on its stale snapshot.
+	let pollGeneration = 0;
+	const armPolling = () => {
+		pollNeeded = true;
+		pollDeferredUntilMs = 0;
+		pollGeneration++;
+	};
 	let automaticGcRan = false;
 	let rootLeasePath: string | undefined;
 	const declaredToolErrors = new Set<string>();
@@ -3750,7 +3739,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		taskProgressCache.clear();
 		searchLogCache.clear();
-		pollNeeded = true;
+		settledSessionIds.clear();
+		remoteHostBackoff.clear();
+		armPolling();
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
 			!automaticGcRan &&
@@ -3759,19 +3750,26 @@ export default function (pi: ExtensionAPI) {
 			automaticGcDue()
 		) {
 			automaticGcRan = true;
-			const gc = gcBabysitRoots({
+			markAutomaticGc();
+			// Fire and forget: the collector runs in a child process so session
+			// start never waits for a full ~/.pi-babysit walk.
+			void runGcWorker({
 				rootBase: ROOT_BASE,
 				currentRoot: ROOT,
 				olderThanMs: retentionDays * 86_400_000,
 				dryRun: false,
-			});
-			markAutomaticGc();
-			if (gc.deleted.length > 0 && ctx.hasUI) {
-				ctx.ui.notify(
-					`pi-babysit GC removed ${gc.deleted.length} roots (${gc.bytes} bytes).`,
-					"info",
-				);
-			}
+			})
+				.then((gc) => {
+					if (gc.deleted.length > 0 && ctx.hasUI) {
+						ctx.ui.notify(
+							`pi-babysit GC removed ${gc.deleted.length} roots (${gc.bytes} bytes).`,
+							"info",
+						);
+					}
+				})
+				.catch(() => {
+					/* best-effort; the next automatic window retries */
+				});
 		}
 		// Warn early if the binary is missing so the user isn't surprised only when
 		// a tool later fails. Tools/commands still enforce it via requireBabysit.
@@ -3783,27 +3781,42 @@ export default function (pi: ExtensionAPI) {
 			// Once a namespace has no live workers or pending notifications, avoid
 			// spawning `babysit list` forever while the UI is idle. A successful
 			// babysit_run re-arms polling below.
-			if (polling || !pollNeeded) return;
+			if (polling || !pollNeeded || Date.now() < pollDeferredUntilMs) return;
 			polling = true;
+			const generation = pollGeneration;
 			void (async () => {
-				const listed = await listSessions();
+				const listed = await listSessions({ poll: true });
 				if (listed.error) {
-					pollNeeded = shouldKeepPollingAfterList(listed, readMeta);
+					if (generation === pollGeneration) pollNeeded = shouldKeepPollingAfterList(listed, readMeta);
 					throw new Error(listed.error);
 				}
-				const snapshot = listed.sessions;
+				// Finished sessions with nothing left to deliver never need another look.
+				const snapshot = listed.sessions.filter(
+					(session) =>
+						session.state === "running" || session.transportError || !settledSessionIds.has(session.id),
+				);
 				await enforceSubagentBudgets(snapshot);
 				await Promise.all([
 					notifyEndedProcesses(ctx, snapshot),
 					notifySettledSubagents(ctx, snapshot),
 					refreshWidget(ctx, snapshot),
 				]);
-				pruneTerminalSessionCache(taskProgressCache, snapshot);
+				const pendingTerminal = new Set<string>();
+				for (const session of snapshot) {
+					if (session.state === "running" || session.transportError) continue;
+					if (isSettledSession(readMeta(session.id))) settledSessionIds.add(session.id);
+					else pendingTerminal.add(session.id);
+				}
+				// Keep parsed progress for finished subagents whose result is still
+				// pending; otherwise each tick would re-parse their whole log.
+				pruneTerminalSessionCache(taskProgressCache, snapshot, pendingTerminal);
+				if (generation !== pollGeneration) return;
 				pollNeeded = shouldKeepPolling(snapshot, readMeta);
+				pollDeferredUntilMs = pollNeeded ? pollDeferredUntil(snapshot, readMeta, remoteBackoffUntil) : 0;
 			})()
 				.catch(() => {
 					// Keep polling armed after a transient CLI/filesystem error.
-					pollNeeded = true;
+					armPolling();
 				})
 				.finally(() => {
 					polling = false;
@@ -4147,7 +4160,7 @@ export default function (pi: ExtensionAPI) {
 						details: {},
 					};
 				}
-				pollNeeded = true;
+				armPolling();
 				await refreshWidget(ctx);
 
 				// One-shot / non-interactive mode has no event loop that can deliver an
@@ -4310,7 +4323,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			pollNeeded = true;
+			armPolling();
 			await refreshWidget(ctx);
 			if (params.foreground || !ctx.hasUI) {
 				const outcome = await waitForTask(res.id, null, _signal);
@@ -5177,7 +5190,7 @@ export default function (pi: ExtensionAPI) {
 					currentRoot: ROOT,
 					olderThanMs: days * 86_400_000,
 				};
-				const preview = gcBabysitRoots({ ...options, dryRun: true });
+				const preview = await runGcWorker({ ...options, dryRun: true });
 				if (preview.candidates.length === 0) {
 					ctx.ui.notify(
 						`No terminal pi-babysit roots older than ${days} days are safe to remove.`,
@@ -5191,7 +5204,7 @@ export default function (pi: ExtensionAPI) {
 						"Running supervisors and the current Pi session are excluded.",
 				);
 				if (!confirmed) return;
-				const removed = gcBabysitRoots({ ...options, dryRun: false });
+				const removed = await runGcWorker({ ...options, dryRun: false });
 				ctx.ui.notify(
 					`Removed ${removed.deleted.length} pi-babysit roots (${removed.bytes} bytes).`,
 					"info",

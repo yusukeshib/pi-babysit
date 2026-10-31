@@ -80,6 +80,17 @@ export function compactRpcLine(
 	mode = process.env.PI_BABYSIT_RPC_LOG_MODE ?? "compact",
 ) {
 	if (!line.trimStart().startsWith("{")) return line;
+	// Pi >= 1.4 already writes delta-only message_update lines (no cumulative
+	// `message` or `partial`). They are the bulk of a worker's stream, so skip
+	// the parse/re-serialize round trip when there is nothing to strip. Inside
+	// JSON strings a quote is escaped, so these key patterns cannot match text.
+	if (
+		line.startsWith('{"type":"message_update"') &&
+		!line.includes('"message":') &&
+		!line.includes('"partial":')
+	) {
+		return line;
+	}
 
 	let event;
 	try {
