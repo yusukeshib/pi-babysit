@@ -3881,7 +3881,7 @@ export default function (pi: ExtensionAPI) {
 			"After a background process starts, stop the turn for its automatic notification; never poll or sleep. Use continueAfterStart only for specific non-polling process work.",
 			"Inspect large logs with a narrow babysit_check pattern and maxBytes rather than broad tails.",
 			"Use retryOnWorkerDeath only once and only for idempotent commands; retries may duplicate side effects.",
-			"Delegate independent work with bounded babysit_run subagents. Prefer foreground for one result needed now; every background subagent must be collected with babysit_wait before the parent task finishes. Size budgets above the worker's initial context and expected tool count; maxUsageTokens counts cumulative input/cache tokens and can overshoot by one in-flight model call.",
+			"When you start a subagent, prefer foreground for one result needed now; every background subagent must be collected with babysit_wait before the parent task finishes. Size budgets above the worker's initial context and expected tool count; maxUsageTokens counts cumulative input/cache tokens and can overshoot by one in-flight model call.",
 			"Omit babysit_run.agent unless you know a named agent definition exists in the selected agentScope.",
 			"Subagent recursion defaults to depth 1; only a top-level caller may explicitly raise maxDepth.",
 		],
