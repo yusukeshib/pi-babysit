@@ -485,6 +485,21 @@ test("RPC stream compaction removes only cumulative message_update snapshots", (
 	expect(compactRpcLine("non-json diagnostic")).toBe("non-json diagnostic");
 });
 
+test("RPC log compaction preserves dialogs, warnings, failures, and unknown events", () => {
+	for (const event of [
+		{ type: "extension_ui_request", method: "confirm", id: "permission", title: "Allow?" },
+		{ type: "extension_ui_request", method: "notify", message: "CLI unavailable", notifyType: "warning" },
+		{ type: "tool_execution_end", isError: true, result: { content: "failure details" } },
+		{ type: "response", command: "prompt", success: false, error: "invalid model" },
+		{ type: "error", message: "transport failed" },
+		{ type: "future_event", payload: "preserved" },
+	]) {
+		const line = JSON.stringify(event);
+		expect(compactRpcLine(line)).toBe(line);
+		expect(compactRpcLine(line, "standard")).toBe(line);
+	}
+});
+
 test("RPC response offsets exclude lifecycle events from the preceding run", () => {
 	const previousEnd = `${JSON.stringify({ type: "agent_end", messages: [] })}\r\n`;
 	const response = `${JSON.stringify({ type: "response", command: "prompt", success: true })}\r\n`;

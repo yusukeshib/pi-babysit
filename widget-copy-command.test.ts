@@ -48,8 +48,8 @@ const {default:extension}=await import(${JSON.stringify(path.join(import.meta.di
 const commands=new Map(), tools=new Map(), messages=[];
 extension({registerTool:t=>tools.set(t.name,t),on(){},registerMessageRenderer(){},registerCommand:(n,c)=>commands.set(n,c),getActiveTools:()=>[],getThinkingLevel:()=> 'low',sendMessage:m=>messages.push(m)});
 const read=()=>JSON.parse(fs.readFileSync(process.env.FAKE_LOG_STATE,'utf8'));
-let widget, editorEdits=0, notices=[], selected, renderRequests=0;
-const ctx={hasUI:true,mode:'tui',cwd:${JSON.stringify(import.meta.dir)},ui:{setWidget:(_name,value)=>{widget=typeof value==='function'?value({requestRender(){renderRequests++;}}):value;},setEditorText:()=>editorEdits++,notify:(text,kind)=>notices.push({text,kind}),theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s},select:async(_title,labels)=>labels.find(label=>label.includes(selected))},sessionManager:{getSessionId:()=> 'copy-test',getSessionFile:()=>undefined}};
+let widget, widgetUpdates=0, editorEdits=0, notices=[], selected, renderRequests=0;
+const ctx={hasUI:true,mode:'tui',cwd:${JSON.stringify(import.meta.dir)},ui:{setWidget:(_name,value)=>{widgetUpdates++;widget=typeof value==='function'?value({requestRender(){renderRequests++;}}):value;},setEditorText:()=>editorEdits++,notify:(text,kind)=>notices.push({text,kind}),theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s},select:async(_title,labels)=>labels.find(label=>label.includes(selected))},sessionManager:{getSessionId:()=> 'copy-test',getSessionFile:()=>undefined}};
 const refresh=async()=>{const result=await tools.get('babysit_run').execute('test',{description:'Refresh widget fixture',name:'fixture',command:'true',continueAfterStart:true},undefined,undefined,ctx);assert(!result.isError,JSON.stringify(result));};
 assert(!commands.has('babysit-log'));
 await refresh();
@@ -87,7 +87,14 @@ assert.equal(clipboard.length,previousCopies); assert(widget.render(200).find(li
 for(const [id,expected] of [[${JSON.stringify(localId)},clipboard[0]],[${JSON.stringify(agentId)},clipboard[1]],[${JSON.stringify(remoteId)},clipboard[2]]]) {
  selected=id; await commands.get('babysit').handler('',ctx); assert(messages.at(-1).details.body.includes(expected));
 }
-originalWidget.dispose(); ctx.mode='rpc'; await refresh(); assert(Array.isArray(widget)); assert(!widget.join('').includes('⧉'));
+originalWidget.dispose();
+const previousWidgetUpdates=widgetUpdates;
+ctx.mode='rpc';
+for(let i=0;i<2;i++) {
+ await refresh();
+ assert.equal(widgetUpdates,previousWidgetUpdates,'RPC must not publish widget updates');
+ assert.equal(widget,originalWidget);
+}
 `);
 	try {
 		const result = spawnSync(process.execPath, [script], {

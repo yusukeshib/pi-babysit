@@ -161,7 +161,7 @@ the host.
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
 | `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; old empty roots are eligible once their lease is gone. Deletion uses a GC lock and atomic rename |
 
-The widget below the editor lists all running sessions, newest first,
+The TUI-only widget below the editor lists all running sessions, newest first,
 including reusable idle agents. Summary counts use `RUNNING` / `IDLE`; rows show
 `PROCESS RUNNING`, `AGENT RUNNING`, or `AGENT IDLE`, total session age, remote host
 and unknown-status indicators when applicable, and a colored one-line description.
@@ -207,6 +207,10 @@ Pattern search returns the latest matching lines with line numbers. Prefer a
 targeted pattern over a broad tail, and do not read a potentially large log file
 in full. Subagent crashes return structured errors plus the full log path, never
 a raw RPC JSON tail.
+
+Periodic widget updates are disabled outside TUI mode, so headless RPC workers
+do not fill their logs with status/age UI requests. Background completion
+notifications and actionable warnings/errors remain enabled.
 
 Subagents run in RPC mode with normal Pi session persistence enabled, using
 Pi's configured session storage (by default `~/.pi/agent/sessions/`). Each worker

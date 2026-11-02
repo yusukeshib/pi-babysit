@@ -3574,7 +3574,9 @@ export default function (pi: ExtensionAPI) {
 
 	let sessionWidget: ReturnType<typeof createWidgetComponent> | undefined;
 	const refreshWidget = async (ctx: ExtensionContext, snapshot?: BsSession[]) => {
-		if (!ctx.hasUI) return;
+		// RPC hasUI is also true, but every setWidget call becomes a log record.
+		// Keep the age/status ticker local to the TUI, not headless worker logs.
+		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		const all = snapshot ?? (await listSessions()).sessions;
 		const { active } = widgetSessionGroups(all, (id) => readMeta(id)?.startedAt ?? 0);
 		const subs = active.filter((session) => kindOf(session.id) === "subagent");
@@ -3606,21 +3608,15 @@ export default function (pi: ExtensionAPI) {
 				description: description ? theme.fg("warning", theme.bold(escapeCommandForDisplay(description))) : undefined,
 			};
 		});
-		if (ctx.mode === "tui") {
-			if (!sessionWidget) {
-				ctx.ui.setWidget("pi-babysit", (tui) => {
-					sessionWidget = createWidgetComponent(summaryLines, displays,
-						(id) => copyToClipboard(sessionCliCommand(id, "log")),
-						() => tui.requestRender());
-					return sessionWidget;
-				}, { placement: "belowEditor" });
-			} else {
-				sessionWidget.update(summaryLines, displays);
-			}
+		if (!sessionWidget) {
+			ctx.ui.setWidget("pi-babysit", (tui) => {
+				sessionWidget = createWidgetComponent(summaryLines, displays,
+					(id) => copyToClipboard(sessionCliCommand(id, "log")),
+					() => tui.requestRender());
+				return sessionWidget;
+			}, { placement: "belowEditor" });
 		} else {
-			ctx.ui.setWidget("pi-babysit", createWidgetComponent(summaryLines, displays).render(10_000), {
-				placement: "belowEditor",
-			});
+			sessionWidget.update(summaryLines, displays);
 		}
 	};
 
