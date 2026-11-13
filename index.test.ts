@@ -13,7 +13,8 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { compactRpcLine } from "./rpc-stream-proxy.mjs";
+import { createRpcLogCompactor } from "./rpc-stream-format.mjs";
+import { rpcLogMode } from "./rpc-stream-proxy.mjs";
 import { isParked as selfReaperIsParked } from "./self-reap.ts";
 import { discoverAgents } from "./agents.ts";
 import extension, {
@@ -451,14 +452,32 @@ test("process commands receive current Pi session metadata", () => {
 	expect(ephemeral.PI_MODEL).toBeUndefined();
 });
 
+/** Run lines through the proxy's compactor and drop the stream header. */
+function compactRpcLog(lines: string[], mode: "compact" | "standard" = "compact"): string[] {
+	const compactor = createRpcLogCompactor({ mode });
+	const out = lines.flatMap((line) => compactor.push(line));
+	out.push(...compactor.end());
+	expect(JSON.parse(out[0])).toEqual({ type: "pi_babysit_stream", version: 1, profile: mode });
+	return out.slice(1);
+}
+const compactRpcText = (raw: string) => compactRpcLog(raw.split("\n")).join("\n");
+
 test("compact RPC logging is the default while standard remains an opt-out", () => {
-	const turnEnd = JSON.stringify({
-		type: "turn_end",
-		message: { role: "assistant", content: [{ type: "text", text: "large" }] },
-		toolResults: [{ content: "large" }],
-	});
-	expect(JSON.parse(compactRpcLine(turnEnd))).toEqual({ type: "turn_end" });
-	expect(compactRpcLine(turnEnd, "standard")).toBe(turnEnd);
+	expect(rpcLogMode(undefined)).toBe("compact");
+	expect(rpcLogMode("compact")).toBe("compact");
+	expect(rpcLogMode("standard")).toBe("standard");
+	const lines = [
+		{ type: "agent_start" },
+		{ type: "turn_start" },
+		{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "large" }] } },
+		{
+			type: "turn_end",
+			message: { role: "assistant", content: [{ type: "text", text: "large" }] },
+			toolResults: [],
+		},
+	].map((event) => JSON.stringify(event));
+	expect(JSON.parse(compactRpcLog(lines).at(-1)!)).toEqual({ type: "turn_end" });
+	expect(compactRpcLog(lines, "standard")).toEqual(lines);
 });
 
 test("RPC stream compaction removes only cumulative message_update snapshots", () => {
@@ -473,7 +492,7 @@ test("RPC stream compaction removes only cumulative message_update snapshots", (
 		},
 		futureField: "preserved",
 	};
-	const compact = JSON.parse(compactRpcLine(JSON.stringify(update)));
+	const compact = JSON.parse(compactRpcLog([JSON.stringify(update)])[0]);
 	expect(compact).toEqual({
 		type: "message_update",
 		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "answer" },
@@ -481,8 +500,8 @@ test("RPC stream compaction removes only cumulative message_update snapshots", (
 	});
 
 	const finalLine = '{"type":"message_end","message":{"role":"assistant"}}';
-	expect(compactRpcLine(finalLine)).toBe(finalLine);
-	expect(compactRpcLine("non-json diagnostic")).toBe("non-json diagnostic");
+	expect(compactRpcLog([finalLine])).toEqual([finalLine]);
+	expect(compactRpcLog(["non-json diagnostic"])).toEqual(["non-json diagnostic"]);
 });
 
 test("RPC log compaction preserves dialogs, warnings, failures, and unknown events", () => {
@@ -495,8 +514,8 @@ test("RPC log compaction preserves dialogs, warnings, failures, and unknown even
 		{ type: "future_event", payload: "preserved" },
 	]) {
 		const line = JSON.stringify(event);
-		expect(compactRpcLine(line)).toBe(line);
-		expect(compactRpcLine(line, "standard")).toBe(line);
+		expect(compactRpcLog([line])).toEqual([line]);
+		expect(compactRpcLog([line], "standard")).toEqual([line]);
 	}
 });
 
@@ -593,7 +612,8 @@ test("RPC stream compaction preserves parseEvents final state", () => {
 		{ type: "agent_settled" },
 	];
 	const raw = events.map((event) => JSON.stringify(event)).join("\n");
-	const compact = raw.split("\n").map((line) => compactRpcLine(line, "compact")).join("\n");
+	const compact = compactRpcText(raw);
+	expect(compact).not.toContain('"messages"');
 	expect(parseEvents(compact)).toEqual(parseEvents(raw));
 	expect(parseEvents(compact)).toMatchObject({
 		done: true,
@@ -865,68 +885,40 @@ test("killed subagents preserve their partially streamed final answer", () => {
 	expect(diagnostic).not.toContain("no structured error");
 });
 
-test("compact RPC mode removes redundant lifecycle and successful tool payloads", () => {
-	const messages = [{ role: "assistant", content: [{ type: "text", text: "x".repeat(10_000) }] }];
-	const cases = [
-		{
-			event: { type: "message_start", message: messages[0] },
-			assert: (value: any) => expect(value.message).toEqual({ role: "assistant" }),
-		},
-		{
-			event: { type: "turn_end", message: messages[0], toolResults: messages },
-			assert: (value: any) => expect(value).toEqual({ type: "turn_end" }),
-		},
-		{
-			event: { type: "agent_end", messages },
-			assert: (value: any) => expect(value).toEqual({ type: "agent_end", piBabysitParked: false }),
-		},
-		{
-			event: { type: "tool_execution_end", toolName: "read", isError: false, result: messages[0] },
-			assert: (value: any) =>
-				expect(value).toEqual({ type: "tool_execution_end", toolName: "read", isError: false }),
-		},
+test("compact RPC mode marks parked agent ends with a separate pi-babysit event", () => {
+	const agentEnd = (messages: unknown[]) => [
+		JSON.stringify({ type: "agent_start" }),
+		JSON.stringify({ type: "agent_end", messages }),
 	];
-	for (const { event, assert } of cases) {
-		const line = JSON.stringify(event);
-		assert(JSON.parse(compactRpcLine(line, "compact")));
-		expect(compactRpcLine(line, "standard")).toBe(line);
-	}
-	const failedTool = JSON.stringify({
-		type: "tool_execution_end",
-		isError: true,
-		result: { content: "diagnostic" },
-	});
-	expect(compactRpcLine(failedTool, "compact")).toBe(failedTool);
-	const parked = JSON.parse(
-		compactRpcLine(
-			JSON.stringify({
-				type: "agent_end",
-				messages: [
-					{
-						role: "toolResult",
-						toolName: "babysit_run",
-						content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
-						details: { kind: "process", status: "started" },
-					},
-					{ role: "toolResult", toolName: "babysit_run", content: "quick command" },
-				],
-			}),
-			"compact",
+	const markerOf = (lines: string[]) => JSON.parse(compactRpcLog(lines).at(-2)!);
+	expect(
+		markerOf(
+			agentEnd([
+				{
+					role: "toolResult",
+					toolName: "babysit_run",
+					content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
+					details: { kind: "process", status: "started" },
+				},
+				{ role: "toolResult", toolName: "babysit_run", content: "quick command" },
+			]),
 		),
-	);
-	expect(parked.piBabysitParked).toBe(true);
-	const spoofed = JSON.parse(
-		compactRpcLine(
-			JSON.stringify({
-				type: "agent_end",
-				messages: [
-					{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" },
-				],
-			}),
-			"compact",
+	).toEqual({ type: "pi_babysit_agent_end", parked: true });
+	expect(
+		markerOf(
+			agentEnd([{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" }]),
 		),
-	);
-	expect(spoofed.piBabysitParked).toBe(false);
+	).toEqual({ type: "pi_babysit_agent_end", parked: false });
+	// Standard events never carry pi-babysit fields.
+	const end = JSON.parse(compactRpcLog(agentEnd([])).at(-1)!);
+	expect(end).not.toHaveProperty("piBabysitParked");
+});
+
+test("legacy compact logs with agent_end.piBabysitParked still parse", () => {
+	const log = [{ type: "agent_start" }, { type: "agent_end", piBabysitParked: true }, { type: "agent_settled" }]
+		.map((event) => JSON.stringify(event))
+		.join("\n");
+	expect(parseEvents(log)).toMatchObject({ done: false, waitingOnProcess: true });
 });
 
 test("self-reaper parked detection cannot be spoofed by command output", () => {
@@ -964,13 +956,13 @@ test("a process explicitly collected in the same subagent run is not left parked
 		{ role: "assistant", content: [{ type: "text", text: "finished" }] },
 	];
 	expect(selfReaperIsParked(messages)).toBe(false);
-	const compactedEnd = compactRpcLine(JSON.stringify({ type: "agent_end", messages }), "compact");
-	expect(JSON.parse(compactedEnd).piBabysitParked).toBe(false);
-	expect(
-		parseEvents(
-			`${JSON.stringify({ type: "agent_start" })}\n${compactedEnd}\n${JSON.stringify({ type: "agent_settled" })}\n`,
+	const compacted = compactRpcLog(
+		[{ type: "agent_start" }, { type: "agent_end", messages }, { type: "agent_settled" }].map((event) =>
+			JSON.stringify(event),
 		),
-	).toMatchObject({ done: true, waitingOnProcess: false });
+	);
+	expect(JSON.parse(compacted[1])).toEqual({ type: "pi_babysit_agent_end", parked: false });
+	expect(parseEvents(compacted.join("\n"))).toMatchObject({ done: true, waitingOnProcess: false });
 });
 
 test("parked reconciliation is ordered and consumes matching process ids once", () => {
@@ -1064,7 +1056,7 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 	];
 	const compare = (events: unknown[]) => {
 		const raw = events.map((event) => JSON.stringify(event)).join("\n");
-		const compact = raw.split("\n").map((line) => compactRpcLine(line, "compact")).join("\n");
+		const compact = compactRpcText(raw);
 		expect(parseEvents(compact)).toEqual(parseEvents(raw));
 		return parseEvents(compact);
 	};
@@ -1119,7 +1111,7 @@ test("RPC stream compaction makes cumulative updates approximately linear", () =
 		}),
 	);
 	const rawBytes = Buffer.byteLength(lines.join("\n"));
-	const compactBytes = Buffer.byteLength(lines.map(compactRpcLine).join("\n"));
+	const compactBytes = Buffer.byteLength(compactRpcLog(lines).join("\n"));
 	expect(compactBytes).toBeLessThan(rawBytes / 20);
 });
 
@@ -1137,11 +1129,12 @@ test("RPC stream proxy forwards multiple and unterminated records", () => {
 	);
 	expect(result.status).toBe(0);
 	const lines = result.stdout.trim().split("\n");
-	expect(JSON.parse(lines[0]!)).toEqual({
+	expect(JSON.parse(lines[0]!)).toEqual({ type: "pi_babysit_stream", version: 1, profile: "compact" });
+	expect(JSON.parse(lines[1]!)).toEqual({
 		type: "message_update",
 		assistantMessageEvent: { type: "text_delta", delta: "héllo" },
 	});
-	expect(lines[1]).toBe(final);
+	expect(lines[2]).toBe(final);
 });
 
 test("RPC stream proxy compact mode preserves parser state end-to-end", () => {
@@ -1197,7 +1190,7 @@ test("RPC stream proxy flushes final output before mirroring a child signal", ()
 		{ encoding: "utf8", maxBuffer: 1_000_000 },
 	);
 	expect(result.signal).toBe("SIGTERM");
-	expect(result.stdout).toBe(payload);
+	expect(result.stdout).toBe(`${JSON.stringify({ type: "pi_babysit_stream", version: 1, profile: "compact" })}\n${payload}`);
 });
 
 test("compact RPC deltas remain visible without duplicate final text", () => {
@@ -2511,13 +2504,13 @@ test("poller sleeps only when every pending session is on a backed-off host", ()
 test("delta-only message_update lines pass through the RPC proxy unchanged", () => {
 	const delta =
 		'{"type":"message_update","usage":{"output":1},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"say \\"message\\": and \\"partial\\": verbatim"}}';
-	expect(compactRpcLine(delta)).toBe(delta);
+	expect(compactRpcLog([delta])).toEqual([delta]);
 	const cumulative = JSON.stringify({
 		type: "message_update",
 		message: { role: "assistant", content: [] },
 		assistantMessageEvent: { type: "text_delta", delta: "x", partial: { content: [] } },
 	});
-	expect(JSON.parse(compactRpcLine(cumulative))).toEqual({
+	expect(JSON.parse(compactRpcLog([cumulative])[0])).toEqual({
 		type: "message_update",
 		assistantMessageEvent: { type: "text_delta", delta: "x" },
 	});

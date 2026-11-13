@@ -1958,12 +1958,20 @@ function parseEventLine(progress: Progress, raw: string): void {
 		case "agent_start":
 			progress.agentStarts++;
 			break;
+		// The compact log precedes every agent_end with this marker and may omit
+		// agent_end.messages (see rpc-stream-format.mjs).
+		case "pi_babysit_agent_end":
+			if (typeof event.parked === "boolean") progress.lastEndWasProcessWait = event.parked;
+			break;
 		case "agent_end": {
 			progress.agentEnds++;
-			progress.lastEndWasProcessWait =
-				typeof event.piBabysitParked === "boolean"
-					? event.piBabysitParked
-					: isParkedMessages(event.messages as ParkedMessage[] | undefined);
+			if (typeof event.piBabysitParked === "boolean") {
+				// Logs written by pi-babysit <= 0.6.32.
+				progress.lastEndWasProcessWait = event.piBabysitParked;
+			} else if (Array.isArray(event.messages)) {
+				progress.lastEndWasProcessWait = isParkedMessages(event.messages as ParkedMessage[]);
+			}
+			// Otherwise keep the value from the preceding pi_babysit_agent_end marker.
 			break;
 		}
 		case "agent_settled":
@@ -2346,9 +2354,9 @@ async function spawnSubagent(
 		"--timeout",
 		opts.timeout,
 	];
-	// Pretty-print the compact JSONL stream for humans who `attach`. The RPC
-	// proxy retains authoritative message_end/response/error events and reduces
-	// redundant lifecycle/tool payloads; parseEvents accepts both log formats.
+	// Pretty-print the JSONL stream for humans who `attach`. The RPC proxy
+	// writes a standard-event subset that omits only reproducible duplicate
+	// payloads (rpc-stream-format.mjs); parseEvents accepts every log format.
 	if (VIEW_CMD.trim()) bsArgs.push("--view-cmd", VIEW_CMD);
 	if (opts.idleTimeout && opts.idleTimeout !== "none") {
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
