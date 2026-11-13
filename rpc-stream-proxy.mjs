@@ -2,165 +2,50 @@
 /**
  * Transparent stdin/stdout proxy for `pi --mode rpc`.
  *
- * Pi's `message_update` events repeat the entire growing assistant message and
- * `assistantMessageEvent.partial` on every token. Those cumulative snapshots
- * are useful only while streaming; `message_end` is the authoritative final
- * message. Persisting every snapshot makes babysit logs grow quadratically.
- *
- * This proxy forwards stdin byte-for-byte. `message_update` snapshots are
- * always compacted. Compact log mode is the default: redundant payloads on
- * lifecycle/tool events are removed while authoritative `message_end`,
- * response, and error events remain intact. Set PI_BABYSIT_RPC_LOG_MODE=standard
- * to opt back into the legacy lifecycle payloads.
+ * stdin is forwarded byte-for-byte. stdout is rewritten line by line into
+ * pi-babysit's subagent log format (see rpc-stream-format.mjs): a subset of
+ * Pi's standard RPC event stream that only omits exactly reproducible
+ * duplicate payloads, plus separate `pi_babysit_*` events. Compact is the
+ * default profile; PI_BABYSIT_RPC_LOG_MODE=standard keeps Pi's events intact.
  */
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL } from "node:url";
+import { createRpcLogCompactor } from "./rpc-stream-format.mjs";
 
-function isParkedMessages(messages) {
-	if (!Array.isArray(messages)) return false;
-	const terminalCounts = new Map();
-	const addTerminal = (id) => terminalCounts.set(id, (terminalCounts.get(id) ?? 0) + 1);
-
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message?.role !== "toolResult") continue;
-		if (message.toolName === "babysit_wait") {
-			const status = message.details?.status;
-			if (
-				status &&
-				typeof status === "object" &&
-				typeof status.id === "string" &&
-				typeof status.state === "string" &&
-				status.state !== "running"
-			) {
-				addTerminal(status.id);
-			}
-			for (const result of message.details?.results ?? []) {
-				if (result.kind === "exited" && typeof result.id === "string") addTerminal(result.id);
-			}
-			const first = message.details?.first;
-			if (first?.kind === "exited" && typeof first.id === "string") addTerminal(first.id);
-			continue;
-		}
-		if (
-			message.toolName === "babysit_kill" &&
-			typeof message.details?.id === "string" &&
-			["exited", "killed", "dead"].includes(String(message.details.status))
-		) {
-			addTerminal(message.details.id);
-			continue;
-		}
-		if (message.toolName === "process") return true;
-		if (message.toolName !== "babysit_run") continue;
-		const text = Array.isArray(message.content)
-			? message.content
-					.filter((part) => part?.type === "text" && typeof part.text === "string")
-					.map((part) => part.text)
-					.join("")
-			: typeof message.content === "string"
-				? message.content
-				: "";
-		const textMatch = /^Process started \(id: ([^)]+)\)\. \[notify-on-exit\]\nLog: /.exec(text);
-		const structuredStart =
-			message.details?.kind === "process" && message.details.status === "started";
-		if (!structuredStart && !textMatch) continue;
-		const id = typeof message.details?.id === "string" ? message.details.id : textMatch?.[1];
-		if (!id) return true;
-		const count = terminalCounts.get(id) ?? 0;
-		if (count === 0) return true;
-		if (count === 1) terminalCounts.delete(id);
-		else terminalCounts.set(id, count - 1);
-	}
-	return false;
-}
-
-export function compactRpcLine(
-	line,
-	mode = process.env.PI_BABYSIT_RPC_LOG_MODE ?? "compact",
-) {
-	if (!line.trimStart().startsWith("{")) return line;
-	// Pi >= 1.4 already writes delta-only message_update lines (no cumulative
-	// `message` or `partial`). They are the bulk of a worker's stream, so skip
-	// the parse/re-serialize round trip when there is nothing to strip. Inside
-	// JSON strings a quote is escaped, so these key patterns cannot match text.
-	if (
-		line.startsWith('{"type":"message_update"') &&
-		!line.includes('"message":') &&
-		!line.includes('"partial":')
-	) {
-		return line;
-	}
-
-	let event;
-	try {
-		event = JSON.parse(line);
-	} catch {
-		return line;
-	}
-
-	if (event?.type === "message_update") {
-		const { message: _cumulativeMessage, assistantMessageEvent, ...rest } = event;
-		if (!assistantMessageEvent || typeof assistantMessageEvent !== "object") {
-			return JSON.stringify(rest);
-		}
-		const { partial: _cumulativePartial, ...deltaEvent } = assistantMessageEvent;
-		return JSON.stringify({ ...rest, assistantMessageEvent: deltaEvent });
-	}
-	if (mode !== "compact") return line;
-
-	switch (event?.type) {
-		case "message_start": {
-			const { message, ...rest } = event;
-			return JSON.stringify({
-				...rest,
-				message:
-					message && typeof message === "object"
-						? { role: message.role, toolName: message.toolName, toolCallId: message.toolCallId }
-						: message,
-			});
-		}
-		case "turn_end": {
-			const { message: _message, toolResults: _toolResults, ...rest } = event;
-			return JSON.stringify(rest);
-		}
-		case "agent_end": {
-			const { messages, ...rest } = event;
-			return JSON.stringify({ ...rest, piBabysitParked: isParkedMessages(messages) });
-		}
-		case "tool_execution_end": {
-			if (event.isError) return line;
-			const { result: _result, ...rest } = event;
-			return JSON.stringify(rest);
-		}
-		default:
-			return line;
-	}
+export function rpcLogMode(value = process.env.PI_BABYSIT_RPC_LOG_MODE) {
+	return value === "standard" ? "standard" : "compact";
 }
 
 function transformRpcOutput(input, output) {
 	return new Promise((resolve, reject) => {
 		const decoder = new StringDecoder("utf8");
+		const compactor = createRpcLogCompactor({ mode: rpcLogMode() });
 		let buffered = "";
 
-		const write = (value) => {
-			if (!output.write(value)) input.pause();
+		const write = (lines, terminated = true) => {
+			if (lines.length === 0) return;
+			if (!output.write(lines.join("\n") + (terminated ? "\n" : ""))) input.pause();
 		};
 		output.on("drain", () => input.resume());
 		input.on("error", reject);
 		input.on("data", (chunk) => {
 			buffered += decoder.write(chunk);
+			const lines = [];
 			for (;;) {
 				const newline = buffered.indexOf("\n");
 				if (newline < 0) break;
-				const line = buffered.slice(0, newline);
+				lines.push(...compactor.push(buffered.slice(0, newline)));
 				buffered = buffered.slice(newline + 1);
-				write(`${compactRpcLine(line)}\n`);
 			}
+			write(lines);
 		});
 		input.on("end", () => {
 			buffered += decoder.end();
-			if (buffered) write(compactRpcLine(buffered));
+			const lines = buffered ? compactor.push(buffered) : [];
+			lines.push(...compactor.end());
+			// Keep an unterminated final record unterminated.
+			write(lines, !buffered);
 			if (output.writableNeedDrain) output.once("drain", resolve);
 			else resolve();
 		});

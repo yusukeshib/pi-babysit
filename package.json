@@ -24,6 +24,7 @@
     "self-reap.ts",
     "format-stream.mjs",
     "rpc-stream-proxy.mjs",
+    "rpc-stream-format.mjs",
     "search-log.mjs",
     "gc.mjs",
     "gc.d.mts",
