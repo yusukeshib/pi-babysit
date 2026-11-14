@@ -86,7 +86,7 @@ Descriptions are display metadata, not shell code, stdin, or instructions sent
 to the subagent.
 
 ```text
-babysit_run { description: "Run regression tests", command: "bun test", foreground: true }
+babysit_run { description: "Run regression tests", command: "bun test", foreground: true, timeout: "10m" }
 babysit_run { description: "Review the authentication changes", profile: "subagent", task: "Review the authentication diff for security regressions", maxTurns: 5 }
 babysit_check { description: "Inspect build errors", id: "build", pattern: "ERROR" }
 babysit_wait { description: "Wait for the build to finish", id: "build" }
@@ -112,8 +112,8 @@ SSH aliases, keys, known hosts, and ProxyJump are handled by babysit/SSH;
 pi-babysit does not install remote software or copy credentials.
 
 ```text
-babysit_run { description: "Run tests on Linux", host: "yusuke-t4", cwd: "/home/yusuke/project", command: "bun test", foreground: true, returnLines: 30 }
-babysit_run { description: "Open a remote Python REPL", host: "user@server", command: "python3 -i", name: "remote-repl", continueAfterStart: true }
+babysit_run { description: "Run tests on Linux", host: "yusuke-t4", cwd: "/home/yusuke/project", command: "bun test", foreground: true, timeout: "10m", returnLines: 30 }
+babysit_run { description: "Open a remote Python REPL", host: "user@server", command: "python3 -i", name: "remote-repl", timeout: "none", continueAfterStart: true }
 babysit_check { description: "Read the remote REPL screen", id: "remote-repl", screen: true }
 babysit_send { description: "Evaluate a value in the remote REPL", id: "remote-repl", text: "print(42)" }
 babysit_kill { description: "Close the remote REPL", id: "remote-repl" }
@@ -268,6 +268,32 @@ packages are loaded from the managed install (`~/.pi/agent/install`), the `pi`
 on `PATH`, or `PI_BABYSIT_PI_PACKAGE_DIR`. Built-in tools use Pi's renderers;
 extension tools fall back to generic rendering. Live `/babysit` and attach views render either profile, as well as logs
 written by older pi-babysit releases.
+
+## Execution timeouts
+
+Commands default to an absolute **60s execution timeout**, in both foreground
+and background mode, locally and over SSH. Subagents retain their **15m**
+default. The babysit supervisor terminates the process when its deadline is
+reached; a foreground call then returns the terminal result to the agent rather
+than waiting forever. This is an execution limit, not an output-inactivity
+limit or the quick-command background grace period.
+
+Set a longer positive duration explicitly for slow work. Only an explicit
+`timeout: "none"` disables the deadline, and only for background runs in
+interactive/RPC mode. It is rejected with `foreground: true` or in non-interactive
+mode, which always waits inline. Empty strings, zero durations, `off`, and
+`never` are rejected rather than forwarded as babysit's infinite-timeout aliases.
+
+```text
+babysit_run { description: "Run a long test suite", command: "bun test", foreground: true, timeout: "10m" }
+babysit_run { description: "Start the development server", command: "bun run dev", name: "dev-server", timeout: "none", continueAfterStart: true }
+```
+
+`idleTimeout` remains disabled by default: a silent command is not necessarily
+stuck. `babysit_wait.timeout` limits only that wait, not the underlying process,
+and its default remains unlimited; the process's execution timeout still applies.
+To wait for readiness of an intentionally unbounded server, set a finite wait
+such as `babysit_wait { description: "Wait for server readiness", id: "dev-server", expect: "listening", timeout: "15s" }`.
 
 ## Process ownership, interruption, shutdown, and reload
 
