@@ -248,7 +248,25 @@ A subagent's babysit log is a subset of Pi's standard RPC event stream
   which completion detection uses.
 
 `createRpcEventRestorer()` turns a log back into standard Pi events for
-viewers. Live `/babysit` and attach views render either profile, as well as logs
+viewers.
+
+### Subagent transcript viewer
+
+`view.mjs` shows a subagent the way Pi shows its own chat: it restores the log
+to standard events and renders them with the installed Pi's components
+(`AssistantMessageComponent`, `ToolExecutionComponent`, …), following the log
+live. `/babysit` prints the exact command for a picked subagent:
+
+```sh
+node ~/.pi/agent/npm/node_modules/@yusukeshib/pi-babysit/view.mjs <session-id | session dir | output.log>
+```
+
+Keys: `q` / `Ctrl-C` quit, `Ctrl-O` expand or collapse tool output, `t`
+toggle thinking blocks. `--print` renders the current transcript once to stdout;
+`--cwd DIR` overrides the worker directory used to shorten tool paths. Pi
+packages are loaded from the managed install (`~/.pi/agent/install`), the `pi`
+on `PATH`, or `PI_BABYSIT_PI_PACKAGE_DIR`. Built-in tools use Pi's renderers;
+extension tools fall back to generic rendering. Live `/babysit` and attach views render either profile, as well as logs
 written by older pi-babysit releases.
 
 ## Process ownership, interruption, shutdown, and reload

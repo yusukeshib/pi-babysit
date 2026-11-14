@@ -639,6 +639,8 @@ interface Meta {
 	// subagent
 	task?: string;
 	launchCommand?: string;
+	/** Worker working directory; the transcript viewer resolves tool paths against it. */
+	cwd?: string;
 	reapAfter?: string;
 	promptOffset?: number;
 	model?: string;
@@ -2504,6 +2506,7 @@ async function spawnSubagent(
 		messageTempDirs: delivery.tempDir
 			? [{ dir: delivery.tempDir, afterAgentEnd: 1 }]
 			: undefined,
+		cwd: path.resolve(opts.cwd),
 		depth: opts.depth,
 		maxDepth: opts.maxDepth,
 		budget: opts.budget,
@@ -2681,6 +2684,11 @@ function sessionCliCommand(id: string, command: "log" | "attach"): string {
 	const meta = readMeta(id);
 	if (meta?.host) return `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} ${command} -s ${shq(meta.remoteId!)}`;
 	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} ${command} -s ${shq(id)}`;
+}
+
+/** Live transcript viewer for a local subagent, rendered with Pi's own components. */
+export function subagentViewCommand(id: string): string {
+	return `${shq(process.execPath)} ${shq(path.join(EXT_DIR, "view.mjs"))} ${shq(logPath(id))}`;
 }
 
 function attachCmd(id: string): string {
@@ -4884,6 +4892,7 @@ export default function (pi: ExtensionAPI) {
 					launchCommand: meta?.launchCommand,
 					reapAfter: meta?.reapAfter,
 					startedAt: meta?.startedAt,
+					cwd: meta?.cwd,
 					task: params.text,
 					// Start after the prompt-acceptance response. This excludes a
 					// preceding run that settled between `send` and RPC acceptance.
@@ -5240,6 +5249,7 @@ export default function (pi: ExtensionAPI) {
 					(picked.state === "running"
 						? "\n\n_Live subagent (read-only). Re-run `/babysit` to refresh this snapshot._"
 						: "") +
+					`\n\n**View transcript** (live, in your own terminal)\n\`\`\`sh\n${subagentViewCommand(picked.id)}\n\`\`\`` +
 					`\n\n**Log command**\n\`\`\`sh\n${sessionCliCommand(picked.id, "log")}\n\`\`\``;
 				const title =
 					`${picked.id} ${picked.state}${elapsedSuffix}` +
