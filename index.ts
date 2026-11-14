@@ -2686,11 +2686,6 @@ function sessionCliCommand(id: string, command: "log" | "attach"): string {
 	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} ${command} -s ${shq(id)}`;
 }
 
-/** Live transcript viewer for a local subagent, rendered with Pi's own components. */
-export function subagentViewCommand(id: string): string {
-	return `${shq(process.execPath)} ${shq(path.join(EXT_DIR, "view.mjs"))} ${shq(logPath(id))}`;
-}
-
 function attachCmd(id: string): string {
 	return sessionCliCommand(id, "attach");
 }
@@ -5249,7 +5244,6 @@ export default function (pi: ExtensionAPI) {
 					(picked.state === "running"
 						? "\n\n_Live subagent (read-only). Re-run `/babysit` to refresh this snapshot._"
 						: "") +
-					`\n\n**View transcript** (live, in your own terminal)\n\`\`\`sh\n${subagentViewCommand(picked.id)}\n\`\`\`` +
 					`\n\n**Log command**\n\`\`\`sh\n${sessionCliCommand(picked.id, "log")}\n\`\`\``;
 				const title =
 					`${picked.id} ${picked.state}${elapsedSuffix}` +
