@@ -1,6 +1,6 @@
 {
   "name": "@yusukeshib/pi-babysit",
-  "version": "0.6.33",
+  "version": "0.6.34",
   "description": "Run any shell command and pi subagents under babysit, with context-safe captured output.",
   "keywords": [
     "pi-package",
@@ -25,6 +25,9 @@
     "format-stream.mjs",
     "rpc-stream-proxy.mjs",
     "rpc-stream-format.mjs",
+    "transcript-view.mjs",
+    "pi-runtime.mjs",
+    "view.mjs",
     "search-log.mjs",
     "gc.mjs",
     "gc.d.mts",

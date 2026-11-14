@@ -639,6 +639,8 @@ interface Meta {
 	// subagent
 	task?: string;
 	launchCommand?: string;
+	/** Worker working directory; the transcript viewer resolves tool paths against it. */
+	cwd?: string;
 	reapAfter?: string;
 	promptOffset?: number;
 	model?: string;
@@ -2504,6 +2506,7 @@ async function spawnSubagent(
 		messageTempDirs: delivery.tempDir
 			? [{ dir: delivery.tempDir, afterAgentEnd: 1 }]
 			: undefined,
+		cwd: path.resolve(opts.cwd),
 		depth: opts.depth,
 		maxDepth: opts.maxDepth,
 		budget: opts.budget,
@@ -2681,6 +2684,18 @@ function sessionCliCommand(id: string, command: "log" | "attach"): string {
 	const meta = readMeta(id);
 	if (meta?.host) return `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} ${command} -s ${shq(meta.remoteId!)}`;
 	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} ${command} -s ${shq(id)}`;
+}
+
+/**
+ * Command copied by the widget icon: local subagents open the transcript
+ * viewer (rendered with Pi's components); everything else gets its log.
+ */
+export function widgetCopyCommand(id: string): string {
+	const meta = readMeta(id);
+	if (meta?.kind === "subagent" && !meta.host) {
+		return `${shq(process.execPath)} ${shq(path.join(EXT_DIR, "view.mjs"))} ${shq(logPath(id))}`;
+	}
+	return sessionCliCommand(id, "log");
 }
 
 function attachCmd(id: string): string {
@@ -3619,7 +3634,7 @@ export default function (pi: ExtensionAPI) {
 		if (!sessionWidget) {
 			ctx.ui.setWidget("pi-babysit", (tui) => {
 				sessionWidget = createWidgetComponent(summaryLines, displays,
-					(id) => copyToClipboard(sessionCliCommand(id, "log")),
+					(id) => copyToClipboard(widgetCopyCommand(id)),
 					() => tui.requestRender());
 				return sessionWidget;
 			}, { placement: "belowEditor" });
@@ -4884,6 +4899,7 @@ export default function (pi: ExtensionAPI) {
 					launchCommand: meta?.launchCommand,
 					reapAfter: meta?.reapAfter,
 					startedAt: meta?.startedAt,
+					cwd: meta?.cwd,
 					task: params.text,
 					// Start after the prompt-acceptance response. This excludes a
 					// preceding run that settled between `send` and RPC acceptance.
