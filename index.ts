@@ -2686,6 +2686,18 @@ function sessionCliCommand(id: string, command: "log" | "attach"): string {
 	return `BABYSIT_DIR=${shq(ROOT)} ${shq(BABYSIT_BIN)} ${command} -s ${shq(id)}`;
 }
 
+/**
+ * Command copied by the widget icon: local subagents open the transcript
+ * viewer (rendered with Pi's components); everything else gets its log.
+ */
+export function widgetCopyCommand(id: string): string {
+	const meta = readMeta(id);
+	if (meta?.kind === "subagent" && !meta.host) {
+		return `${shq(process.execPath)} ${shq(path.join(EXT_DIR, "view.mjs"))} ${shq(logPath(id))}`;
+	}
+	return sessionCliCommand(id, "log");
+}
+
 function attachCmd(id: string): string {
 	return sessionCliCommand(id, "attach");
 }
@@ -3622,7 +3634,7 @@ export default function (pi: ExtensionAPI) {
 		if (!sessionWidget) {
 			ctx.ui.setWidget("pi-babysit", (tui) => {
 				sessionWidget = createWidgetComponent(summaryLines, displays,
-					(id) => copyToClipboard(sessionCliCommand(id, "log")),
+					(id) => copyToClipboard(widgetCopyCommand(id)),
 					() => tui.requestRender());
 				return sessionWidget;
 			}, { placement: "belowEditor" });

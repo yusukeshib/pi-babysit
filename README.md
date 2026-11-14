@@ -255,7 +255,7 @@ viewers.
 `view.mjs` shows a subagent the way Pi shows its own chat: it restores the log
 to standard events and renders them with the installed Pi's components
 (`AssistantMessageComponent`, `ToolExecutionComponent`, …), following the log
-live:
+live. The widget's copy icon on a local subagent row copies this command:
 
 ```sh
 node ~/.pi/agent/npm/node_modules/@yusukeshib/pi-babysit/view.mjs <session-id | session dir | output.log>

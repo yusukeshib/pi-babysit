@@ -65,7 +65,7 @@ const click=async id=>{
 };
 for(const [id,expectedArgs,local] of [
  [${JSON.stringify(localId)},['log','-s',${JSON.stringify(localId)}],true],
- [${JSON.stringify(agentId)},['log','-s',${JSON.stringify(agentId)}],true],
+ [${JSON.stringify(agentId)},null,true],
  [${JSON.stringify(remoteId)},['--host','user@server','log','-s',"worker'quoted"],false],
 ]) {
  const previousLogCalls=read().calls.filter(c=>c.args.includes('log')).length, previousCopies=clipboard.length;
@@ -74,6 +74,15 @@ for(const [id,expectedArgs,local] of [
  assert.equal(read().calls.filter(c=>c.args.includes('log')).length,previousLogCalls,'copy must not execute logs');
  assert(widget.render(200).find(line=>line.includes(id)).endsWith('✓'),'successful copy must show a checkmark');
  const command=clipboard.at(-1);
+ if(expectedArgs===null){
+  // Local subagents copy the transcript viewer for their log.
+  assert(command.includes('view.mjs'),command);
+  assert(command.includes('output.log'),command);
+  const viewed=spawnSync('sh',['-c',command+' --print'],{encoding:'utf8'});
+  assert.equal(viewed.status,0,viewed.stderr);
+  assert.equal(read().calls.filter(c=>c.args.includes('log')).length,previousLogCalls,'the viewer must not call babysit log');
+  continue;
+ }
  const result=spawnSync('sh',['-c',command],{encoding:'utf8'});
  assert.equal(result.status,0,result.stderr); assert.equal(result.stdout.trim(),'selected log');
  const call=read().calls.at(-1); assert.deepEqual(call.args,expectedArgs);
@@ -84,7 +93,7 @@ const originalWidget=widget; await refresh(); assert.equal(widget,originalWidget
 rejectCopy=true; const previousCopies=clipboard.length; await click(${JSON.stringify(localId)});
 assert.equal(clipboard.length,previousCopies); assert(widget.render(200).find(line=>line.includes(${JSON.stringify(localId)})).endsWith('!')); assert.equal(editorEdits,0);
 // The existing keyboard picker exposes the same command for manual copying.
-for(const [id,expected] of [[${JSON.stringify(localId)},clipboard[0]],[${JSON.stringify(agentId)},clipboard[1]],[${JSON.stringify(remoteId)},clipboard[2]]]) {
+for(const [id,expected] of [[${JSON.stringify(localId)},clipboard[0]],[${JSON.stringify(remoteId)},clipboard[2]]]) {
  selected=id; await commands.get('babysit').handler('',ctx); assert(messages.at(-1).details.body.includes(expected));
 }
 originalWidget.dispose();
