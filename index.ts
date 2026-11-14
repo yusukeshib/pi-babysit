@@ -2131,6 +2131,28 @@ async function reserveUniqueSessionId(name: string): Promise<string> {
 	return id;
 }
 
+/** Resolve a bounded execution deadline before invoking the supervisor. */
+export function resolveRunTimeout(timeout: string | undefined, isSubagent: boolean, waitsInline: boolean): string {
+	const value = timeout === undefined ? (isSubagent ? "15m" : "60s") : timeout.trim().toLowerCase();
+	if (value === "none") {
+		if (waitsInline) {
+			throw new Error('timeout: "none" requires a background run; foreground and non-interactive runs need a finite timeout.');
+		}
+		return value;
+	}
+	// babysit also accepts empty/zero/off/never as infinite deadlines. Do not
+	// forward those aliases: unbounded execution must be an explicit "none".
+	const match = /^(\d+)\s*(ms|s|m|h|d)?$/.exec(value);
+	const amount = match ? Number(match[1]) : NaN;
+	const unit = match?.[2] ?? "s";
+	const multipliers: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+	const multiplier = multipliers[unit]!;
+	if (!Number.isSafeInteger(amount * multiplier) || amount <= 0) {
+		throw new Error('Invalid timeout: use a positive duration (e.g. "60s", "10m") or explicit "none" for a background run.');
+	}
+	return `${amount}${unit}`;
+}
+
 interface ProcOpts {
 	description: string;
 	name?: string;
@@ -2138,7 +2160,7 @@ interface ProcOpts {
 	cwd?: string;
 	host?: string;
 	env?: Record<string, string | undefined>;
-	timeout?: string; // default: none — dev servers may run indefinitely
+	timeout: string; // resolved to 60s unless explicitly overridden
 	idleTimeout?: string;
 	pty: boolean;
 	notificationGroup?: string;
@@ -2179,7 +2201,7 @@ async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: s
 	const remote = !!opts.host && opts.host !== "local";
 	const bsArgs = ["run", "-d", "--json", "--size", "120x40"];
 	if (!opts.pty) bsArgs.push("--no-tty");
-	if (opts.timeout && opts.timeout !== "none") bsArgs.push("--timeout", opts.timeout);
+	if (opts.timeout !== "none") bsArgs.push("--timeout", opts.timeout);
 	if (opts.idleTimeout && opts.idleTimeout !== "none")
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
 	const reservedId = remote ? await reserveUniqueSessionId(opts.name ?? "remote-proc") : opts.name ? await reserveUniqueSessionId(opts.name) : undefined;
@@ -3908,6 +3930,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run supervised commands or bounded pi subagents with context-safe logs",
 		promptGuidelines: [
 			"Use babysit_run for shell commands and give meaningful sessions a stable name; bundle tiny related read-only observations into one command.",
+			"babysit_run commands default to a 60s execution timeout (subagents: 15m). Set a longer timeout for long-running work; timeout: none is allowed only for explicit background runs, never foreground or non-interactive runs.",
 			"Use babysit_run foreground mode for one process or subagent whose result is needed now; never issue sibling foreground runs in parallel. For parallel process checks, start background runs with continueAfterStart and collect them with one multi-session babysit_wait.",
 			"Use returnPattern/returnLines for noisy commands. During edit/fix loops run targeted checks first and one full validation suite at the end instead of repeating every full gate.",
 			"After a background process starts, stop the turn for its automatic notification; never poll or sleep. Use continueAfterStart only for specific non-polling process work.",
@@ -3991,7 +4014,7 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(
 				Type.String({
 					description:
-						"Absolute auto-kill after this long (e.g. 30m). Default: none for processes (dev servers may run forever), 15m for subagents. 'none' disables.",
+						"Absolute auto-kill after a positive duration (e.g. 60s, 10m). Default: 60s for processes, 15m for subagents. Explicit 'none' disables only for background runs; forbidden with foreground or in non-interactive mode. Zero/empty/off/never are invalid.",
 				}),
 			),
 			reapAfter: Type.Optional(
@@ -4053,8 +4076,10 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const description = params.description.trim();
-			await requireBabysit();
 			const isSubagent = params.profile === "subagent";
+			const waitsInline = !ctx.hasUI || params.foreground === true;
+			const timeout = resolveRunTimeout(params.timeout, isSubagent, waitsInline);
+			await requireBabysit();
 			validateProcessHost(params.host);
 			if (isSubagent && (params.cwd !== undefined || (params.host && params.host !== "local"))) throw new Error("host/cwd are process-only options; remote subagents are not supported.");
 			if (params.host && params.host !== "local" && params.retryOnWorkerDeath) throw new Error("Remote automatic launch retries are unsupported; reconcile the tracked session explicitly.");
@@ -4142,7 +4167,6 @@ export default function (pi: ExtensionAPI) {
 
 			// --- process mode ---
 			if (!isSubagent) {
-				const waitsInline = !ctx.hasUI || params.foreground === true;
 				const lifecycle = resolveProcessLifecycle(params.lifecycle, waitsInline);
 				if (params.returnPattern) {
 					try {
@@ -4165,7 +4189,7 @@ export default function (pi: ExtensionAPI) {
 					command: params.command as string,
 					host: params.host,
 					cwd: params.cwd ?? (params.host && params.host !== "local" ? undefined : ctx.cwd),
-					timeout: params.timeout,
+					timeout,
 					idleTimeout: params.idleTimeout,
 					pty: params.pty ?? true,
 					env: processSessionEnvironment(ctx, pi.getThinkingLevel()),
@@ -4330,7 +4354,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						: undefined,
 				reapAfter: params.reapAfter,
-				timeout: params.timeout ?? "15m",
+				timeout,
 				idleTimeout: params.idleTimeout,
 			});
 

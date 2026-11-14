@@ -50,6 +50,7 @@ import extension, {
 	readLogBytesFrom,
 	resolveKillConfirmation,
 	resolveProcessLifecycle,
+	resolveRunTimeout,
 	resolveSubagentSendMode,
 	rpcResponsePattern,
 	type ProcessCompletionNotice,
@@ -2268,6 +2269,49 @@ test("foreground mode filters noisy output without a second check turn", async (
 	);
 	expect(invalid.isError).toBe(true);
 	expect(invalid.content[0]?.text).toContain("Invalid returnPattern");
+});
+
+test("run deadlines default to 60s for processes and 15m for subagents", () => {
+	for (const waitsInline of [false, true]) {
+		expect(resolveRunTimeout(undefined, false, waitsInline)).toBe("60s");
+		expect(resolveRunTimeout(undefined, true, waitsInline)).toBe("15m");
+		for (const [input, expected] of [["10m", "10m"], [" 2 H ", "2h"], ["500ms", "500ms"], ["30", "30s"], ["1D", "1d"]]) {
+			expect(resolveRunTimeout(input, false, waitsInline)).toBe(expected);
+		}
+	}
+});
+
+test("unlimited run deadlines require explicit none and background execution", () => {
+	for (const isSubagent of [false, true]) {
+		expect(resolveRunTimeout("none", isSubagent, false)).toBe("none");
+		expect(resolveRunTimeout(" NONE ", isSubagent, false)).toBe("none");
+		expect(() => resolveRunTimeout("none", isSubagent, true)).toThrow("requires a background run");
+		for (const value of ["", " ", "0", "0s", "00ms", "0m", "off", "never", "-1s", "1.5s", "10minutes", "9007199254740992h"]) {
+			for (const waitsInline of [false, true]) {
+				expect(() => resolveRunTimeout(value, isSubagent, waitsInline)).toThrow("Invalid timeout");
+			}
+		}
+	}
+});
+
+test("inline runs reject unbounded timeouts before starting a process or subagent", async () => {
+	for (const profile of [undefined, "subagent"]) {
+		for (const context of [ctx, interactiveCtx]) {
+			for (const foreground of [false, true]) {
+				if (context.hasUI && !foreground) continue;
+				await expect(tools.get("babysit_run").execute(
+					"reject-unbounded-run",
+					{
+						description: "Reject an unbounded inline run",
+						...(profile ? { profile, task: "Must not start a model" } : { command: "sleep 60" }),
+						foreground,
+						timeout: "none",
+					},
+					undefined, undefined, context,
+				)).rejects.toThrow("requires a background run");
+			}
+		}
+	}
 });
 
 test("foreground mode lets the supervisor own the absolute timeout boundary", async () => {
