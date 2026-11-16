@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-test("widget icons copy runnable local/agent/remote commands without executing logs or touching the editor", () => {
+test("widget icons copy log commands or subagent log paths without executing logs or touching the editor", () => {
 	const dir = mkdtempSync(path.join(tmpdir(), "pi copy ' test-"));
 	const root = path.join(dir, "session root");
 	const cli = path.join(dir, "babysit ' cli");
@@ -75,12 +75,9 @@ for(const [id,expectedArgs,local] of [
  assert(widget.render(200).find(line=>line.includes(id)).endsWith('✓'),'successful copy must show a checkmark');
  const command=clipboard.at(-1);
  if(expectedArgs===null){
-  // Local subagents copy the transcript viewer for their log.
-  assert(command.includes('view.mjs'),command);
-  assert(command.includes('output.log'),command);
-  const viewed=spawnSync('sh',['-c',command+' --print'],{encoding:'utf8'});
-  assert.equal(viewed.status,0,viewed.stderr);
-  assert.equal(read().calls.filter(c=>c.args.includes('log')).length,previousLogCalls,'the viewer must not call babysit log');
+  // Local subagents copy their log file path (Pi's RPC event stream).
+  assert.equal(command,${JSON.stringify(path.join(root, "sessions", agentId, "output.log"))});
+  assert(fs.existsSync(command),command);
   continue;
  }
  const result=spawnSync('sh',['-c',command],{encoding:'utf8'});

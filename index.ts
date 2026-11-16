@@ -638,7 +638,7 @@ interface Meta {
 	// subagent
 	task?: string;
 	launchCommand?: string;
-	/** Worker working directory; the transcript viewer resolves tool paths against it. */
+	/** Worker working directory. */
 	cwd?: string;
 	reapAfter?: string;
 	promptOffset?: number;
@@ -2694,14 +2694,12 @@ function sessionCliCommand(id: string, command: "log" | "attach"): string {
 }
 
 /**
- * Command copied by the widget icon: local subagents open the transcript
- * viewer (rendered with Pi's components); everything else gets its log.
+ * Text copied by the widget icon: a local subagent's log file path (Pi's RPC
+ * event stream, e.g. for `pi-tail -f`); everything else gets its log command.
  */
 export function widgetCopyCommand(id: string): string {
 	const meta = readMeta(id);
-	if (meta?.kind === "subagent" && !meta.host) {
-		return `${shq(process.execPath)} ${shq(path.join(EXT_DIR, "view.mjs"))} ${shq(logPath(id))}`;
-	}
+	if (meta?.kind === "subagent" && !meta.host) return logPath(id);
 	return sessionCliCommand(id, "log");
 }
 

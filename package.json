@@ -1,6 +1,6 @@
 {
   "name": "@yusukeshib/pi-babysit",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Run any shell command and pi subagents under babysit, with context-safe captured output.",
   "keywords": [
     "pi-package",
@@ -23,7 +23,6 @@
     "agents.ts",
     "self-reap.ts",
     "format-stream.mjs",
-    "view.mjs",
     "search-log.mjs",
     "gc.mjs",
     "gc.d.mts",
@@ -38,9 +37,6 @@
     "extensions": [
       "./index.ts"
     ]
-  },
-  "dependencies": {
-    "@yusukeshib/pi-tail": "^0.1.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
