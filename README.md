@@ -227,35 +227,20 @@ Set `PI_BABYSIT_ALLOW_BASH=1` only as an explicit emergency escape hatch.
 
 ### Subagent log format
 
-A subagent's babysit log is a subset of Pi's standard RPC event stream
-(`rpc-stream-format.mjs`):
-
-- The first line is `{"type":"pi_babysit_stream","version":1,"profile":"compact"}`
-  (`"standard"` with `PI_BABYSIT_RPC_LOG_MODE=standard`).
-- Standard events keep their type and field meaning. The compact profile only
-  omits fields whose value is exactly reproducible from other lines; it never
-  reshapes a field. pi-babysit's own data uses separate `pi_babysit_*` events.
-- `message_update` is delta-only, as in Pi >= 1.4 (older Pi's cumulative
-  `message` / `partial` snapshots are stripped).
-- Compact omissions: `message.content` / `message.details` of a non-assistant
-  `message_start` that is immediately followed by an identical `message_end`;
-  `result.content` / `result.details` of a non-error `tool_execution_end` (they
-  equal the `toolResult` `message_end` with the same `toolCallId`, otherwise a
-  `pi_babysit_tool_execution_result` event carries the original); and
-  `turn_end.message` / `turn_end.toolResults` / `agent_end.messages` when they
-  equal the values derived from the run's `message_end` events.
-- Every `agent_end` is preceded by `{"type":"pi_babysit_agent_end","parked":bool}`,
-  which completion detection uses.
-
-`createRpcEventRestorer()` turns a log back into standard Pi events for
-viewers.
+A subagent's babysit log is Pi's `pi --mode rpc` stdout as-is: the standard
+RPC event stream (JSONL), recorded through the worker's PTY, so lines end in
+`\r\n`. pi-babysit adds no records and removes no fields. Parked-turn
+detection reads `agent_end.messages`.
 
 ### Subagent transcript viewer
 
-`view.mjs` shows a subagent the way Pi shows its own chat: it restores the log
-to standard events and renders them with the installed Pi's components
-(`AssistantMessageComponent`, `ToolExecutionComponent`, …), following the log
-live. The widget's copy icon on a local subagent row copies this command:
+`view.mjs` shows a subagent the way Pi shows its own chat. It is a thin wrapper
+around [`@yusukeshib/pi-tail`](https://github.com/yusukeshib/pi-tail), which
+renders a Pi event log with the installed Pi's components
+(`AssistantMessageComponent`, `ToolExecutionComponent`, …) and follows it live.
+The wrapper resolves a session id, uses the worker's directory, and shows the
+session state. The widget's copy icon on a local subagent row copies this
+command:
 
 ```sh
 node ~/.pi/agent/npm/node_modules/@yusukeshib/pi-babysit/view.mjs <session-id | session dir | output.log>
@@ -263,16 +248,10 @@ node ~/.pi/agent/npm/node_modules/@yusukeshib/pi-babysit/view.mjs <session-id | 
 
 Keys: `q` / `Ctrl-C` quit, `Ctrl-O` expand or collapse tool output, `t`
 toggle thinking blocks. `--print` renders the current transcript once to stdout;
-`--cwd DIR` overrides the worker directory used to shorten tool paths. Pi
-packages are loaded from the managed install (`~/.pi/agent/install`), the `pi`
-on `PATH`, or `PI_BABYSIT_PI_PACKAGE_DIR`. The viewer sets up the worker's
-environment the way Pi does for its directory: settings (global and, for a
-trusted project, project), themes from `settings.themes` and packages, terminal
-colors, keybindings, and the extensions' tool, message and Markdown renderers.
-Extensions are loaded but no session starts, so their session handlers never
-run; missing packages are skipped, never installed; a project that Pi has not
-been told to trust is loaded without its project-local resources. Live `/babysit` and attach views render either profile, as well as logs
-written by older pi-babysit releases.
+`--cwd DIR` overrides the worker directory. Because the log is a plain Pi RPC
+stream, `pi-tail <output.log>` works on it too. See the pi-tail README for how
+Pi packages, settings, themes and extension renderers are loaded
+(`PI_TAIL_PI_PACKAGE_DIR` overrides the Pi package directory).
 
 ## Execution timeouts
 
@@ -395,7 +374,6 @@ session totals.
 | `PI_BABYSIT_QUICK_GRACE` | `2s` | interactive process grace before a still-running command is returned as background work; use `foreground: true` to wait explicitly |
 | `PI_BABYSIT_REAP_AFTER` | `120s` | idle grace before a finished subagent self-exits (`off`/`none`/`0` disables) |
 | `PI_BABYSIT_BUDGET_GRACE` | `90s` | grace after a subagent budget is exceeded before verified termination |
-| `PI_BABYSIT_RPC_LOG_MODE` | `compact` | `compact` omits reproducible duplicate RPC payloads; `standard` records Pi's events unchanged (see Subagent log format) |
 | `PI_BABYSIT_RETENTION_DAYS` | `3` | at most once per day, remove safe terminal roots older than this (in a background child process, so session start never waits); set `0` to disable automatic retention |
 | `PI_BABYSIT_TAIL_MAX_BYTES` | `4000` | default cap for explicit log tails/screens returned by `babysit_check`; override per call with `maxBytes` |
 | `PI_BABYSIT_INLINE_OUTPUT_MAX_BYTES` | `8000` | cap for complete process output and aggregate multi-wait results |

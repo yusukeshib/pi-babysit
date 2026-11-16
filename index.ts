@@ -160,10 +160,9 @@ export function planSubagentSpawn(
 // apart from any other turn end (see isParkedMessages / self-reap.ts).
 export const NOTIFY_MARKER = "[notify-on-exit]";
 
-// Human-readable view for the compact subagent JSONL stream when a human
-// attaches. The RPC proxy removes cumulative streaming snapshots before both
-// recording and display; authoritative events remain intact for parsers. Set
-// PI_BABYSIT_VIEW_CMD="" to disable formatting, or provide a custom command.
+// Human-readable view for the subagent's Pi RPC event stream when a human
+// attaches. Set PI_BABYSIT_VIEW_CMD="" to disable formatting, or provide a
+// custom command.
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const VIEW_CMD =
@@ -1960,22 +1959,12 @@ function parseEventLine(progress: Progress, raw: string): void {
 		case "agent_start":
 			progress.agentStarts++;
 			break;
-		// The compact log precedes every agent_end with this marker and may omit
-		// agent_end.messages (see rpc-stream-format.mjs).
-		case "pi_babysit_agent_end":
-			if (typeof event.parked === "boolean") progress.lastEndWasProcessWait = event.parked;
-			break;
-		case "agent_end": {
+		case "agent_end":
 			progress.agentEnds++;
-			if (typeof event.piBabysitParked === "boolean") {
-				// Logs written by pi-babysit <= 0.6.32.
-				progress.lastEndWasProcessWait = event.piBabysitParked;
-			} else if (Array.isArray(event.messages)) {
-				progress.lastEndWasProcessWait = isParkedMessages(event.messages as ParkedMessage[]);
-			}
-			// Otherwise keep the value from the preceding pi_babysit_agent_end marker.
+			progress.lastEndWasProcessWait = isParkedMessages(
+				Array.isArray(event.messages) ? (event.messages as ParkedMessage[]) : undefined,
+			);
 			break;
-		}
 		case "agent_settled":
 			progress.agentSettled++;
 			break;
@@ -2378,9 +2367,8 @@ async function spawnSubagent(
 		"--timeout",
 		opts.timeout,
 	];
-	// Pretty-print the JSONL stream for humans who `attach`. The RPC proxy
-	// writes a standard-event subset that omits only reproducible duplicate
-	// payloads (rpc-stream-format.mjs); parseEvents accepts every log format.
+	// Pretty-print the JSONL stream for humans who `attach`. The log is Pi's
+	// RPC event stream as-is.
 	if (VIEW_CMD.trim()) bsArgs.push("--view-cmd", VIEW_CMD);
 	if (opts.idleTimeout && opts.idleTimeout !== "none") {
 		bsArgs.push("--idle-timeout", opts.idleTimeout);
@@ -2388,9 +2376,6 @@ async function spawnSubagent(
 	const reservedId = opts.name ? await reserveUniqueSessionId(opts.name) : undefined;
 	if (reservedId) bsArgs.push("--id", reservedId);
 	bsArgs.push(
-		"--",
-		process.execPath,
-		path.join(EXT_DIR, "rpc-stream-proxy.mjs"),
 		"--",
 		PI_BIN,
 		...piArgs,

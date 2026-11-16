@@ -13,8 +13,6 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { createRpcLogCompactor } from "./rpc-stream-format.mjs";
-import { rpcLogMode } from "./rpc-stream-proxy.mjs";
 import { isParked as selfReaperIsParked } from "./self-reap.ts";
 import { discoverAgents } from "./agents.ts";
 import extension, {
@@ -453,73 +451,6 @@ test("process commands receive current Pi session metadata", () => {
 	expect(ephemeral.PI_MODEL).toBeUndefined();
 });
 
-/** Run lines through the proxy's compactor and drop the stream header. */
-function compactRpcLog(lines: string[], mode: "compact" | "standard" = "compact"): string[] {
-	const compactor = createRpcLogCompactor({ mode });
-	const out = lines.flatMap((line) => compactor.push(line));
-	out.push(...compactor.end());
-	expect(JSON.parse(out[0])).toEqual({ type: "pi_babysit_stream", version: 1, profile: mode });
-	return out.slice(1);
-}
-const compactRpcText = (raw: string) => compactRpcLog(raw.split("\n")).join("\n");
-
-test("compact RPC logging is the default while standard remains an opt-out", () => {
-	expect(rpcLogMode(undefined)).toBe("compact");
-	expect(rpcLogMode("compact")).toBe("compact");
-	expect(rpcLogMode("standard")).toBe("standard");
-	const lines = [
-		{ type: "agent_start" },
-		{ type: "turn_start" },
-		{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "large" }] } },
-		{
-			type: "turn_end",
-			message: { role: "assistant", content: [{ type: "text", text: "large" }] },
-			toolResults: [],
-		},
-	].map((event) => JSON.stringify(event));
-	expect(JSON.parse(compactRpcLog(lines).at(-1)!)).toEqual({ type: "turn_end" });
-	expect(compactRpcLog(lines, "standard")).toEqual(lines);
-});
-
-test("RPC stream compaction removes only cumulative message_update snapshots", () => {
-	const update = {
-		type: "message_update",
-		message: { role: "assistant", content: [{ type: "text", text: "growing answer" }] },
-		assistantMessageEvent: {
-			type: "text_delta",
-			contentIndex: 0,
-			delta: "answer",
-			partial: { type: "text", text: "growing answer" },
-		},
-		futureField: "preserved",
-	};
-	const compact = JSON.parse(compactRpcLog([JSON.stringify(update)])[0]);
-	expect(compact).toEqual({
-		type: "message_update",
-		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "answer" },
-		futureField: "preserved",
-	});
-
-	const finalLine = '{"type":"message_end","message":{"role":"assistant"}}';
-	expect(compactRpcLog([finalLine])).toEqual([finalLine]);
-	expect(compactRpcLog(["non-json diagnostic"])).toEqual(["non-json diagnostic"]);
-});
-
-test("RPC log compaction preserves dialogs, warnings, failures, and unknown events", () => {
-	for (const event of [
-		{ type: "extension_ui_request", method: "confirm", id: "permission", title: "Allow?" },
-		{ type: "extension_ui_request", method: "notify", message: "CLI unavailable", notifyType: "warning" },
-		{ type: "tool_execution_end", isError: true, result: { content: "failure details" } },
-		{ type: "response", command: "prompt", success: false, error: "invalid model" },
-		{ type: "error", message: "transport failed" },
-		{ type: "future_event", payload: "preserved" },
-	]) {
-		const line = JSON.stringify(event);
-		expect(compactRpcLog([line])).toEqual([line]);
-		expect(compactRpcLog([line], "standard")).toEqual([line]);
-	}
-});
-
 test("RPC response offsets exclude lifecycle events from the preceding run", () => {
 	const previousEnd = `${JSON.stringify({ type: "agent_end", messages: [] })}\r\n`;
 	const response = `${JSON.stringify({ type: "response", command: "prompt", success: true })}\r\n`;
@@ -586,7 +517,7 @@ test("terminal subagent progress cache entries are pruned while running entries 
 	expect([...cache.keys()]).toEqual(["working"]);
 });
 
-test("RPC stream compaction preserves parseEvents final state", () => {
+test("parseEvents derives the final state from an RPC log", () => {
 	const assistant = {
 		role: "assistant",
 		content: [{ type: "text", text: "final answer" }],
@@ -613,10 +544,7 @@ test("RPC stream compaction preserves parseEvents final state", () => {
 		{ type: "agent_settled" },
 	];
 	const raw = events.map((event) => JSON.stringify(event)).join("\n");
-	const compact = compactRpcText(raw);
-	expect(compact).not.toContain('"messages"');
-	expect(parseEvents(compact)).toEqual(parseEvents(raw));
-	expect(parseEvents(compact)).toMatchObject({
+	expect(parseEvents(raw)).toMatchObject({
 		done: true,
 		finalText: "final answer",
 		turns: 1,
@@ -781,7 +709,7 @@ test("a completed subagent task charges nested usage to the parent exactly once"
 				},
 			},
 		},
-		{ type: "agent_end", piBabysitParked: false },
+		{ type: "agent_end", messages: [] },
 		{ type: "agent_settled" },
 	].map((event) => JSON.stringify(event)).join("\n") + "\n";
 	const encoded = Buffer.from(events).toString("base64");
@@ -886,42 +814,6 @@ test("killed subagents preserve their partially streamed final answer", () => {
 	expect(diagnostic).not.toContain("no structured error");
 });
 
-test("compact RPC mode marks parked agent ends with a separate pi-babysit event", () => {
-	const agentEnd = (messages: unknown[]) => [
-		JSON.stringify({ type: "agent_start" }),
-		JSON.stringify({ type: "agent_end", messages }),
-	];
-	const markerOf = (lines: string[]) => JSON.parse(compactRpcLog(lines).at(-2)!);
-	expect(
-		markerOf(
-			agentEnd([
-				{
-					role: "toolResult",
-					toolName: "babysit_run",
-					content: "Process started (id: build). [notify-on-exit]\nLog: /tmp/output.log",
-					details: { kind: "process", status: "started" },
-				},
-				{ role: "toolResult", toolName: "babysit_run", content: "quick command" },
-			]),
-		),
-	).toEqual({ type: "pi_babysit_agent_end", parked: true });
-	expect(
-		markerOf(
-			agentEnd([{ role: "toolResult", toolName: "babysit_run", content: "command printed [notify-on-exit]" }]),
-		),
-	).toEqual({ type: "pi_babysit_agent_end", parked: false });
-	// Standard events never carry pi-babysit fields.
-	const end = JSON.parse(compactRpcLog(agentEnd([])).at(-1)!);
-	expect(end).not.toHaveProperty("piBabysitParked");
-});
-
-test("legacy compact logs with agent_end.piBabysitParked still parse", () => {
-	const log = [{ type: "agent_start" }, { type: "agent_end", piBabysitParked: true }, { type: "agent_settled" }]
-		.map((event) => JSON.stringify(event))
-		.join("\n");
-	expect(parseEvents(log)).toMatchObject({ done: false, waitingOnProcess: true });
-});
-
 test("self-reaper parked detection cannot be spoofed by command output", () => {
 	expect(
 		selfReaperIsParked([
@@ -957,13 +849,10 @@ test("a process explicitly collected in the same subagent run is not left parked
 		{ role: "assistant", content: [{ type: "text", text: "finished" }] },
 	];
 	expect(selfReaperIsParked(messages)).toBe(false);
-	const compacted = compactRpcLog(
-		[{ type: "agent_start" }, { type: "agent_end", messages }, { type: "agent_settled" }].map((event) =>
-			JSON.stringify(event),
-		),
-	);
-	expect(JSON.parse(compacted[1])).toEqual({ type: "pi_babysit_agent_end", parked: false });
-	expect(parseEvents(compacted.join("\n"))).toMatchObject({ done: true, waitingOnProcess: false });
+	const log = [{ type: "agent_start" }, { type: "agent_end", messages }, { type: "agent_settled" }]
+		.map((event) => JSON.stringify(event))
+		.join("\n");
+	expect(parseEvents(log)).toMatchObject({ done: true, waitingOnProcess: false });
 });
 
 test("parked reconciliation is ordered and consumes matching process ids once", () => {
@@ -1028,7 +917,7 @@ test("self-reaper exits an already-idle RPC worker when its grace elapses", () =
 	expect(child.status, child.stderr).toBe(0);
 });
 
-test("RPC stream compaction preserves parked, resumed, and failed RPC state", () => {
+test("RPC logs track parked, resumed, and failed RPC state", () => {
 	const parkedEnd = {
 		type: "agent_end",
 		messages: [
@@ -1055,12 +944,7 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 		parkedEnd,
 		{ type: "agent_settled" },
 	];
-	const compare = (events: unknown[]) => {
-		const raw = events.map((event) => JSON.stringify(event)).join("\n");
-		const compact = compactRpcText(raw);
-		expect(parseEvents(compact)).toEqual(parseEvents(raw));
-		return parseEvents(compact);
-	};
+	const compare = (events: unknown[]) => parseEvents(events.map((event) => JSON.stringify(event)).join("\n"));
 
 	expect(compare(parkedEvents)).toMatchObject({ done: false, waitingOnProcess: true });
 	expect(
@@ -1099,102 +983,7 @@ test("RPC stream compaction preserves parked, resumed, and failed RPC state", ()
 	).toMatchObject({ done: false, waitingOnProcess: true });
 });
 
-test("RPC stream compaction makes cumulative updates approximately linear", () => {
-	const lines = Array.from({ length: 200 }, (_, index) =>
-		JSON.stringify({
-			type: "message_update",
-			message: { role: "assistant", content: [{ type: "text", text: "x".repeat((index + 1) * 100) }] },
-			assistantMessageEvent: {
-				type: "text_delta",
-				delta: "x".repeat(100),
-				partial: { type: "text", text: "x".repeat((index + 1) * 100) },
-			},
-		}),
-	);
-	const rawBytes = Buffer.byteLength(lines.join("\n"));
-	const compactBytes = Buffer.byteLength(compactRpcLog(lines).join("\n"));
-	expect(compactBytes).toBeLessThan(rawBytes / 20);
-});
-
-test("RPC stream proxy forwards multiple and unterminated records", () => {
-	const update = JSON.stringify({
-		type: "message_update",
-		message: { role: "assistant", content: [{ type: "text", text: "héllo" }] },
-		assistantMessageEvent: { type: "text_delta", delta: "héllo", partial: { text: "héllo" } },
-	});
-	const final = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [] } });
-	const result = spawnSync(
-		process.execPath,
-		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", "process.stdin.pipe(process.stdout)"],
-		{ input: `${update}\n${final}`, encoding: "utf8" },
-	);
-	expect(result.status).toBe(0);
-	const lines = result.stdout.trim().split("\n");
-	expect(JSON.parse(lines[0]!)).toEqual({ type: "pi_babysit_stream", version: 1, profile: "compact" });
-	expect(JSON.parse(lines[1]!)).toEqual({
-		type: "message_update",
-		assistantMessageEvent: { type: "text_delta", delta: "héllo" },
-	});
-	expect(lines[2]).toBe(final);
-});
-
-test("RPC stream proxy compact mode preserves parser state end-to-end", () => {
-	const assistant = {
-		role: "assistant",
-		content: [{ type: "text", text: "done" }],
-		usage: { input: 10, output: 2, cacheRead: 30, totalTokens: 42, cost: { total: 0.01 } },
-	};
-	const events = [
-		{ type: "agent_start" },
-		{ type: "turn_start" },
-		{ type: "message_start", message: assistant },
-		{ type: "tool_execution_end", toolName: "read", isError: false, result: { content: "large".repeat(100) } },
-		{ type: "message_end", message: assistant },
-		{ type: "turn_end", message: assistant, toolResults: [{ content: "large".repeat(100) }] },
-		{ type: "agent_end", messages: [assistant] },
-		{ type: "agent_settled" },
-	];
-	const input = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
-	const result = spawnSync(
-		process.execPath,
-		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", "process.stdin.pipe(process.stdout)"],
-		{
-			input,
-			encoding: "utf8",
-			env: { ...process.env, PI_BABYSIT_RPC_LOG_MODE: "compact" },
-		},
-	);
-	expect(result.status).toBe(0);
-	expect(Buffer.byteLength(result.stdout)).toBeLessThan(Buffer.byteLength(input));
-	expect(parseEvents(result.stdout)).toEqual(parseEvents(input));
-});
-
-test("RPC stream proxy preserves an early child's exit status during EPIPE", () => {
-	const result = spawnSync(
-		process.execPath,
-		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", "process.exit(7)"],
-		{ input: "x".repeat(2_000_000), encoding: "utf8" },
-	);
-	expect(result.status).toBe(7);
-	expect(result.stderr).not.toContain("EPIPE");
-});
-
-test("RPC stream proxy flushes final output before mirroring a child signal", () => {
-	const payload = JSON.stringify({ type: "message_end", data: "x".repeat(200_000) });
-	const childScript = [
-		`const payload = ${JSON.stringify(payload)};`,
-		"process.stdout.write(payload, () => process.kill(process.pid, 'SIGTERM'));",
-	].join("\n");
-	const result = spawnSync(
-		process.execPath,
-		[path.join(process.cwd(), "rpc-stream-proxy.mjs"), "--", process.execPath, "-e", childScript],
-		{ encoding: "utf8", maxBuffer: 1_000_000 },
-	);
-	expect(result.signal).toBe("SIGTERM");
-	expect(result.stdout).toBe(`${JSON.stringify({ type: "pi_babysit_stream", version: 1, profile: "compact" })}\n${payload}`);
-});
-
-test("compact RPC deltas remain visible without duplicate final text", () => {
+test("delta-only RPC updates stream without duplicate final text", () => {
 	const events = [
 		{ type: "turn_start" },
 		{ type: "message_start", message: { role: "assistant", content: [] } },
@@ -2543,19 +2332,4 @@ test("poller sleeps only when every pending session is on a backed-off host", ()
 	expect(pollDeferredUntil([unknown("remote-a", "a")], meta, backoff, 2_000)).toBe(0);
 	// Reachable remote sessions are polled normally even if the host had failures before.
 	expect(pollDeferredUntil([{ id: "remote-a", host: "a", state: "running" }], meta, backoff, 1_000)).toBe(0);
-});
-
-test("delta-only message_update lines pass through the RPC proxy unchanged", () => {
-	const delta =
-		'{"type":"message_update","usage":{"output":1},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"say \\"message\\": and \\"partial\\": verbatim"}}';
-	expect(compactRpcLog([delta])).toEqual([delta]);
-	const cumulative = JSON.stringify({
-		type: "message_update",
-		message: { role: "assistant", content: [] },
-		assistantMessageEvent: { type: "text_delta", delta: "x", partial: { content: [] } },
-	});
-	expect(JSON.parse(compactRpcLog([cumulative])[0])).toEqual({
-		type: "message_update",
-		assistantMessageEvent: { type: "text_delta", delta: "x" },
-	});
 });

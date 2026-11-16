@@ -23,11 +23,6 @@
     "agents.ts",
     "self-reap.ts",
     "format-stream.mjs",
-    "rpc-stream-proxy.mjs",
-    "rpc-stream-format.mjs",
-    "transcript-view.mjs",
-    "pi-runtime.mjs",
-    "pi-environment.mjs",
     "view.mjs",
     "search-log.mjs",
     "gc.mjs",
@@ -43,6 +38,9 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "@yusukeshib/pi-tail": "^0.1.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

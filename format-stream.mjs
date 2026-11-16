@@ -3,8 +3,8 @@
  * format-stream.mjs — human-readable view for a `pi --mode rpc` event stream.
  *
  * This filter sits on the interactive attach path via `babysit run --view-cmd`.
- * It accepts both Pi's raw cumulative updates and pi-babysit's compact deltas,
- * then prints a colored, incrementally streamed transcript so a human sees
+ * It accepts delta-only `message_update` events (Pi >= 0.84) as well as older
+ * cumulative snapshots, then prints a colored, incrementally streamed transcript so a human sees
  * turns, thinking, tool calls and answers instead of a JSON firehose.
  */
 import * as readline from "node:readline";
@@ -51,8 +51,8 @@ function summarizeTool(name, a = {}) {
 }
 
 // Join the text of a given block kind ("text" or "thinking") in a message's
-// content array. Unfiltered RPC streams repeat the whole growing message;
-// pi-babysit's compact stream instead retains only assistantMessageEvent.delta.
+// content array. Pi < 0.84 repeated the whole growing message on every update;
+// newer releases send only assistantMessageEvent.delta.
 function blockText(content, kind) {
 	if (!Array.isArray(content)) return "";
 	let s = "";
