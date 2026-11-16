@@ -167,7 +167,9 @@ including reusable idle agents. Summary counts use `RUNNING` / `IDLE`; rows show
 and unknown-status indicators when applicable, and a colored one-line description.
 Older sessions fall back to their command or task. Rows truncate to terminal width
 with `…`. In fullscreen mode, click the single `⧉` icon at the right edge of a row
-to copy that session's shell-quoted `babysit log` command. It includes the local
+to copy that session's shell-quoted `babysit log` command (for a local subagent,
+its log file path; see [Viewing a subagent transcript](#viewing-a-subagent-transcript)).
+The command includes the local
 `BABYSIT_DIR` or remote host/worker ID, without executing the command or changing
 the input buffer. The icon changes in place: `…` while copying, `✓` on success,
 or `!` on failure. The result stays visible for two seconds before returning to
@@ -232,26 +234,16 @@ RPC event stream (JSONL), recorded through the worker's PTY, so lines end in
 `\r\n`. pi-babysit adds no records and removes no fields. Parked-turn
 detection reads `agent_end.messages`.
 
-### Subagent transcript viewer
+### Viewing a subagent transcript
 
-`view.mjs` shows a subagent the way Pi shows its own chat. It is a thin wrapper
-around [`@yusukeshib/pi-tail`](https://github.com/yusukeshib/pi-tail), which
-renders a Pi event log with the installed Pi's components
-(`AssistantMessageComponent`, `ToolExecutionComponent`, …) and follows it live.
-The wrapper resolves a session id, uses the worker's directory, and shows the
-session state. The widget's copy icon on a local subagent row copies this
-command:
+The widget's copy icon on a local subagent row copies the subagent's log file
+path. The log is Pi's standard RPC event stream, so any Pi event viewer can
+read it, for example [pi-tail](https://github.com/yusukeshib/pi-tail), which
+renders it with Pi's own components:
 
 ```sh
-node ~/.pi/agent/npm/node_modules/@yusukeshib/pi-babysit/view.mjs <session-id | session dir | output.log>
+pi-tail -f <copied output.log path>
 ```
-
-Keys: `q` / `Ctrl-C` quit, `Ctrl-O` expand or collapse tool output, `t`
-toggle thinking blocks. `--print` renders the current transcript once to stdout;
-`--cwd DIR` overrides the worker directory. Because the log is a plain Pi RPC
-stream, `pi-tail <output.log>` works on it too. See the pi-tail README for how
-Pi packages, settings, themes and extension renderers are loaded
-(`PI_TAIL_PI_PACKAGE_DIR` overrides the Pi package directory).
 
 ## Execution timeouts
 
