@@ -60,7 +60,24 @@ export function applyAssistantDelta(message, update) {
 	}
 }
 
-export function createTranscriptView({ runtime, tui, cwd = process.cwd(), hideThinkingBlock = false }) {
+/**
+ * Render context without a loaded Pi environment: built-in tool renderers only
+ * and default settings. pi-environment.mjs builds the full one.
+ */
+export function defaultRenderContext(runtime) {
+	return {
+		getToolDefinition: (name) => runtime.withBuiltInRenderers?.(name, undefined),
+		getMessageRenderer: () => undefined,
+		getMarkdownTransformers: () => [],
+		markdownTheme: () => runtime.agent.getMarkdownTheme(),
+		hideThinkingBlock: false,
+		outputPad: undefined,
+		showImages: false,
+		imageWidthCells: undefined,
+	};
+}
+
+export function createTranscriptView({ runtime, tui, cwd = process.cwd(), render = defaultRenderContext(runtime) }) {
 	const {
 		AssistantMessageComponent,
 		ToolExecutionComponent,
@@ -68,7 +85,8 @@ export function createTranscriptView({ runtime, tui, cwd = process.cwd(), hideTh
 		CustomMessageComponent,
 		CompactionSummaryMessageComponent,
 		BranchSummaryMessageComponent,
-		getMarkdownTheme,
+		SkillInvocationMessageComponent,
+		parseSkillBlock,
 	} = runtime.agent;
 	const { Container, Spacer, Text } = runtime.tui;
 
@@ -77,11 +95,14 @@ export function createTranscriptView({ runtime, tui, cwd = process.cwd(), hideTh
 	const expandables = [];
 	const assistants = [];
 	let expanded = false;
-	let hideThinking = hideThinkingBlock;
+	let hideThinking = render.hideThinkingBlock === true;
 	let streaming;
 
-	const markdownTheme = () => getMarkdownTheme();
-	const toolDefinition = (name) => runtime.withBuiltInRenderers?.(name, undefined);
+	// Constructor arguments below follow interactive mode (InteractiveMode.handleEvent / addMessageToChat).
+	const markdownTheme = () => render.markdownTheme();
+	const transformers = () => render.getMarkdownTransformers();
+	const outputPad = render.outputPad;
+	const toolOptions = { showImages: render.showImages, imageWidthCells: render.imageWidthCells, outputPad };
 	const add = (component) => {
 		container.addChild(component);
 		return component;
@@ -99,7 +120,7 @@ export function createTranscriptView({ runtime, tui, cwd = process.cwd(), hideTh
 	function toolComponent(name, id, args) {
 		let component = pendingTools.get(id);
 		if (component) return component;
-		component = new ToolExecutionComponent(name, id, args ?? {}, { showImages: false }, toolDefinition(name), tui, cwd);
+		component = new ToolExecutionComponent(name, id, args ?? {}, toolOptions, render.getToolDefinition(name), tui, cwd);
 		addExpandable(component);
 		pendingTools.set(id, component);
 		return component;
@@ -115,7 +136,15 @@ export function createTranscriptView({ runtime, tui, cwd = process.cwd(), hideTh
 	}
 
 	function newAssistant(message) {
-		const component = new AssistantMessageComponent(undefined, hideThinking, markdownTheme());
+		// undefined label: the component's default, as in interactive mode before an extension changes it.
+		const component = new AssistantMessageComponent(
+			undefined,
+			hideThinking,
+			markdownTheme(),
+			undefined,
+			outputPad,
+			transformers(),
+		);
 		assistants.push(component);
 		add(component);
 		component.updateContent(message, true);
@@ -142,19 +171,35 @@ export function createTranscriptView({ runtime, tui, cwd = process.cwd(), hideTh
 				const text = userText(message);
 				if (!text) return;
 				if (container.children.length > 0) add(new Spacer(1));
-				add(new UserMessageComponent(text, markdownTheme()));
+				const skillBlock = parseSkillBlock?.(text);
+				if (skillBlock && SkillInvocationMessageComponent) {
+					addExpandable(
+						new SkillInvocationMessageComponent(skillBlock, markdownTheme(), outputPad, transformers()),
+					);
+					if (skillBlock.userMessage) {
+						add(new Spacer(1));
+						add(new UserMessageComponent(skillBlock.userMessage, markdownTheme(), outputPad, transformers()));
+					}
+					return;
+				}
+				add(new UserMessageComponent(text, markdownTheme(), outputPad, transformers()));
 				return;
 			}
 			case "custom":
-				if (message.display) addExpandable(new CustomMessageComponent(message, undefined, markdownTheme()));
+				if (message.display) {
+					const renderer = render.getMessageRenderer(message.customType);
+					addExpandable(new CustomMessageComponent(message, renderer, markdownTheme(), outputPad, transformers()));
+				}
 				return;
 			case "compactionSummary":
 				add(new Spacer(1));
-				addExpandable(new CompactionSummaryMessageComponent(message, markdownTheme()));
+				addExpandable(
+					new CompactionSummaryMessageComponent(message, markdownTheme(), outputPad, transformers()),
+				);
 				return;
 			case "branchSummary":
 				add(new Spacer(1));
-				addExpandable(new BranchSummaryMessageComponent(message, markdownTheme()));
+				addExpandable(new BranchSummaryMessageComponent(message, markdownTheme(), outputPad, transformers()));
 				return;
 			default:
 				return;
