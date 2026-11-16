@@ -4,15 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { loadPiRuntime } from "./pi-runtime.mjs";
 import { createRpcLogCompactor } from "./rpc-stream-format.mjs";
-import { applyAssistantDelta, createTranscriptView } from "./transcript-view.mjs";
+import { loadPiEnvironment } from "./pi-environment.mjs";
+import { applyAssistantDelta, createTranscriptView, defaultRenderContext } from "./transcript-view.mjs";
 import { createLogReader, parseArgs, resolveLogPath } from "./view.mjs";
 
 const runtime = await loadPiRuntime();
 runtime.agent.initTheme(undefined, false);
 const stripAnsi = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 
-function render(events: Record<string, unknown>[], setup?: (view: any) => void) {
-	const view = createTranscriptView({ runtime, tui: { requestRender() {} }, cwd: "/repo" });
+function render(events: Record<string, unknown>[], setup?: (view: any) => void, context?: any) {
+	const view = createTranscriptView({ runtime, tui: { requestRender() {} }, cwd: "/repo", render: context });
 	setup?.(view);
 	const compactor = createRpcLogCompactor();
 	const lines = events.flatMap((event) => compactor.push(JSON.stringify(event)));
@@ -118,4 +119,97 @@ test("viewer resolves session ids to the newest log and parses options", () => {
 		rmSync(base, { recursive: true, force: true });
 	}
 	expect(parseArgs(["w", "--print", "--cwd", "/x"])).toEqual({ target: "w", print: true, cwd: "/x" });
+});
+
+test("extension tool and message renderers from the render context are used", () => {
+	const { Text } = runtime.tui;
+	const base = defaultRenderContext(runtime);
+	const context = {
+		...base,
+		getToolDefinition: (name: string) =>
+			name === "demo_tool"
+				? { name, renderCall: () => new Text("DEMO-CALL", 0, 0), renderResult: () => new Text("DEMO-RESULT", 0, 0) }
+				: base.getToolDefinition(name),
+		getMessageRenderer: (type: string) => (type === "demo-note" ? () => new Text("DEMO-NOTE", 0, 0) : undefined),
+	};
+	const call = { type: "toolCall", id: "call-9", name: "demo_tool", arguments: { secret: "raw-arg" } };
+	const assistant = { role: "assistant", content: [call], stopReason: "toolUse", timestamp: 2 };
+	const note = { role: "custom", customType: "demo-note", content: "raw-note", display: true, timestamp: 5 };
+	const { text } = render(
+		[
+			{ type: "agent_start" },
+			{ type: "message_start", message: assistant },
+			{ type: "message_end", message: assistant },
+			{ type: "tool_execution_start", toolCallId: "call-9", toolName: "demo_tool", args: call.arguments },
+			{
+				type: "tool_execution_end",
+				toolCallId: "call-9",
+				toolName: "demo_tool",
+				result: { content: [{ type: "text", text: "raw-result" }] },
+				isError: false,
+			},
+			{ type: "message_start", message: note },
+			{ type: "message_end", message: note },
+			{ type: "agent_end", messages: [] },
+		],
+		undefined,
+		context,
+	);
+	const out = text();
+	expect(out).toContain("DEMO-CALL");
+	expect(out).toContain("DEMO-RESULT");
+	expect(out).toContain("DEMO-NOTE");
+	expect(out).not.toContain("raw-arg");
+	expect(out).not.toContain("raw-note");
+});
+
+test("the Pi environment registers settings themes and extension tools without installing packages", async () => {
+	const base = mkdtempSync(path.join(os.tmpdir(), "pi-babysit-env-"));
+	try {
+		const agentDir = path.join(base, "agent");
+		const cwd = path.join(base, "work");
+		mkdirSync(path.join(agentDir, "theme-resources"), { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+		const darkTheme = JSON.parse(
+			require("node:fs").readFileSync(
+				path.join(runtime.packageDir, "dist", "modes", "interactive", "theme", "dark.json"),
+				"utf8",
+			),
+		);
+		writeFileSync(
+			path.join(agentDir, "theme-resources", "fixture.json"),
+			JSON.stringify({ ...darkTheme, name: "fixture-theme" }),
+		);
+		writeFileSync(
+			path.join(agentDir, "ext.ts"),
+			`export default function (pi) {
+				pi.registerTool({
+					name: "fixture_tool",
+					label: "Fixture",
+					description: "fixture",
+					parameters: { type: "object", properties: {} },
+					async execute() { return { content: [] }; },
+					renderCall() { return undefined; },
+				});
+			}\n`,
+		);
+		writeFileSync(
+			path.join(agentDir, "settings.json"),
+			JSON.stringify({
+				theme: "fixture-theme",
+				themes: ["theme-resources/fixture.json"],
+				extensions: ["ext.ts"],
+				packages: ["npm:@pi-babysit-fixture/not-installed@0.0.0"],
+				outputPad: 0,
+			}),
+		);
+		const environment = await loadPiEnvironment(runtime, { cwd, agentDir });
+		expect(environment.themes.map((theme: any) => theme.name)).toContain("fixture-theme");
+		expect(typeof environment.render.getToolDefinition("fixture_tool")?.renderCall).toBe("function");
+		expect(typeof environment.render.getToolDefinition("bash")?.renderCall).toBe("function");
+		expect(environment.render.outputPad).toBe(0);
+		expect(require("node:fs").existsSync(path.join(agentDir, "npm", "node_modules", "@pi-babysit-fixture"))).toBe(false);
+	} finally {
+		rmSync(base, { recursive: true, force: true });
+	}
 });

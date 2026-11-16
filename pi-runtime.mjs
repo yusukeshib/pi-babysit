@@ -67,32 +67,54 @@ function siblingPackageEntry(agentDir, name) {
 }
 
 /**
- * Load { agent, tui, withBuiltInRenderers, packageDir, version }.
- * withBuiltInRenderers is optional (an internal module of pi-coding-agent).
+ * Internal (non-exported) modules of pi-coding-agent that interactive mode
+ * uses to set up its chat. Each is optional: a pi release that moved or lacks
+ * one degrades to the closest public behavior instead of failing.
+ */
+const INTERNAL_MODULES = {
+	renderers: "dist/core/tools/renderers/index.js",
+	builtInExtensions: "dist/extensions/index.js",
+	trust: "dist/core/trust-manager.js",
+	keybindings: "dist/core/keybindings.js",
+	theme: "dist/modes/interactive/theme/theme.js",
+	themeController: "dist/modes/interactive/theme/theme-controller.js",
+	mermaid: "dist/modes/interactive/components/mermaid.js",
+};
+
+async function importInternal(packageDir, relativePath) {
+	const file = path.join(packageDir, relativePath);
+	if (!fs.existsSync(file)) return undefined;
+	try {
+		return await import(pathToFileURL(file).href);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Load { agent, tui, withBuiltInRenderers, internal, packageDir, version }.
+ * `internal` holds the optional internal modules (see INTERNAL_MODULES); they
+ * resolve to the same module instances the public entry point uses, so module
+ * state such as registered themes is shared.
  */
 export async function loadPiRuntime() {
 	const packageDir = findPiPackageDir();
 	let agent;
 	let tui;
-	let withBuiltInRenderers;
 	let version;
+	const internal = {};
 	if (packageDir) {
 		const pkg = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
 		version = pkg.version;
 		agent = await import(pathToFileURL(path.join(packageDir, pkg.exports?.["."]?.import ?? "dist/index.js")).href);
 		const tuiEntry = siblingPackageEntry(packageDir, "pi-tui");
 		tui = await import(tuiEntry ?? "@earendil-works/pi-tui");
-		try {
-			const renderers = await import(
-				pathToFileURL(path.join(packageDir, "dist", "core", "tools", "renderers", "index.js")).href
-			);
-			withBuiltInRenderers = renderers.withBuiltInRenderers;
-		} catch {
-			/* generic tool rendering */
+		for (const [key, relativePath] of Object.entries(INTERNAL_MODULES)) {
+			internal[key] = await importInternal(packageDir, relativePath);
 		}
 	} else {
 		agent = await import(AGENT_PACKAGE);
 		tui = await import("@earendil-works/pi-tui");
 	}
-	return { agent, tui, withBuiltInRenderers, packageDir, version };
+	return { agent, tui, withBuiltInRenderers: internal.renderers?.withBuiltInRenderers, internal, packageDir, version };
 }

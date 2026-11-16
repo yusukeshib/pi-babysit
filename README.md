@@ -265,8 +265,13 @@ Keys: `q` / `Ctrl-C` quit, `Ctrl-O` expand or collapse tool output, `t`
 toggle thinking blocks. `--print` renders the current transcript once to stdout;
 `--cwd DIR` overrides the worker directory used to shorten tool paths. Pi
 packages are loaded from the managed install (`~/.pi/agent/install`), the `pi`
-on `PATH`, or `PI_BABYSIT_PI_PACKAGE_DIR`. Built-in tools use Pi's renderers;
-extension tools fall back to generic rendering. Live `/babysit` and attach views render either profile, as well as logs
+on `PATH`, or `PI_BABYSIT_PI_PACKAGE_DIR`. The viewer sets up the worker's
+environment the way Pi does for its directory: settings (global and, for a
+trusted project, project), themes from `settings.themes` and packages, terminal
+colors, keybindings, and the extensions' tool, message and Markdown renderers.
+Extensions are loaded but no session starts, so their session handlers never
+run; missing packages are skipped, never installed; a project that Pi has not
+been told to trust is loaded without its project-local resources. Live `/babysit` and attach views render either profile, as well as logs
 written by older pi-babysit releases.
 
 ## Execution timeouts

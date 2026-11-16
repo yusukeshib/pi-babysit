@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { applyTerminalSettings, initPiTheme, loadPiEnvironment } from "./pi-environment.mjs";
 import { loadPiRuntime } from "./pi-runtime.mjs";
 import { createRpcEventRestorer } from "./rpc-stream-format.mjs";
 import { createTranscriptView } from "./transcript-view.mjs";
@@ -72,11 +73,6 @@ function sessionInfo(logPath) {
 	};
 }
 
-function piSettings() {
-	const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
-	return readJson(path.join(agentDir, "settings.json")) ?? {};
-}
-
 /** Incremental JSONL reader: feed bytes, get complete event objects. */
 export function createLogReader(onEvent) {
 	const restorer = createRpcEventRestorer();
@@ -132,28 +128,44 @@ export async function main(argv = process.argv.slice(2)) {
 	const info = sessionInfo(logPath);
 	const cwd = options.cwd ?? info.meta?.cwd ?? process.cwd();
 	const runtime = await loadPiRuntime();
-	const settings = piSettings();
-	runtime.agent.initTheme(settings.theme, false);
+	// The worker's settings, themes and extension renderers, as Pi loads them for its cwd.
+	const environment = await loadPiEnvironment(runtime, { cwd });
+	applyTerminalSettings(runtime, environment);
+	const newView = (tui) => createTranscriptView({ runtime, tui, cwd, render: environment.render });
 
 	const decoder = new TextDecoder();
 	if (options.print) {
-		const stub = { requestRender() {} };
-		const view = createTranscriptView({ runtime, tui: stub, cwd, hideThinkingBlock: settings.hideThinkingBlock === true });
+		initPiTheme(runtime, environment);
+		for (const message of environment.diagnostics) process.stderr.write(`${message}\n`);
+		const view = newView({ requestRender() {} });
 		const reader = createLogReader((event) => view.apply(event));
 		reader.push(decoder.decode(fs.readFileSync(logPath)));
 		reader.end();
 		const width = process.stdout.columns || 120;
-		process.stdout.write(`${view.container.render(width).join("\n")}\n`);
+		await new Promise((resolve) => process.stdout.write(`${view.container.render(width).join("\n")}\n`, resolve));
 		return 0;
 	}
 
-	const { ProcessTerminal, Text } = runtime.tui;
+	const { Container, ProcessTerminal, Spacer, Text } = runtime.tui;
 	// Pi >= 1.5 renders regular (scrollback) mode with TuiMainScreen; older
 	// pi-tui releases export the TUI class itself.
 	const Screen = runtime.tui.TuiMainScreen ?? runtime.tui.TUI;
 	if (typeof Screen !== "function") throw new Error("Unsupported pi-tui: no TuiMainScreen or TUI export");
-	const ui = new Screen(new ProcessTerminal());
-	let view = createTranscriptView({ runtime, tui: ui, cwd, hideThinkingBlock: settings.hideThinkingBlock === true });
+	const settingsManager = environment.settingsManager;
+	const ui = new Screen(
+		new ProcessTerminal(),
+		settingsManager?.getShowHardwareCursor?.(),
+		runtime.agent.getAgentDir?.(),
+	);
+	if (settingsManager?.getClearOnShrink) ui.setClearOnShrink?.(settingsManager.getClearOnShrink());
+	const theme = initPiTheme(runtime, environment, ui);
+	if (environment.diagnostics.length > 0) {
+		const diagnostics = new Container();
+		for (const message of environment.diagnostics) diagnostics.addChild(new Text(`\x1b[31m${message}\x1b[0m`, 1, 0));
+		diagnostics.addChild(new Spacer(1));
+		ui.addChild(diagnostics);
+	}
+	let view = newView(ui);
 	let reader = createLogReader((event) => view.apply(event));
 	const status = new Text("", 1, 0);
 	const statusLine = () => {
@@ -171,10 +183,10 @@ export async function main(argv = process.argv.slice(2)) {
 		const chunk = readFrom(logPath, offset);
 		if (chunk.truncated) {
 			// The log was replaced; start over.
-			ui.removeChild(view.container);
-			view = createTranscriptView({ runtime, tui: ui, cwd, hideThinkingBlock: settings.hideThinkingBlock === true });
+			const index = ui.children.indexOf(view.container);
+			view = newView(ui);
 			reader = createLogReader((event) => view.apply(event));
-			ui.children.unshift(view.container);
+			ui.children.splice(index, 1, view.container);
 		}
 		offset = chunk.offset;
 		if (chunk.text.length) reader.push(decoder.decode(chunk.text, { stream: true }));
@@ -201,6 +213,7 @@ export async function main(argv = process.argv.slice(2)) {
 
 	poll();
 	ui.start();
+	theme.start();
 	const timer = setInterval(poll, 200);
 	return undefined;
 }
@@ -209,11 +222,12 @@ const entry = process.argv[1] ? pathToFileURL(fs.realpathSync(process.argv[1])).
 if (entry === import.meta.url) {
 	main().then(
 		(code) => {
-			if (typeof code === "number") process.exitCode = code;
+			// Loaded extensions may keep timers alive; a finished one-shot run exits.
+			if (typeof code === "number") process.exit(code);
 		},
 		(error) => {
 			console.error(error instanceof Error ? error.message : String(error));
-			process.exitCode = 1;
+			process.exit(1);
 		},
 	);
 }
