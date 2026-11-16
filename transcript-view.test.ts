@@ -6,7 +6,7 @@ import { loadPiRuntime } from "./pi-runtime.mjs";
 import { createRpcLogCompactor } from "./rpc-stream-format.mjs";
 import { loadPiEnvironment } from "./pi-environment.mjs";
 import { applyAssistantDelta, createTranscriptView, defaultRenderContext } from "./transcript-view.mjs";
-import { createLogReader, parseArgs, resolveLogPath } from "./view.mjs";
+import { createLogReader, createViewerInputListener, parseArgs, resolveLogPath } from "./view.mjs";
 
 const runtime = await loadPiRuntime();
 runtime.agent.initTheme(undefined, false);
@@ -65,6 +65,60 @@ test("a compact subagent log renders with Pi's components", () => {
 	expect(out).not.toContain("**");
 	expect(out.indexOf("Say hi")).toBeLessThan(out.indexOf("echo hi"));
 	expect(out.indexOf("hi-output")).toBeLessThan(out.indexOf("All done."));
+});
+
+test.each([
+	["tools", "\x1b[111;5:1u", "\x1b[111;5:2u", "\x1b[111;5:3u", "\x0f"],
+	["thinking", "\x1b[116;1:1u", "\x1b[116;1:2u", "\x1b[116;1:3u", "t"],
+])("viewer %s toggles persist after release and ignore key repeats", (_name, press, repeat, release, legacy) => {
+	const output = Array.from({ length: 40 }, (_, i) => `tool-output-${i}`).join("\n");
+	const { view, text } = render([
+		...run(),
+		{ type: "message_end", message: { ...final, content: [{ type: "thinking", thinking: "private reasoning" }] } },
+		{ type: "tool_execution_start", toolCallId: "long", toolName: "bash", args: { command: "long-output" } },
+		{ type: "tool_execution_end", toolCallId: "long", result: { content: [{ type: "text", text: output }] }, isError: false },
+	]);
+	let changes = 0;
+	const listener = createViewerInputListener({
+		tui: runtime.tui,
+		getView: () => view,
+		quit() { throw new Error("unexpected quit"); },
+		onChange() { changes++; },
+	});
+	const before = text();
+	expect(listener(press)).toEqual({ consume: true });
+	const toggled = text();
+	expect(toggled).not.toBe(before);
+	for (const data of [repeat, repeat, release]) {
+		expect(listener(data)).toEqual({ consume: true });
+		expect(text()).toBe(toggled);
+	}
+	expect(changes).toBe(1);
+	listener(press);
+	listener(release);
+	expect(text()).toBe(before);
+	expect(changes).toBe(2);
+	listener(legacy);
+	expect(text()).toBe(toggled);
+	listener(legacy);
+	expect(text()).toBe(before);
+});
+
+test("viewer ignores quit releases, repeats, and unrelated input", () => {
+	let quits = 0;
+	let changes = 0;
+	const listener = createViewerInputListener({
+		tui: runtime.tui,
+		getView() { throw new Error("unexpected view access"); },
+		quit() { quits++; },
+		onChange() { changes++; },
+	});
+	for (const data of ["\x1b[113;1:3u", "\x1b[99;5:3u", "\x1b[113;1:2u", "x"]) listener(data);
+	expect(quits).toBe(0);
+	expect(changes).toBe(0);
+	for (const data of ["\x1b[113;1:1u", "\x1b[99;5:1u", "q", "\x03"]) listener(data);
+	expect(quits).toBe(4);
+	expect(changes).toBe(4);
 });
 
 test("streaming deltas are visible before message_end", () => {

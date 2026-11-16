@@ -118,6 +118,23 @@ function readFrom(file, offset) {
 	return { text: buffer, offset: size, truncated: false };
 }
 
+export function createViewerInputListener({ tui, getView, quit, onChange }) {
+	const key = (data, name) => tui.matchesKey?.(data, name) ?? false;
+	return (data) => {
+		// Input listeners run before Pi's focused-component key-release filter.
+		// Toggle once per press, not again on release or while holding the key.
+		if (tui.isKeyRelease?.(data) || tui.isKeyRepeat?.(data)) return { consume: true };
+		if (key(data, "q") || key(data, "ctrl+c") || data === "q" || data === "\x03") quit();
+		else if (key(data, "ctrl+o") || data === "\x0f") {
+			const view = getView();
+			view.setToolsExpanded(!view.expanded);
+		} else if (key(data, "t") || data === "t") getView().toggleThinking();
+		else return { consume: true };
+		onChange();
+		return { consume: true };
+	};
+}
+
 export async function main(argv = process.argv.slice(2)) {
 	const options = parseArgs(argv);
 	if (options.help || !options.target) {
@@ -199,17 +216,15 @@ export async function main(argv = process.argv.slice(2)) {
 		ui.stop();
 		process.exit(0);
 	};
-	// pi-tui may enable the kitty keyboard protocol, so compare parsed keys.
-	const key = (data, name) => runtime.tui.matchesKey?.(data, name) ?? false;
-	ui.addInputListener((data) => {
-		if (key(data, "q") || key(data, "ctrl+c") || data === "q" || data === "\x03") quit();
-		else if (key(data, "ctrl+o") || data === "\x0f") view.setToolsExpanded(!view.expanded);
-		else if (key(data, "t") || data === "t") view.toggleThinking();
-		else return { consume: true };
-		statusLine();
-		ui.requestRender();
-		return { consume: true };
-	});
+	ui.addInputListener(createViewerInputListener({
+		tui: runtime.tui,
+		getView: () => view,
+		quit,
+		onChange() {
+			statusLine();
+			ui.requestRender();
+		},
+	}));
 
 	poll();
 	ui.start();
