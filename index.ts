@@ -196,9 +196,11 @@ export function subagentGuidance(
 		"your controller reads it from the event stream.",
 	].join(" ");
 }
+/** Remote status cadence per host (each query is an SSH round trip). */
 const POLL_MS = 2500;
-const QUICK_COMMAND_GRACE = process.env.PI_BABYSIT_QUICK_GRACE ?? "2s";
-const KILL_CONFIRM_TIMEOUT = "4s";
+/** Background poller tick; local status is a few small file reads. */
+const LOCAL_POLL_MS = 250;
+const KILL_CONFIRM_TIMEOUT_MS = 4_000;
 
 interface BsSession {
 	id: string;
@@ -210,6 +212,8 @@ interface BsSession {
 	screen_seq?: number | null;
 	host?: string;
 	transportError?: string;
+	/** Local only: whether the babysit supervisor process still exists. */
+	supervisorAlive?: boolean;
 }
 
 // A worker whose PTY process is gone (alive:false) can still report state
@@ -217,11 +221,16 @@ interface BsSession {
 // died in the first few ms). Treat that as finished so it never shows or counts
 // as running. This normalizes at the source so every downstream
 // `state === "running"` check is correct.
-function normalizeSession(s: BsSession): BsSession {
-	if (s.alive === false && s.state === "running") {
+//
+// babysit also reports a brief "starting" state before the PTY child exists.
+// It is live work, so report it as running (or dead when its owner is gone)
+// instead of letting `state !== "running"` checks mistake it for an exit.
+export function normalizeSession(s: BsSession): BsSession {
+	if (s.state !== "running" && s.state !== "starting") return s;
+	if (s.alive === false) {
 		return { ...s, state: s.exit_code != null ? "exited" : "dead" };
 	}
-	return s;
+	return s.state === "starting" ? { ...s, state: "running" } : s;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,10 +389,128 @@ async function requireBabysit(): Promise<void> {
 	if (!(await babysitAvailable())) throw new Error(babysitPreflightError ?? INSTALL_HINT);
 }
 
+// ---------------------------------------------------------------------------
+// local registry: read babysit's on-disk session state directly
+// ---------------------------------------------------------------------------
+
+// Every `babysit` exec costs a process spawn, which is slow on hosts with
+// endpoint security (hundreds of ms each). Local status is therefore read from
+// babysit's documented layout `<root>/sessions/<id>/{meta.json,status.json,note}`
+// with the same rules as `babysit list --json`: unreadable meta skips the
+// session, a missing status means "starting", and an owner is alive while the
+// state is non-terminal and its supervisor pid exists. Remote hosts still go
+// through the CLI.
+
+/** `babysit run -d` returns before its detached worker creates the session dir. */
+export const LOCAL_STARTUP_GRACE_MS = 15_000;
+const pendingLocalStarts = new Map<string, number>();
+
+export function pidAlive(pid: unknown): boolean {
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+type LocalSessionRecord = BsSession & { lastChange: number };
+
+/** Read one babysit session directory; null when it is not (yet) a session. */
+export function readLocalSessionDir(dir: string, id: string): LocalSessionRecord | null {
+	let meta: { babysit_pid?: unknown };
+	try {
+		meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
+	} catch {
+		return null;
+	}
+	if (!meta || typeof meta.babysit_pid !== "number") return null;
+	let status: { state?: unknown; exit_code?: unknown; last_change?: unknown } = {};
+	try {
+		status = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")) ?? {};
+	} catch {
+		// babysit treats a missing or torn status as "starting".
+	}
+	const state = typeof status.state === "string" ? status.state : "starting";
+	const supervisorAlive = pidAlive(meta.babysit_pid);
+	let note: string | null = null;
+	try {
+		note = fs.readFileSync(path.join(dir, "note"), "utf8").trim();
+	} catch {
+		// not flagged
+	}
+	const lastChange = typeof status.last_change === "string" ? Date.parse(status.last_change) : Number.NaN;
+	return {
+		...normalizeSession({
+			id,
+			state,
+			alive: (state === "starting" || state === "running") && supervisorAlive,
+			exit_code: typeof status.exit_code === "number" ? status.exit_code : null,
+			note,
+			supervisorAlive,
+		}),
+		lastChange: Number.isFinite(lastChange) ? lastChange : Date.now(),
+	};
+}
+
+/**
+ * List the local registry. `skip` names terminal sessions whose state cannot
+ * change any more (the poller's settled set), so they are not re-read.
+ */
+export function readLocalRegistry(
+	root: string,
+	options: { ids?: readonly string[]; skip?: ReadonlySet<string> } = {},
+	pending: Map<string, number> = new Map(),
+	now = Date.now(),
+): { sessions: BsSession[]; error?: string } {
+	const dir = path.join(root, "sessions");
+	let names: string[];
+	if (options.ids) {
+		names = [...options.ids];
+	} else {
+		try {
+			names = fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				return { sessions: [], error: `cannot read babysit registry ${dir}: ${error instanceof Error ? error.message : String(error)}` };
+			}
+			names = [];
+		}
+	}
+	const sessions: LocalSessionRecord[] = [];
+	const found = new Set<string>();
+	for (const id of names) {
+		// Caller-supplied ids must never escape the sessions directory.
+		if (!id || id === "." || id === ".." || /[\\/]/.test(id)) continue;
+		if (options.skip?.has(id)) continue;
+		const session = readLocalSessionDir(path.join(dir, id), id);
+		if (!session) continue;
+		sessions.push(session);
+		found.add(id);
+	}
+	for (const [id, launchedAt] of pending) {
+		if (found.has(id) || now - launchedAt > LOCAL_STARTUP_GRACE_MS) {
+			// Registered (or never will be): from now on the registry is authoritative.
+			pending.delete(id);
+			continue;
+		}
+		if (options.ids && !options.ids.includes(id)) continue;
+		if (options.skip?.has(id)) continue;
+		sessions.push({ id, state: "running", alive: true, exit_code: null, note: null, lastChange: now });
+	}
+	sessions.sort((a, b) => b.lastChange - a.lastChange);
+	return { sessions: sessions.map(({ lastChange: _lastChange, ...session }) => session) };
+}
+
 // Error-aware: `babysit list` failing is NOT the same as "no sessions" —
 // callers that show state to the agent must surface the error instead of
 // silently reporting an empty registry (which reads like lost sessions).
-async function localSessions(host?: string): Promise<{ sessions: BsSession[]; error?: string }> {
+async function localSessions(
+	host?: string,
+	options: { ids?: readonly string[]; skip?: ReadonlySet<string> } = {},
+): Promise<{ sessions: BsSession[]; error?: string }> {
+	if (!host) return readLocalRegistry(ROOT, options, pendingLocalStarts);
 	const r = await bs(["list", "--json"], { host });
 	if (r.code !== 0) {
 		return {
@@ -421,18 +548,27 @@ const unknownRemoteSession = (id: string, host: string, error: string): BsSessio
 	note: `status unknown on ${host}: ${error}`,
 });
 
+// The poller ticks quickly because local status is a few file reads, but
+// remote status costs an SSH round trip. Each host is therefore queried at
+// most once per POLL_MS; ticks in between reuse that host's last poll result.
+const remotePollCache = new Map<string, { at: number; sessions: Map<string, BsSession> }>();
+
 /**
  * List local sessions plus tracked remote sessions. With `poll: true` (the
  * background poller), settled sessions are skipped, hosts with only settled
- * sessions are not contacted, and failing hosts are retried with backoff.
+ * sessions are not contacted, hosts are queried at most once per POLL_MS, and
+ * failing hosts are retried with backoff.
  * `ids` limits which tracked remote sessions (and therefore hosts) are queried;
- * `local: false` skips the local registry.
+ * `localIds` limits which local sessions are read; `local: false` skips the
+ * local registry.
  */
 async function listSessions(
-	options: { poll?: boolean; ids?: readonly string[]; local?: boolean } = {},
+	options: { poll?: boolean; ids?: readonly string[]; localIds?: readonly string[]; local?: boolean } = {},
 ): Promise<{ sessions: BsSession[]; error?: string }> {
 	const local: { sessions: BsSession[]; error?: string } =
-		options.local === false ? { sessions: [] } : await localSessions();
+		options.local === false
+			? { sessions: [] }
+			: await localSessions(undefined, { ids: options.localIds, skip: options.poll ? settledSessionIds : undefined });
 	const known = remoteMetadata().filter(
 		({ id }) => (!options.poll || !settledSessionIds.has(id)) && (!options.ids || options.ids.includes(id)),
 	);
@@ -446,22 +582,31 @@ async function listSessions(
 			}
 			return;
 		}
+		const cached = options.poll ? remotePollCache.get(host) : undefined;
+		if (cached && Date.now() - cached.at < POLL_MS && tracked.every(({ id }) => cached.sessions.has(id))) {
+			for (const { id } of tracked) local.sessions.push(cached.sessions.get(id)!);
+			return;
+		}
+		const queriedAt = Date.now();
 		const remote = await localSessions(host);
+		const observed = new Map<string, BsSession>();
 		let foundCount = 0;
 		for (const { id, meta } of tracked) {
 			const found = remote.sessions.find((session) => session.id === meta.remoteId);
 			if (found && !remote.error) {
 				foundCount++;
-				local.sessions.push({ ...found, id, host });
+				observed.set(id, { ...found, id, host });
 				const terminalState = isConfirmedTerminalState(found.state) ? found.state : undefined;
 				if (meta.remoteTerminalState !== terminalState) {
 					writeMeta(id, { ...readMeta(id)!, remoteTerminalState: terminalState });
 				}
 			} else {
 				// Keep unresolved references active for polling/group delivery, never fabricate exit.
-				local.sessions.push(unknownRemoteSession(id, host, remote.error ?? "tracked remote session not found"));
+				observed.set(id, unknownRemoteSession(id, host, remote.error ?? "tracked remote session not found"));
 			}
 		}
+		local.sessions.push(...observed.values());
+		if (options.poll) remotePollCache.set(host, { at: queriedAt, sessions: observed });
 		if (foundCount > 0) {
 			remoteHostBackoff.delete(host);
 		} else if (options.poll) {
@@ -507,7 +652,7 @@ async function lookupStatus(
 		// Only contact the registry that owns this session: a local lookup must not
 		// SSH to every remote host, and a remote one needs no local list.
 		const remote = Boolean(readMeta(id)?.host);
-		const listed = await listSessions({ ids: [id], local: !remote });
+		const listed = await listSessions({ ids: [id], localIds: [id], local: !remote });
 		const session = listed.sessions.find((session) => session.id === id) ?? null;
 		if (session?.transportError) return { session: null, error: `${session.host}: ${session.transportError}` };
 		if (listed.error && !readMeta(id)?.host) return { session: null, error: listed.error };
@@ -557,7 +702,7 @@ async function awaitConfirmedTermination(id: string): Promise<BsSession | null> 
 	// New babysit versions return only after persistence, so this is normally
 	// skipped. It is a bounded compatibility guard for older binaries that
 	// acknowledged signal delivery before the process actually exited.
-	await bs(["wait", "-s", id, "--timeout", KILL_CONFIRM_TIMEOUT]);
+	await waitForStop(id, KILL_CONFIRM_TIMEOUT_MS);
 	return statusOf(id);
 }
 
@@ -633,7 +778,6 @@ interface Meta {
 	// A timeout must not re-enable the poller while another wait still owns it.
 	waitReservations?: number;
 	waitCompletionClaimed?: boolean;
-	completionObservedAt?: number;
 	startedAt?: number;
 	// subagent
 	task?: string;
@@ -661,9 +805,6 @@ interface Meta {
 	subagentCollectedOffset?: number;
 	/** Prompt offset whose ready-to-collect reminder was sent to the parent. */
 	subagentNotifiedOffset?: number;
-	/** Current task completion first observed by the reminder poller. */
-	subagentCompletionObservedOffset?: number;
-	subagentCompletionObservedAt?: number;
 }
 
 const metaDir = () => path.join(ROOT, "meta");
@@ -1138,6 +1279,8 @@ function parseDurMs(s?: string): number | null {
 	return n * (u === "ms" ? 1 : u === "s" ? 1000 : u === "m" ? 60_000 : 3_600_000);
 }
 
+const QUICK_COMMAND_GRACE_MS = parseDurMs(process.env.PI_BABYSIT_QUICK_GRACE ?? "2s") ?? 2_000;
+
 // ---------------------------------------------------------------------------
 // Context-size guard — every string that flows back into the agent's context
 // passes through clip(). Log tails are line-capped upstream (`--tail N`), but
@@ -1281,6 +1424,122 @@ async function searchLog(
 	});
 }
 
+/**
+ * Text view of a raw PTY log, matching `babysit log` (strip-ansi-escapes on a
+ * VT parser): printable characters (including DEL) and line feeds survive;
+ * other C0/C1 controls, escape/CSI sequences, and OSC/DCS/SOS/PM/APC strings are removed.
+ * Invalid UTF-8 becomes U+FFFD.
+ */
+export function stripTerminalOutput(bytes: Uint8Array): string {
+	const text = new TextDecoder("utf-8").decode(bytes);
+	let out = "";
+	let state: "ground" | "escape" | "intermediate" | "csi" | "osc" | "string" = "ground";
+	for (const ch of text) {
+		const c = ch.codePointAt(0)!;
+		if (c === 0x18 || c === 0x1a) {
+			state = "ground";
+			continue;
+		}
+		if (c === 0x1b) {
+			state = "escape";
+			continue;
+		}
+		switch (state) {
+			case "ground":
+				// DEL is printed by the VT parser; C1 controls are executed (dropped).
+				if (c === 0x0a || (c >= 0x20 && !(c >= 0x80 && c <= 0x9f))) out += ch;
+				break;
+			case "escape":
+			case "intermediate":
+				if (c < 0x20) {
+					if (c === 0x0a) out += ch;
+				} else if (c <= 0x2f) {
+					state = "intermediate";
+				} else if (c === 0x7f) {
+					// ignored
+				} else if (state === "escape" && c === 0x5b) {
+					state = "csi";
+				} else if (state === "escape" && c === 0x5d) {
+					state = "osc";
+				} else if (state === "escape" && (c === 0x50 || c === 0x58 || c === 0x5e || c === 0x5f)) {
+					state = "string";
+				} else {
+					state = "ground";
+				}
+				break;
+			case "csi":
+				if (c < 0x20) {
+					if (c === 0x0a) out += ch;
+				} else if (c >= 0x40 && c <= 0x7e) {
+					state = "ground";
+				}
+				break;
+			case "osc":
+				if (c === 0x07) state = "ground";
+				break;
+			case "string":
+				break;
+		}
+	}
+	return out;
+}
+
+/** Last `n` lines, matching babysit's `--tail` (a trailing newline is kept). */
+export function lastLines(text: string, n: number): string {
+	if (n <= 0) return "";
+	const trimmed = text.endsWith("\n") ? text.slice(0, -1) : text;
+	let start = trimmed.length;
+	for (let seen = 0; seen < n; seen++) {
+		const index = trimmed.lastIndexOf("\n", start - 1);
+		if (index < 0) return text;
+		start = index;
+	}
+	return text.slice(start + 1);
+}
+
+/** Tail reads never parse more than this many trailing bytes of a local log. */
+const LOCAL_TAIL_WINDOW_BYTES = 1_048_576;
+
+/**
+ * `babysit log [-s id] [--tail n]` without a CLI spawn for local sessions.
+ * Remote sessions still go through `babysit --host`.
+ */
+async function readSessionLog(
+	id: string,
+	tail?: number,
+	signal?: AbortSignal,
+): Promise<{ stdout: string; stderr: string; code: number }> {
+	if (readMeta(id)?.host) {
+		return bs(["log", "-s", id, ...(tail != null ? ["--tail", String(tail)] : [])], { signal });
+	}
+	const file = localLogPath(id);
+	let bytes: Buffer;
+	try {
+		if (tail == null) {
+			bytes = fs.readFileSync(file);
+		} else {
+			const size = fs.statSync(file).size;
+			const length = Math.min(size, LOCAL_TAIL_WINDOW_BYTES);
+			bytes = readLogBytesFrom(file, size - length);
+			if (length < size) {
+				// The window may start mid-line or mid-sequence: drop that first line.
+				const newline = bytes.indexOf(0x0a);
+				bytes = newline >= 0 ? bytes.subarray(newline + 1) : Buffer.alloc(0);
+			}
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			return { stdout: "", stderr: `cannot read ${file}: ${String(error)}`, code: 1 };
+		}
+		if (!fs.existsSync(path.dirname(file)) && !localStatusOf(id)) {
+			return { stdout: "", stderr: `babysit: no such session: ${id}`, code: 1 };
+		}
+		bytes = Buffer.alloc(0);
+	}
+	const text = stripTerminalOutput(bytes);
+	return { stdout: tail == null ? text : lastLines(text, tail), stderr: "", code: 0 };
+}
+
 export function shouldInlineCompleteOutput(outputBytes: number, maxBytes: number): boolean {
 	return maxBytes > 0 && outputBytes <= maxBytes;
 }
@@ -1308,7 +1567,7 @@ async function inlineOutput(
 		const size = Number.isFinite(bytes) ? `${bytes} bytes` : "size unavailable";
 		return `\nOutput omitted (${size}; inline limit ${maxBytes}).`;
 	}
-	const result = await bs(["log", "-s", id]);
+	const result = await readSessionLog(id);
 	if (result.code !== 0) return `\nOutput unavailable: ${clip(result.stderr || result.stdout, maxBytes)}`;
 	const output = result.stdout.trimEnd();
 	if (Buffer.byteLength(output) > maxBytes) {
@@ -1340,7 +1599,7 @@ async function selectedProcessOutput(
 		const body = result.text || `(no output matching /${selection.pattern}/)`;
 		return `\n\nSelected output /${selection.pattern}/:\n${clip(body, maxBytes)}`;
 	}
-	const result = await bs(["log", "-s", id, "--tail", String(lines)], { signal });
+	const result = await readSessionLog(id, lines, signal);
 	if (result.code !== 0) return `\nOutput unavailable: ${clip(result.stderr || result.stdout, maxBytes)}`;
 	const tail = result.stdout.trimEnd();
 	return tail ? `\n\nSelected tail (${lines} lines max):\n${clip(tail, maxBytes)}` : "";
@@ -2228,6 +2487,7 @@ async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: s
 	} catch {
 		return { error: `could not parse id from: ${r.stdout}` };
 	}
+	pendingLocalStarts.set(id, Date.now());
 	writeMeta(id, {
 		kind: "process",
 		name: opts.name ?? id,
@@ -2406,6 +2666,7 @@ async function spawnSubagent(
 		cleanupPromptTemp();
 		return { error: `could not parse id from: ${r.stdout}` };
 	}
+	pendingLocalStarts.set(id, Date.now());
 
 	// Stamp the kind IMMEDIATELY (with notified:true) so that if validation
 	// below fails and we kill the session, the exit poller does NOT mistake it
@@ -2635,6 +2896,8 @@ export function createWidgetComponent(
 	};
 	return {
 		update(summary: string[], rows: WidgetSessionDisplay[]) {
+			// The poller ticks several times per second; only repaint on change.
+			if (JSON.stringify([summary, rows]) === JSON.stringify([summaryLines, sessions])) return;
 			summaryLines = summary;
 			sessions = rows;
 			copyTargets.clear();
@@ -2863,8 +3126,8 @@ function sumNestedUsage(values: Array<NestedUsage | undefined>): NestedUsage | u
 
 // Wait for ONE subagent's current task. Completion = agent_settled without a
 // parked babysit_run/process result (a parked run only means "waiting for
-// process exit; pi will resume itself"). Parse appended bytes incrementally,
-// then block on the next agent_settled via race-free byte offsets.
+// process exit; pi will resume itself"). Parse appended bytes incrementally
+// and re-check every SUBAGENT_WAIT_POLL_MS.
 async function waitForTask(
 	id: string,
 	limitMs: number | null,
@@ -2879,7 +3142,7 @@ async function waitForTask(
 		} catch {
 			observed = { progress: emptyProgress(), offset: readMeta(id)?.promptOffset ?? 0 };
 		}
-		const { progress: prog, offset: cur } = observed;
+		const { progress: prog } = observed;
 		const st = await statusOf(id);
 
 		const stats =
@@ -2932,19 +3195,18 @@ async function waitForTask(
 			progress: prog,
 		});
 
-		// Still working — block until Pi declares the run fully settled. Unlike
-		// agent_end, this cannot fire before an automatic retry/compaction retry.
-		let expectTimeout = "0"; // indefinite
+		// Still working — re-check until Pi declares the run fully settled
+		// (`progress.done` comes from agent_settled, which unlike agent_end cannot
+		// fire before an automatic retry/compaction retry) or the worker stops.
+		// Both checks are incremental file reads, so poll in-process instead of
+		// paying a `babysit expect` spawn per wait.
+		let delay = SUBAGENT_WAIT_POLL_MS;
 		if (limitMs != null) {
 			const remaining = limitMs - (Date.now() - t0);
 			if (remaining <= 0) return timeoutOutcome();
-			expectTimeout = `${Math.ceil(remaining / 1000)}s`;
+			delay = Math.min(delay, remaining);
 		}
-		const e = await bs(
-			["expect", "-s", id, "--since", String(cur), "--timeout", expectTimeout, '"type":"agent_settled"'],
-			{ signal },
-		);
-		if (signal?.aborted || e.code === 130) {
+		if (await sleepUnlessAborted(delay, signal)) {
 			return {
 				id,
 				kind: "interrupted",
@@ -2953,12 +3215,6 @@ async function waitForTask(
 				status: st,
 				progress: prog,
 			};
-		}
-		if (e.code === 124) return timeoutOutcome();
-		// e.code !== 0 (session likely exited mid-wait) falls through to the
-		// next loop iteration, where the exited branch reports the cause.
-		if (e.code !== 0) {
-			await new Promise((res) => setTimeout(res, 500));
 		}
 	}
 }
@@ -3045,6 +3301,88 @@ function resumeNotify(id: string): void {
 	}
 }
 
+/** Resolve after `ms`, or early (true) when the signal aborts. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return Promise.resolve(true);
+	return new Promise((resolve) => {
+		const onAbort = () => {
+			clearTimeout(timer);
+			resolve(true);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve(false);
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+const LOCAL_WAIT_POLL_MS = 50;
+const SUBAGENT_WAIT_POLL_MS = 100;
+const LOCAL_OUTPUT_SETTLE_MAX_MS = 1_000;
+
+/** Current local status (including pending launches); null when unknown. */
+function localStatusOf(id: string): BsSession | null {
+	return readLocalRegistry(ROOT, { ids: [id] }, pendingLocalStarts).sessions[0] ?? null;
+}
+
+/**
+ * Block until a session is no longer running. Local sessions are watched
+ * in-process through their status file; remote ones use `babysit wait`.
+ * "timeout" from a remote wait is ambiguous (the child may exit 124), so
+ * callers confirm it with a status lookup.
+ */
+async function waitForStop(
+	id: string,
+	limitMs: number | null,
+	signal?: AbortSignal,
+): Promise<"stopped" | "timeout" | "interrupted"> {
+	if (!readMeta(id)?.host) {
+		const deadline = limitMs == null ? Number.POSITIVE_INFINITY : Date.now() + limitMs;
+		for (;;) {
+			if (signal?.aborted) return "interrupted";
+			const status = localStatusOf(id);
+			if (!status || status.state !== "running") return "stopped";
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) return "timeout";
+			if (await sleepUnlessAborted(Math.min(LOCAL_WAIT_POLL_MS, remaining), signal)) return "interrupted";
+		}
+	}
+
+	const t = limitMs != null ? `${Math.ceil(limitMs / 1000)}s` : "0";
+	let w: Awaited<ReturnType<typeof bs>>;
+	let attempt = 0;
+	for (;;) {
+		w = await bs(["wait", "-s", id, "--timeout", t], { signal });
+		if (signal?.aborted) return "interrupted";
+		if (w.code === 0 || w.code === 124 || w.code === 130) break;
+
+		// A freshly spawned session can be visible in `list` before the backend's
+		// wait endpoint is ready. Retry that transient startup race instead of
+		// reporting the still-running child as "exited with code ?".
+		const retryStatus = await statusOf(id);
+		if (retryStatus?.state !== "running" || attempt++ >= 3) break;
+		await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+	}
+	if (w.code === 130 && (await statusOf(id))?.state === "running") return "interrupted";
+	return w.code === 124 ? "timeout" : "stopped";
+}
+
+/**
+ * babysit records a local exit before draining the PTY's final bytes into
+ * output.log, then the supervisor exits. Wait (bounded) for that supervisor so
+ * output read right after an exit is complete.
+ */
+async function awaitLocalOutputSettled(id: string, signal?: AbortSignal): Promise<void> {
+	if (readMeta(id)?.host) return;
+	const deadline = Date.now() + LOCAL_OUTPUT_SETTLE_MAX_MS;
+	while (Date.now() < deadline) {
+		const status = localStatusOf(id);
+		if (!status?.supervisorAlive) return;
+		if (await sleepUnlessAborted(20, signal)) return;
+	}
+}
+
 // Wait for a PROCESS session: either until a regex appears in its output
 // (`expect` — e.g. "server listening") or until the process exits.
 async function waitForExit(
@@ -3091,33 +3429,13 @@ async function waitForExit(
 		// one concurrent wait timing out cannot re-enable notifications underneath
 		// another wait that is still pending.
 		updateWaitReservation(id, "reserve");
-		let w: Awaited<ReturnType<typeof bs>>;
-		let attempt = 0;
-		for (;;) {
-			w = await bs(["wait", "-s", id, "--timeout", t], { signal });
-			if (signal?.aborted) {
-				updateWaitReservation(id, "abandon");
-				return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
-			}
-			if (w.code === 0 || w.code === 124 || w.code === 130) break;
-
-			// A freshly spawned session can be visible in `list` before the backend's
-			// wait endpoint is ready, especially when sibling foreground tools start
-			// concurrently. Retry that transient startup race instead of reporting the
-			// still-running child as "exited with code ?".
-			const retryStatus = await statusOf(id);
-			if (retryStatus?.state !== "running" || attempt++ >= 3) break;
-			await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+		const waited = await waitForStop(id, limitMs, signal);
+		if (waited === "interrupted") {
+			updateWaitReservation(id, "abandon");
+			return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
 		}
-		if (w.code === 130) {
-			const interruptedStatus = await statusOf(id);
-			if (interruptedStatus?.state === "running") {
-				updateWaitReservation(id, "abandon");
-				return { id, kind: "interrupted", ok: false, text: `wait for ${id} was interrupted.` };
-			}
-		}
-		if (w.code === 124) {
-			// 124 is ambiguous (timeout vs child exiting 124) — disambiguate.
+		if (waited === "timeout") {
+			// A remote 124 is ambiguous (timeout vs child exiting 124) — disambiguate.
 			const st0 = await statusOf(id);
 			if (st0?.state === "running") {
 				updateWaitReservation(id, "abandon");
@@ -3166,6 +3484,7 @@ async function waitForExit(
 	const meta = readMeta(id);
 	const workerDead = st.state === "dead" && st.exit_code == null;
 	const ok = st.exit_code === 0;
+	await awaitLocalOutputSettled(id, signal);
 	const output = await selectedProcessOutput(id, st, outputSelection, signal);
 	return {
 		id,
@@ -3294,7 +3613,7 @@ export default function (pi: ExtensionAPI) {
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
 	let pollNeeded = true;
 	// Earliest time the poller should run again when every pending session is a
-	// remote one whose host is in backoff (0 = poll every POLL_MS).
+	// remote one whose host is in backoff (0 = poll every tick).
 	let pollDeferredUntilMs = 0;
 	// Bumped by every re-arm so a tick that started before a new session was
 	// created cannot switch polling off based on its stale snapshot.
@@ -3465,15 +3784,9 @@ export default function (pi: ExtensionAPI) {
 			// A notification group is delivered only after all currently known
 			// members have stopped, even when their exit times span many polls.
 			if (!isNotificationGroupReady(meta, sessions, readMeta)) continue;
-			// Delay delivery by one poll interval. This gives an agent that chose
-			// babysit_wait immediately after babysit_run enough time to claim the
-			// completion and suppress the otherwise duplicate automatic message.
-			if (!meta.completionObservedAt) {
-				meta.completionObservedAt = Date.now();
-				writeMeta(session.id, meta);
-				continue;
-			}
-			if (Date.now() - meta.completionObservedAt < POLL_MS) continue;
+			// No extra debounce: an agent that calls babysit_wait right after
+			// babysit_run does so inside an active run, where delivery is already
+			// deferred above, and the wait's reservation suppresses this message.
 			ready.push({ session, meta });
 		}
 
@@ -3485,10 +3798,9 @@ export default function (pi: ExtensionAPI) {
 				: session.state === "dead" || session.exit_code == null
 					? "terminated"
 					: "failed";
+			await awaitLocalOutputSettled(session.id);
 			const output = await inlineOutput(session.id, session, NOTIFY_OUTPUT_MAX_BYTES);
-			const runtime = meta.startedAt
-				? `${Math.round(((meta.completionObservedAt ?? Date.now()) - meta.startedAt) / 1000)}s`
-				: "?";
+			const runtime = meta.startedAt ? `${Math.round((Date.now() - meta.startedAt) / 1000)}s` : "?";
 			const summary = ok
 				? `Process "${session.id}" completed successfully after ${runtime}.`
 				: session.state === "dead" || session.exit_code == null
@@ -3561,13 +3873,6 @@ export default function (pi: ExtensionAPI) {
 			if (session.state === "running" && !progress.done) continue;
 
 			const offset = meta.promptOffset ?? 0;
-			if (meta.subagentCompletionObservedOffset !== offset) {
-				meta.subagentCompletionObservedOffset = offset;
-				meta.subagentCompletionObservedAt = Date.now();
-				writeMeta(session.id, meta);
-				continue;
-			}
-			if (Date.now() - (meta.subagentCompletionObservedAt ?? 0) < POLL_MS) continue;
 			const summary = progress.done
 				? `task settled; ${progress.turns} turns, ${progress.toolCallCount} tools, $${progress.cost.toFixed(4)}`
 				: `worker ${session.state} with exit code ${session.exit_code ?? "?"}; partial usage $${progress.cost.toFixed(4)}`;
@@ -3765,6 +4070,8 @@ export default function (pi: ExtensionAPI) {
 		searchLogCache.clear();
 		settledSessionIds.clear();
 		remoteHostBackoff.clear();
+		remotePollCache.clear();
+		pendingLocalStarts.clear();
 		armPolling();
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
@@ -3800,59 +4107,78 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI && !(await babysitAvailable())) {
 			ctx.ui.notify(babysitPreflightError ?? INSTALL_HINT, "warning");
 		}
+		pollCtx = ctx;
 		if (pollTimer) clearInterval(pollTimer);
-		pollTimer = setInterval(() => {
-			// Once a namespace has no live workers or pending notifications, avoid
-			// spawning `babysit list` forever while the UI is idle. A successful
-			// babysit_run re-arms polling below.
-			if (polling || !pollNeeded || Date.now() < pollDeferredUntilMs) return;
-			polling = true;
-			const generation = pollGeneration;
-			void (async () => {
-				const listed = await listSessions({ poll: true });
-				if (listed.error) {
-					if (generation === pollGeneration) pollNeeded = shouldKeepPollingAfterList(listed, readMeta);
-					throw new Error(listed.error);
-				}
-				// Finished sessions with nothing left to deliver never need another look.
-				const snapshot = listed.sessions.filter(
-					(session) =>
-						session.state === "running" || session.transportError || !settledSessionIds.has(session.id),
-				);
-				await enforceSubagentBudgets(snapshot);
-				await Promise.all([
-					notifyEndedProcesses(ctx, snapshot),
-					notifySettledSubagents(ctx, snapshot),
-					refreshWidget(ctx, snapshot),
-				]);
-				const pendingTerminal = new Set<string>();
-				for (const session of snapshot) {
-					if (session.state === "running" || session.transportError) continue;
-					if (isSettledSession(readMeta(session.id))) settledSessionIds.add(session.id);
-					else pendingTerminal.add(session.id);
-				}
-				// Keep parsed progress for finished subagents whose result is still
-				// pending; otherwise each tick would re-parse their whole log.
-				pruneTerminalSessionCache(taskProgressCache, snapshot, pendingTerminal);
-				if (generation !== pollGeneration) return;
-				pollNeeded = shouldKeepPolling(snapshot, readMeta);
-				pollDeferredUntilMs = pollNeeded ? pollDeferredUntil(snapshot, readMeta, remoteBackoffUntil) : 0;
-			})()
-				.catch(() => {
-					// Keep polling armed after a transient CLI/filesystem error.
-					armPolling();
-				})
-				.finally(() => {
-					polling = false;
-				});
-		}, POLL_MS);
+		pollTimer = setInterval(() => runPollTick(), LOCAL_POLL_MS);
 	});
+
+	// Deliver anything that became ready while the agent was busy as soon as it
+	// goes idle, instead of waiting for the next tick.
+	pi.on("agent_settled", () => {
+		runPollTick();
+	});
+
+	let pollCtx: ExtensionContext | undefined;
+	let pollAgain = false;
+	function runPollTick(): void {
+		const ctx = pollCtx;
+		if (!ctx) return;
+		if (polling) {
+			pollAgain = true;
+			return;
+		}
+		// Once a namespace has no live workers or pending notifications, stop
+		// scanning while the UI is idle. A successful babysit_run re-arms polling.
+		if (!pollNeeded || Date.now() < pollDeferredUntilMs) return;
+		polling = true;
+		pollAgain = false;
+		const generation = pollGeneration;
+		void (async () => {
+			const listed = await listSessions({ poll: true });
+			if (listed.error) {
+				if (generation === pollGeneration) pollNeeded = shouldKeepPollingAfterList(listed, readMeta);
+				throw new Error(listed.error);
+			}
+			// Finished sessions with nothing left to deliver never need another look.
+			const snapshot = listed.sessions.filter(
+				(session) =>
+					session.state === "running" || session.transportError || !settledSessionIds.has(session.id),
+			);
+			await enforceSubagentBudgets(snapshot);
+			await Promise.all([
+				notifyEndedProcesses(ctx, snapshot),
+				notifySettledSubagents(ctx, snapshot),
+				refreshWidget(ctx, snapshot),
+			]);
+			const pendingTerminal = new Set<string>();
+			for (const session of snapshot) {
+				if (session.state === "running" || session.transportError) continue;
+				if (isSettledSession(readMeta(session.id))) settledSessionIds.add(session.id);
+				else pendingTerminal.add(session.id);
+			}
+			// Keep parsed progress for finished subagents whose result is still
+			// pending; otherwise each tick would re-parse their whole log.
+			pruneTerminalSessionCache(taskProgressCache, snapshot, pendingTerminal);
+			if (generation !== pollGeneration) return;
+			pollNeeded = shouldKeepPolling(snapshot, readMeta);
+			pollDeferredUntilMs = pollNeeded ? pollDeferredUntil(snapshot, readMeta, remoteBackoffUntil) : 0;
+		})()
+			.catch(() => {
+				// Keep polling armed after a transient CLI/filesystem error.
+				armPolling();
+			})
+			.finally(() => {
+				polling = false;
+				if (pollAgain && pollCtx === ctx) runPollTick();
+			});
+	}
 
 	pi.on("session_shutdown", async (event) => {
 		sessionWidget?.dispose();
 		sessionWidget = undefined;
 		if (pollTimer) clearInterval(pollTimer);
 		pollTimer = undefined;
+		pollCtx = undefined;
 		// Pi also emits session_shutdown while hot-reloading and switching sessions.
 		// Preserve detached work for those lifecycle transitions; only a real Pi
 		// quit owns and terminates every worker in the current session namespace.
@@ -4229,7 +4555,7 @@ export default function (pi: ExtensionAPI) {
 				// period; if it exits, return lifecycle metadata + log path immediately.
 				// A process still running after the grace follows the parked-turn /
 				// automatic-notification contract below.
-				await bs(["wait", "-s", res.id, "--timeout", QUICK_COMMAND_GRACE], { signal: _signal });
+				await waitForStop(res.id, QUICK_COMMAND_GRACE_MS, _signal);
 				let quickStatus = await statusOf(res.id);
 				let retried = false;
 				if (params.retryOnWorkerDeath && quickStatus?.state === "dead" && quickStatus.exit_code == null) {
@@ -4240,7 +4566,7 @@ export default function (pi: ExtensionAPI) {
 					if (!("error" in retry)) {
 						res = retry;
 						retried = true;
-						await bs(["wait", "-s", res.id, "--timeout", QUICK_COMMAND_GRACE], { signal: _signal });
+						await waitForStop(res.id, QUICK_COMMAND_GRACE_MS, _signal);
 						quickStatus = await statusOf(res.id);
 					}
 				}
@@ -4634,7 +4960,7 @@ export default function (pi: ExtensionAPI) {
 					if (sc.code !== 0) throw new Error(sc.stderr || sc.stdout || "Screenshot unavailable");
 					parts.push(`--- screen ---\n${clip(sc.stdout.trimEnd(), checkMaxBytes) || "(blank screen)"}`);
 				} else {
-					const result = await bs(["log", "-s", params.id, "--tail", String(nLines)]);
+					const result = await readSessionLog(params.id, nLines);
 					if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Log unavailable");
 					const tail = clip(
 						result.stdout.trimEnd(),
@@ -5295,7 +5621,7 @@ export default function (pi: ExtensionAPI) {
 				// the recorded tail is enough.
 				const screenResult = running ? await bs(["screenshot", "-s", picked.id, "--trim"]) : undefined;
 				const screen = screenResult ? screenResult.code === 0 ? screenResult.stdout.trimEnd() : `Screen unavailable: ${screenResult.stderr || screenResult.stdout}` : "";
-				const tailResult = await bs(["log", "-s", picked.id, "--tail", "30"]);
+				const tailResult = await readSessionLog(picked.id, 30);
 				const tail = tailResult.code === 0 ? tailResult.stdout.trimEnd() : `Output unavailable: ${tailResult.stderr || tailResult.stdout}`;
 				const title =
 					`${picked.id}${meta?.host ? ` @${meta.host}` : ""} ${picked.transportError ? "unknown" : picked.state}${elapsedSuffix}` +

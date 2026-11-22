@@ -18,7 +18,13 @@ test("widget icons copy log commands or subagent log paths without executing log
 		[agentId, { kind: "subagent", task: "Legacy agent task" }],
 		[remoteId, { kind: "process", description: "Remote build", host: "user@server", remoteId: "worker'quoted" }],
 	] as const) writeFileSync(path.join(root, "meta", `${id}.json`), JSON.stringify(meta));
-	mkdirSync(path.join(root, "sessions", agentId), { recursive: true });
+	// Local sessions are read from babysit's on-disk registry.
+	for (const id of [localId, agentId]) {
+		const sessionDir = path.join(root, "sessions", id);
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(path.join(sessionDir, "meta.json"), JSON.stringify({ id, cmd: ["x"], babysit_pid: process.pid, started_at: new Date().toISOString() }));
+		writeFileSync(path.join(sessionDir, "status.json"), JSON.stringify({ state: "running", child_pid: null, exit_code: null, last_change: new Date().toISOString() }));
+	}
 	writeFileSync(path.join(root, "sessions", agentId, "output.log"), "");
 	writeFileSync(state, JSON.stringify({ calls: [] }));
 	writeFileSync(cli, `#!/usr/bin/env bun
@@ -86,7 +92,7 @@ for(const [id,expectedArgs,local] of [
  if(local) assert.equal(call.root,process.env.PI_BABYSIT_DIR);
 }
 assert.equal(editorEdits,0); assert(renderRequests>=6);
-const originalWidget=widget; await refresh(); assert.equal(widget,originalWidget,'poll refresh must preserve feedback state'); assert(widget.render(200).find(line=>line.includes(${JSON.stringify(localId)})).endsWith('✓'));
+await click(${JSON.stringify(localId)}); const originalWidget=widget; await refresh(); assert.equal(widget,originalWidget,'poll refresh must preserve feedback state'); assert(widget.render(200).find(line=>line.includes(${JSON.stringify(localId)})).endsWith('✓'));
 rejectCopy=true; const previousCopies=clipboard.length; await click(${JSON.stringify(localId)});
 assert.equal(clipboard.length,previousCopies); assert(widget.render(200).find(line=>line.includes(${JSON.stringify(localId)})).endsWith('!')); assert.equal(editorEdits,0);
 // The existing keyboard picker exposes the same command for manual copying.
@@ -105,9 +111,9 @@ for(let i=0;i<2;i++) {
 	try {
 		const result = spawnSync(process.execPath, [script], {
 			cwd: import.meta.dir,
-			env: { ...process.env, PI_BABYSIT_CLI: cli, PI_BABYSIT_DIR: root, FAKE_LOG_STATE: state },
+			env: { ...process.env, PI_BABYSIT_CLI: cli, PI_BABYSIT_DIR: root, FAKE_LOG_STATE: state, PI_BABYSIT_QUICK_GRACE: "100ms" },
 			encoding: "utf8", timeout: 15_000,
 		});
 		expect(result.status, result.stdout + result.stderr).toBe(0);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 30_000);

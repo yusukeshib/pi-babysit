@@ -147,7 +147,7 @@ After reconnecting, check or kill tracked workers to establish terminal status
 before local retention can collect their metadata.
 
 The background poller only contacts hosts that still have unsettled tracked
-sessions. When a host keeps failing (SSH error, or none of its tracked
+sessions, and queries each host at most once every 2.5s. When a host keeps failing (SSH error, or none of its tracked
 sessions can be found), the poller retries it with backoff (free for two
 consecutive failures, then 5s doubling up to 60s) and sleeps while such sessions
 are the only pending work. Their status stays "unknown"; it is never
@@ -303,12 +303,19 @@ because blindly rerunning an arbitrary command can duplicate side effects.
 
 ## How completion detection works
 
-- **Process**: a 2.5s poller watches for running→exited transitions and, once the
+- **Process**: a 250ms poller watches for running→exited transitions and, once the
   parent agent is idle, injects one
   `pi.sendMessage(…, { triggerTurn: true, deliverAs: "steer" })` containing every
   deliverable exit observed in that poll (deduped via `meta/<id>.json`). Waiting
   for idleness prevents an immediately-following `babysit_wait` from racing the
-  poller and receiving a duplicate completion. Background process calls emitted
+  poller and receiving a duplicate completion; exits that happened during a run
+  are delivered as soon as the agent settles. Local status is read directly from
+  babysit's on-disk registry (`sessions/<id>/{meta.json,status.json,note}`) and
+  local logs are read from `output.log` with `babysit log`'s terminal-control
+  stripping, so local polling, waits, and output collection spawn no `babysit`
+  process. Before reading a just-finished session's output, the poller waits
+  (up to 1s) for the babysit supervisor to exit, because babysit records the exit
+  before it flushes the final PTY output. Background process calls emitted
   together in one assistant message automatically share a notification group;
   an explicit `notificationGroup` overrides this. Group members wait for every
   currently running member to stop and then share one notification even when
@@ -320,8 +327,8 @@ because blindly rerunning an arbitrary command can duplicate side effects.
   notification. Kill results are reconciled with persisted terminal state, so
   a backend escalation warning that arrives after the child has already exited
   does not produce a false failure followed by a redundant notification.
-- **Subagent**: `foreground: true` or `babysit_wait` blocks on
-  `babysit expect '"type":"agent_settled"'`. A background task that settles or
+- **Subagent**: `foreground: true` or `babysit_wait` re-checks the worker's RPC
+  log for `agent_settled` every 100ms. A background task that settles or
   exits before it is collected emits one ready-to-collect reminder; the parent
   must still call `babysit_wait` so the answer and nested usage are persisted.
   Unlike `agent_end`, `agent_settled` cannot precede an automatic retry,
