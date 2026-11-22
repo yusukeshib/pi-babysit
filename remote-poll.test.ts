@@ -42,14 +42,18 @@ const hooks = new Map(); const messages = [];
 extension({registerTool(){},on:(n,h)=>hooks.set(n,h),registerCommand(){},registerMessageRenderer(){},getActiveTools:()=>[],setActiveTools(){},getThinkingLevel:()=>'low',sendMessage:m=>messages.push(m)});
 const ctx={hasUI:true,mode:'tui',ui:{notify(){},setWidget(){},theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s}},cwd:'/tmp',isIdle:()=>true,sessionManager:{getSessionId:()=>'fake',getSessionFile:()=>'/tmp/s.jsonl'},model:{provider:'t',id:'t'}};
 await hooks.get('session_start')({}, ctx);
-await new Promise(r => setTimeout(r, 11_000));
+await new Promise(r => setTimeout(r, 16_000));
 await hooks.get('session_shutdown')({ reason: 'reload' });
 const lines = fs.readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n');
 const lists = host => lines.filter(l => l === host + ' list --json').length;
 // The settled alpha session is observed at most once, then never again.
 assert(lists('alpha') <= 1, 'alpha queried ' + lists('alpha') + ' times');
-// Without backoff beta would be queried on all 4 ticks (2.5s..10s).
-assert(lists('beta') >= 2 && lists('beta') <= 3, 'beta queried ' + lists('beta') + ' times');
+// Remote hosts are queried at most once per 2.5s even though local ticks are
+// faster. Without backoff beta would be queried 7 times in 16s; with it the
+// third failure defers the next query by 5s and the fourth by 10s.
+assert(lists('beta') >= 3 && lists('beta') <= 4, 'beta queried ' + lists('beta') + ' times');
+// Local status is read from disk, never through the CLI.
+assert.equal(lists('local'), 0);
 assert.equal(messages.length, 0, JSON.stringify(messages));
 console.log('remote poll scenario passed');
 `,
@@ -66,4 +70,4 @@ console.log('remote poll scenario passed');
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 40_000);

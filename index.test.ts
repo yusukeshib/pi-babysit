@@ -38,6 +38,11 @@ import extension, {
 	isConfirmedTerminalState,
 	isNotificationGroupReady,
 	isSupportedBabysitVersion,
+	lastLines,
+	LOCAL_STARTUP_GRACE_MS,
+	normalizeSession,
+	readLocalRegistry,
+	stripTerminalOutput,
 	parseEvents,
 	parseRpcResponseBytes,
 	planSubagentSpawn,
@@ -2333,3 +2338,115 @@ test("poller sleeps only when every pending session is on a backed-off host", ()
 	// Reachable remote sessions are polled normally even if the host had failures before.
 	expect(pollDeferredUntil([{ id: "remote-a", host: "a", state: "running" }], meta, backoff, 1_000)).toBe(0);
 });
+
+test("babysit's transient starting state is live work, not an exit", () => {
+	expect(normalizeSession({ id: "a", state: "starting", alive: true }).state).toBe("running");
+	expect(normalizeSession({ id: "a", state: "starting" }).state).toBe("running");
+	expect(normalizeSession({ id: "a", state: "starting", alive: false, exit_code: null }).state).toBe("dead");
+	expect(normalizeSession({ id: "a", state: "running", alive: false, exit_code: 3 }).state).toBe("exited");
+	expect(normalizeSession({ id: "a", state: "killed", alive: false, exit_code: 130 }).state).toBe("killed");
+});
+
+test("the local registry is read from babysit's on-disk layout like `babysit list --json`", () => {
+	const root = mkdtempSync(path.join(os.tmpdir(), "pi-local-registry-"));
+	const deadPid = spawnSync("true").pid!;
+	const session = (id: string, meta: unknown, status?: unknown, note?: string) => {
+		const dir = path.join(root, "sessions", id);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(path.join(dir, "meta.json"), typeof meta === "string" ? meta : JSON.stringify(meta));
+		if (status !== undefined) writeFileSync(path.join(dir, "status.json"), JSON.stringify(status));
+		if (note !== undefined) writeFileSync(path.join(dir, "note"), note);
+	};
+	const meta = (pid: number) => ({ id: "x", cmd: ["true"], babysit_pid: pid, started_at: "2026-01-01T00:00:00Z" });
+	const status = (state: string, exit_code: number | null, last_change: string) => ({ state, child_pid: null, exit_code, last_change });
+	try {
+		session("live", meta(process.pid), status("running", null, "2026-01-01T00:00:03Z"), "  needs input \n");
+		session("crashed", meta(deadPid), status("running", null, "2026-01-01T00:00:02Z"));
+		session("done", meta(deadPid), status("exited", 7, "2026-01-01T00:00:04Z"));
+		session("booting", meta(process.pid));
+		session("broken", "{not json");
+		mkdirSync(path.join(root, "sessions", "no-meta-yet"), { recursive: true });
+
+		const pending = new Map([
+			["launching", 1_000],
+			["no-meta-yet", 1_000],
+			["live", 1_000],
+			["gone", 1_000 - LOCAL_STARTUP_GRACE_MS - 1],
+		]);
+		const listed = readLocalRegistry(root, {}, pending, 1_000);
+		expect(listed.error).toBeUndefined();
+		const byId = Object.fromEntries(listed.sessions.map((s) => [s.id, s]));
+		expect(Object.keys(byId).sort()).toEqual(["booting", "crashed", "done", "launching", "live", "no-meta-yet"]);
+		expect(byId.live).toMatchObject({ state: "running", alive: true, note: "needs input", supervisorAlive: true });
+		expect(byId.crashed).toMatchObject({ state: "dead", alive: false, exit_code: null, supervisorAlive: false });
+		expect(byId.done).toMatchObject({ state: "exited", alive: false, exit_code: 7 });
+		expect(byId.booting).toMatchObject({ state: "running", alive: true });
+		// Launched ids without a registered session stay running during the grace;
+		// registered or expired ids leave the pending set.
+		expect(byId.launching).toMatchObject({ state: "running" });
+		expect(byId["no-meta-yet"]).toMatchObject({ state: "running" });
+		expect([...pending.keys()].sort()).toEqual(["launching", "no-meta-yet"]);
+		// Most recently changed first, like babysit.
+		const order = listed.sessions.map((s) => s.id).filter((id) => ["live", "crashed", "done"].includes(id));
+		expect(order).toEqual(["done", "live", "crashed"]);
+
+		expect(readLocalRegistry(root, { ids: ["done", "../escape", "missing"] }).sessions.map((s) => s.id)).toEqual(["done"]);
+		expect(readLocalRegistry(root, { skip: new Set(["done", "broken"]) }).sessions.some((s) => s.id === "done")).toBe(false);
+		expect(readLocalRegistry(path.join(root, "absent")).sessions).toEqual([]);
+		writeFileSync(path.join(root, "file-root"), "");
+		mkdirSync(path.join(root, "bad-root"));
+		writeFileSync(path.join(root, "bad-root", "sessions"), "");
+		expect(readLocalRegistry(path.join(root, "bad-root")).error).toContain("cannot read babysit registry");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("local log text matches `babysit log` stripping and tail semantics", () => {
+	const binary = process.env.PI_BABYSIT_CLI ?? "babysit";
+	const root = mkdtempSync(path.join(os.tmpdir(), "pi-strip-"));
+	const env = { ...process.env, BABYSIT_DIR: root };
+	const cases: Record<string, Buffer> = {
+		tabcr: Buffer.from("a\tb\r\nc\n"),
+		sgr: Buffer.from("\x1b[31mred\x1b[0m plain\n"),
+		oscBel: Buffer.from("\x1b]0;title\x07after\n"),
+		oscSt: Buffer.from("\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\\n"),
+		c0: Buffer.from("x\x00y\x01z\x7fw\x08v\n"),
+		csiC0: Buffer.from("\x1b[3\n1mz\n"),
+		dcs: Buffer.from("\x1bPqabc\x1b\\after\n"),
+		escSingle: Buffer.from("\x1b7save\x1b8\x1b(Bq\n"),
+		utf8: Buffer.from("héllo ✓ \u{1F600}\n"),
+		invalid: Buffer.from([0x61, 0xff, 0xfe, 0x62, 0x0a]),
+		c1: Buffer.from("a\u009bb\n"),
+		cancel: Buffer.from("\x1b[12\x18x\x1b]abc\x1ay\n"),
+		apc: Buffer.from("\x1b_hidden\x1b\\vis\n"),
+		bareEsc: Buffer.from("end\x1b"),
+		progress: Buffer.from("10%\r\x1b[K50%\r\x1b[K100%\n\x1b[?25hdone"),
+	};
+	try {
+		for (const [name, bytes] of Object.entries(cases)) {
+			const file = path.join(root, `${name}.bin`);
+			writeFileSync(file, bytes);
+			const launched = spawnSync(binary, ["run", "-d", "--json", "--no-tty", "--", "cat", file], { env, encoding: "utf8" });
+			const id = JSON.parse(launched.stdout).id;
+			// `run -d` returns before the detached worker registers the session.
+			let waited = spawnSync(binary, ["wait", "-s", id, "--timeout", "10s"], { env });
+			for (let i = 0; i < 100 && waited.status !== 0; i++) {
+				Bun.sleepSync(20);
+				waited = spawnSync(binary, ["wait", "-s", id, "--timeout", "10s"], { env });
+			}
+			expect(waited.status).toBe(0);
+			const raw = readFileSync(path.join(root, "sessions", id, "output.log"));
+			expect(raw.equals(bytes)).toBe(true);
+			const expected = spawnSync(binary, ["log", "-s", id], { env, encoding: "utf8" }).stdout;
+			expect([name, stripTerminalOutput(raw)]).toEqual([name, expected]);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+	expect(lastLines("a\nb\nc\n", 2)).toBe("b\nc\n");
+	expect(lastLines("a\nb\nc", 2)).toBe("b\nc");
+	expect(lastLines("a\nb", 5)).toBe("a\nb");
+	expect(lastLines("a\nb\n", 0)).toBe("");
+	expect(lastLines("", 3)).toBe("");
+}, 60_000);

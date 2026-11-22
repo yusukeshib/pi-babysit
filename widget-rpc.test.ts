@@ -4,35 +4,39 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-test("RPC polling stays UI-silent while still delivering process completion once", () => {
-	const dir = mkdtempSync(path.join(tmpdir(), "pi-widget-rpc-"));
-	const root = path.join(dir, "root");
-	const meta = path.join(root, "rpc-test", "meta");
-	const state = path.join(dir, "state.json");
-	const cli = path.join(dir, "babysit");
-	mkdirSync(meta, { recursive: true });
-	writeFileSync(path.join(meta, "job.json"), JSON.stringify({
-		kind: "process", command: "fixture", description: "Background fixture",
-		startedAt: Date.now(), completionObservedAt: Date.now() - 10_000,
-	}));
-	writeFileSync(state, JSON.stringify({ running: true, lists: 0 }));
-	writeFileSync(cli, `#!/usr/bin/env bun
+test("RPC polling stays UI-silent, spawns no CLI per tick, and delivers process completion once", () => {
+const dir = mkdtempSync(path.join(tmpdir(), "pi-widget-rpc-"));
+const root = path.join(dir, "root");
+const meta = path.join(root, "rpc-test", "meta");
+const session = path.join(root, "rpc-test", "sessions", "job");
+const calls = path.join(dir, "calls.log");
+const cli = path.join(dir, "babysit");
+mkdirSync(meta, { recursive: true });
+mkdirSync(session, { recursive: true });
+writeFileSync(path.join(meta, "job.json"), JSON.stringify({
+kind: "process", command: "fixture", description: "Background fixture", startedAt: Date.now(),
+}));
+writeFileSync(path.join(session, "output.log"), "\x1b[32mfixture output\x1b[0m\r\n");
+writeFileSync(calls, "");
+writeFileSync(cli, `#!/usr/bin/env bun
 import fs from 'node:fs';
 const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)}, args.join(' ') + '\\n');
 if (args[0] === '--version') console.log('babysit 0.14.7');
-else if (args[0] === 'list') {
- const state = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
- state.lists++;
- fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(state));
- console.log(JSON.stringify([{ id: 'job', state: state.running ? 'running' : 'exited', exit_code: state.running ? null : 0, output_bytes: 0 }]));
-} else if (args[0] === 'log') console.log('fixture output');
 else { console.error('unexpected command: ' + args.join(' ')); process.exit(1); }
 `, { mode: 0o755 });
-	const script = path.join(dir, "scenario.ts");
-	writeFileSync(script, `
+const script = path.join(dir, "scenario.ts");
+writeFileSync(script, `
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {spawn} from 'node:child_process';
 import extension from ${JSON.stringify(path.join(import.meta.dir, "index.ts"))};
+const session = ${JSON.stringify(session)};
+// Stand-in babysit supervisor: alive while running, gone after the exit.
+const supervisor = spawn('sleep', ['30'], {stdio:'ignore'});
+fs.writeFileSync(session + '/meta.json', JSON.stringify({id:'job', cmd:['fixture'], babysit_pid: supervisor.pid, started_at: new Date().toISOString()}));
+const status = (state, exit_code) => fs.writeFileSync(session + '/status.json', JSON.stringify({state, child_pid: null, exit_code, last_change: new Date().toISOString()}));
+status('running', null);
 const hooks = new Map(), messages = [], uiRequests = [];
 let complete;
 const completion = new Promise(resolve => { complete = resolve; });
@@ -44,21 +48,27 @@ const ctx = {
 };
 try {
  await hooks.get('session_start')({}, ctx);
- await new Promise(resolve => setTimeout(resolve, 5600));
- const state = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
- assert(state.lists >= 2, 'must exercise repeated running-session polls');
+ await new Promise(resolve => setTimeout(resolve, 1500));
  assert.deepEqual(uiRequests, [], 'running-session polling must not emit UI requests');
- fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify({...state, running:false}));
+ assert.equal(messages.length, 0, 'a running session must not notify');
+ status('exited', 0);
+ const exitedAt = Date.now();
+ supervisor.kill();
  let timeout;
  try {
-  await Promise.race([completion, new Promise((_, reject)=>{timeout=setTimeout(()=>reject(new Error('missing completion notification')), 10_000);})]);
+  await Promise.race([completion, new Promise((_, reject)=>{timeout=setTimeout(()=>reject(new Error('missing completion notification')), 5_000);})]);
  } finally { clearTimeout(timeout); }
- await new Promise(resolve => setTimeout(resolve, 2800));
+ assert(Date.now() - exitedAt < 1500, 'completion took ' + (Date.now() - exitedAt) + 'ms');
+ await new Promise(resolve => setTimeout(resolve, 1000));
  assert.equal(messages.length, 1, 'completion must not be repeated');
  assert(messages[0].content.includes('fixture output'));
+ assert(!messages[0].content.includes('\\x1b'), 'output must be stripped of terminal controls');
  assert(messages[0].content.includes('Background fixture'));
  assert.deepEqual(uiRequests, [], 'terminal-session polling must not emit UI requests');
+ const spawned = fs.readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n').filter(Boolean);
+ assert.deepEqual(spawned, ['--version'], 'local polling must not spawn the babysit CLI: ' + spawned.join(', '));
 } finally {
+ supervisor.kill();
  await hooks.get('session_shutdown')({reason:'reload'});
 }
 `);
