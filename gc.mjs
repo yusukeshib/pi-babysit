@@ -94,12 +94,14 @@ function gcRootIsSafe(root) {
 	}
 
 	// Remote PIDs are meaningless locally. Retain unresolved remote references;
-	// terminal observations are persisted by listSessions, never prune remote data.
+	// terminal observations (exited/killed, or dead when the host's registry no
+	// longer lists the worker) are persisted by listSessions. Never prune remote data.
 	try {
 		for (const file of fs.readdirSync(path.join(root, "meta"))) {
 			if (!file.endsWith(".json")) continue;
 			const meta = JSON.parse(fs.readFileSync(path.join(root, "meta", file), "utf8"));
-			if (meta.host && (!meta.remoteTerminalState || !isConfirmedTerminalState(meta.remoteTerminalState))) return false;
+			const remoteState = meta.remoteTerminalState;
+			if (meta.host && (!remoteState || (!isConfirmedTerminalState(remoteState) && remoteState !== "dead"))) return false;
 		}
 	} catch (error) {
 		if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT") return false;

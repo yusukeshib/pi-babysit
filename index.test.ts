@@ -47,8 +47,11 @@ import extension, {
 	parseRpcResponseBytes,
 	planSubagentSpawn,
 	prepareBabysitRunArguments,
+	persistedRemoteSession,
 	processSessionEnvironment,
 	pruneTerminalSessionCache,
+	REMOTE_STARTUP_GRACE_MS,
+	remoteAbsenceIsAuthoritative,
 	readableLaunchCommand,
 	readLogBytesFrom,
 	resolveKillConfirmation,
@@ -1325,6 +1328,34 @@ test("kill confirmation validates both backend acknowledgement and terminal stat
 		confirmed: false,
 		error: "Kill could not be verified: session job disappeared.",
 	});
+	// No live worker is left to signal, so the session must still be dismissible.
+	expect(resolveKillConfirmation("job", "session not found", "dead")).toEqual({
+		confirmed: true,
+		warning: "session not found",
+	});
+});
+
+test("remote absence is authoritative only after launch and registration settle", () => {
+	const now = 1_000_000;
+	expect(remoteAbsenceIsAuthoritative(undefined, undefined, now)).toBe(true);
+	expect(remoteAbsenceIsAuthoritative(now - REMOTE_STARTUP_GRACE_MS - 1, undefined, now)).toBe(true);
+	expect(remoteAbsenceIsAuthoritative(now - 1_000, undefined, now)).toBe(false);
+	// In-flight launch, however old the metadata is.
+	expect(remoteAbsenceIsAuthoritative(now - 3_600_000, Number.POSITIVE_INFINITY, now)).toBe(false);
+	// A slow launch that just returned still gets the full registration grace.
+	expect(remoteAbsenceIsAuthoritative(now - 3_600_000, now - 1_000, now)).toBe(false);
+	expect(remoteAbsenceIsAuthoritative(now - 3_600_000, now - REMOTE_STARTUP_GRACE_MS - 1, now)).toBe(true);
+
+	expect(persistedRemoteSession("job", "h", { remoteId: "r" })).toBeNull();
+	expect(persistedRemoteSession("job", "h", { remoteId: "r", remoteTerminalState: "exited", remoteExitCode: 2 })).toEqual({
+		id: "job",
+		host: "h",
+		state: "exited",
+		alive: false,
+		exit_code: 2,
+		note: null,
+	});
+	expect(persistedRemoteSession("job", "h", { remoteId: "r", remoteTerminalState: "dead" })?.note).toContain("not in h's babysit registry");
 });
 
 test("clip enforces the complete byte limit at zero, exact, and overflow boundaries", () => {

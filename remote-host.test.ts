@@ -22,7 +22,7 @@ else if(state.offline && host!=='local') {console.error('SSH unavailable'); save
 else if(command==='list') {if(host==='local') {console.error('local status must be read from disk');save();process.exit(1);} console.log(JSON.stringify(Object.values(state.sessions[host]??{})));}
 else if(command==='run') {const rid=args[args.indexOf('--id')+1]; if(rid.length>64 || !/^[A-Za-z0-9_.-]+$/.test(rid)) {console.error('session id too long or invalid (max 64)');save();process.exit(1);} (state.sessions[host]??={})[rid]={id:rid,state:'running',alive:true}; if(state.failLaunch) {console.error('lost launch reply'); save(); process.exit(255);} console.log(state.malformed?'not json':JSON.stringify({id:rid}));}
 else if(command==='wait') {if(state.hangWait) {save(); const {spawn}=await import('node:child_process'); const transport=spawn('sleep',['30'],{stdio:'inherit'}); fs.writeFileSync(file+'.grandchild',String(transport.pid)); setInterval(()=>{},1000); await new Promise(()=>{});} if(state.finish) Object.assign(state.sessions[host][id],{state:'exited',exit_code:0}); else {save();process.exit(124);}}
-else if(command==='kill') {if(!state.unconfirmed) Object.assign(state.sessions[host][id],{state:'killed',alive:false}); console.log(JSON.stringify({killed:true,confirmed:!state.unconfirmed}));}
+else if(command==='kill') {if(!state.sessions[host]?.[id]) {console.error('error: session not found: '+id);save();process.exit(1);} if(!state.unconfirmed) Object.assign(state.sessions[host][id],{state:'killed',alive:false}); console.log(JSON.stringify({killed:true,confirmed:!state.unconfirmed}));}
 else if(command==='log') {if(state.logFail) {console.error('log unavailable');save();process.exit(1);} if(args.includes('--json')) {if(args.includes('--timestamps')&&state.noTimestamps) {console.error("error: unexpected argument '--timestamps' found");save();process.exit(2);} const text=state.logText??'remote output'; const since=Number(args[args.indexOf('--since')+1]); const out={text:text.slice(since),offset:text.length,done:state.sessions[host][id].state!=='running'}; if(args.includes('--timestamps')) {let at=0; out.timestamps=text.split(/(?<=\\n)/).flatMap((line,i)=>{const s=at; at+=line.length; const b=Math.max(s,since), e=Math.min(at,text.length); return line&&e>b?[[b,e-b,1000+i]]:[];});} console.log(JSON.stringify(out));} else console.log(args.includes('--grep')?'matching output':(state.logText??'remote output'));}
 else if(command==='screenshot') console.log('remote screen');
 else if(command==='expect') console.log('matched');
@@ -37,8 +37,8 @@ save();
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import extension, {gcBabysitRoots,remoteProcessCommand,remoteProcessId,validateProcessHost} from ${JSON.stringify(path.join(import.meta.dir, "index.ts"))};
-const tools=new Map(); const hooks=new Map(); const messages=[];
-extension({registerTool:t=>tools.set(t.name,t),on:(n,h)=>hooks.set(n,h),registerCommand(){},registerMessageRenderer(){},getActiveTools:()=>[],getThinkingLevel:()=> 'low',sendMessage:m=>messages.push(m)});
+const tools=new Map(); const hooks=new Map(); const messages=[]; const commands=new Map();
+extension({registerTool:t=>tools.set(t.name,t),on:(n,h)=>hooks.set(n,h),registerCommand:(n,c)=>commands.set(n,c),registerMessageRenderer(){},getActiveTools:()=>[],getThinkingLevel:()=> 'low',sendMessage:m=>messages.push(m)});
 let widget; let inputHooks=0;
 const ctx={hasUI:true,mode:'tui',ui:{setWidget(_name,factory){widget=typeof factory==='function'?factory({requestRender(){}}):undefined;},onTerminalInput(){inputHooks++;},theme:{fg:(_,s)=>s,bg:(_,s)=>s,bold:s=>s}},cwd:'/local/does-not-exist',isIdle:()=>true, sessionManager:{getSessionId:()=> 'fake',getSessionFile:()=> '/local/pi-session.jsonl'},model:{provider:'test',id:'test'}};
 const call=async(name,args,signal)=>{args={description:'Verify remote '+name+' behavior',...args}; try {return await tools.get('babysit_'+name).execute('call',args,signal,undefined,ctx);} catch(e){return {isError:true,content:[{text:e.message}],details:{}};}};
@@ -75,6 +75,22 @@ set({hangWait:true}); const controller=new AbortController(); const hangStarted=
 const detached=await call('run',{host:'alpha',name:'detached',command:'sleep 10',foreground:true,lifecycle:'detached'},AbortSignal.abort()); assert(detached.isError); assert(!meta('detached').remoteTerminalState); assert(!(await call('kill',{id:'detached'})).isError);
 set({unconfirmed:true}); const unverified=await call('run',{host:'alpha',name:'unverified',command:'sleep 10',foreground:true},AbortSignal.abort()); assert(unverified.isError); assert(unverified.content[0].text.includes('could not be verified')); assert(!meta('unverified').killNotificationSuppressed); set({unconfirmed:false}); assert(!(await call('kill',{id:'unverified'})).isError);
 set({malformed:true}); const malformed=await call('run',{host:'alpha',name:'malformed',command:'true',continueAfterStart:true}); assert(malformed.isError); assert(meta('malformed').remoteId); set({malformed:false}); assert(!(await call('kill',{id:'malformed'})).isError);
+// A tracked worker that a reachable host does not list (never started) can be
+// dismissed with kill instead of staying "running · status unknown" forever.
+const writeMetaFile=(id,value)=>fs.writeFileSync(process.env.PI_BABYSIT_DIR+'/meta/'+id+'.json',JSON.stringify(value));
+writeMetaFile('ghost',{kind:'process',host:'alpha',remoteId:'pi-ghost',name:'ghost',notified:false,startedAt:Date.now()-60000});
+const ghostCheck=await call('check',{id:'ghost'}); assert(!ghostCheck.isError,JSON.stringify(ghostCheck)); assert.equal(meta('ghost').remoteTerminalState,'dead');
+const ghostKill=await call('kill',{id:'ghost'}); assert(!ghostKill.isError,JSON.stringify(ghostKill)); assert(ghostKill.content[0].text.includes('nothing left to kill'),JSON.stringify(ghostKill)); assert(ghostKill.content[0].text.includes("not in alpha's babysit registry")); assert(meta('ghost').killNotificationSuppressed);
+// /babysit forget drops local tracking only for sessions kill cannot verify.
+const notices=[]; ctx.ui.notify=(text,level)=>notices.push({text,level}); let confirms=0; ctx.ui.confirm=async()=>{confirms++;return true;};
+const forget=id=>commands.get('babysit').handler('forget '+id,ctx);
+writeMetaFile('ghost-offline',{kind:'process',host:'alpha',remoteId:'pi-ghost-offline',notified:false,startedAt:Date.now()-60000});
+set({offline:true}); assert((await call('kill',{id:'ghost-offline'})).isError); await forget('ghost-offline'); set({offline:false});
+assert.equal(confirms,1); assert(!fs.existsSync(process.env.PI_BABYSIT_DIR+'/meta/ghost-offline.json')); assert(notices.at(-1).text.includes('pi-ghost-offline'),JSON.stringify(notices));
+const live=await call('run',{host:'alpha',name:'live-forget',command:'sleep 10',continueAfterStart:true}); assert(!live.isError,JSON.stringify(live));
+await forget('live-forget'); assert.equal(confirms,1); assert.equal(notices.at(-1).level,'error'); assert(fs.existsSync(process.env.PI_BABYSIT_DIR+'/meta/live-forget.json')); assert(!(await call('kill',{id:'live-forget'})).isError);
+await forget('../x'); assert.equal(notices.at(-1).level,'error'); assert.equal(confirms,1);
+delete ctx.ui.notify; delete ctx.ui.confirm;
 // Widget refreshes are passive: no log commands, input hooks, or terminal rows.
 const logReads=()=>read().calls.filter(c=>c.args.includes('log')).length;
 const beforeWidget=logReads();

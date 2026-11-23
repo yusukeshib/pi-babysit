@@ -548,6 +548,57 @@ const unknownRemoteSession = (id: string, host: string, error: string): BsSessio
 	note: `status unknown on ${host}: ${error}`,
 });
 
+/**
+ * Persisted remote states that can never change again: an observed exit/kill,
+ * or `dead` when the host's registry was listed successfully and no longer (or
+ * never) contained the worker.
+ */
+export function isResolvedRemoteState(state: string | undefined): state is string {
+	return state !== undefined && (isConfirmedTerminalState(state) || state === "dead");
+}
+
+export function missingRemoteNote(host: string, remoteId: string | undefined): string {
+	return `remote worker ${remoteId ?? "?"} is not in ${host}'s babysit registry (it never started, or its record was removed)`;
+}
+
+/**
+ * Last persisted terminal state of a tracked remote session. Used when the host
+ * cannot be queried: a finished session must not reappear as running/unknown.
+ */
+export function persistedRemoteSession(
+	id: string,
+	host: string,
+	meta: Pick<Meta, "remoteId" | "remoteTerminalState" | "remoteExitCode">,
+): BsSession | null {
+	const state = meta.remoteTerminalState;
+	if (!isResolvedRemoteState(state)) return null;
+	return {
+		id,
+		host,
+		state,
+		alive: false,
+		exit_code: meta.remoteExitCode ?? null,
+		note: state === "dead" ? missingRemoteNote(host, meta.remoteId) : null,
+	};
+}
+
+/**
+ * `babysit run -d` can return before the detached worker registers itself, and
+ * an in-flight launch has not registered yet either. Only after that window is
+ * a worker missing from a successfully listed registry known not to exist.
+ */
+export const REMOTE_STARTUP_GRACE_MS = LOCAL_STARTUP_GRACE_MS;
+const pendingRemoteStarts = new Map<string, number>();
+
+export function remoteAbsenceIsAuthoritative(
+	startedAt: number | undefined,
+	launchSettledAt: number | undefined,
+	now = Date.now(),
+): boolean {
+	if (launchSettledAt !== undefined && !(now - launchSettledAt > REMOTE_STARTUP_GRACE_MS)) return false;
+	return startedAt === undefined || now - startedAt > REMOTE_STARTUP_GRACE_MS;
+}
+
 // The poller ticks quickly because local status is a few file reads, but
 // remote status costs an SSH round trip. Each host is therefore queried at
 // most once per POLL_MS; ticks in between reuse that host's last poll result.
@@ -577,8 +628,11 @@ async function listSessions(
 		const backoff = remoteHostBackoff.get(host);
 		if (options.poll && backoff && Date.now() < backoff.nextAt) {
 			const retry = Math.ceil((backoff.nextAt - Date.now()) / 1000);
-			for (const { id } of tracked) {
-				local.sessions.push(unknownRemoteSession(id, host, `${backoff.error} (retrying in ${retry}s)`));
+			for (const { id, meta } of tracked) {
+				local.sessions.push(
+					persistedRemoteSession(id, host, meta) ??
+						unknownRemoteSession(id, host, `${backoff.error} (retrying in ${retry}s)`),
+				);
 			}
 			return;
 		}
@@ -590,31 +644,51 @@ async function listSessions(
 		const queriedAt = Date.now();
 		const remote = await localSessions(host);
 		const observed = new Map<string, BsSession>();
-		let foundCount = 0;
 		for (const { id, meta } of tracked) {
+			if (remote.error) {
+				// Transport failure: status is unknown, never a fabricated exit. A
+				// terminal state persisted earlier stays final, though.
+				observed.set(id, persistedRemoteSession(id, host, meta) ?? unknownRemoteSession(id, host, remote.error));
+				continue;
+			}
 			const found = remote.sessions.find((session) => session.id === meta.remoteId);
-			if (found && !remote.error) {
-				foundCount++;
+			if (found) {
+				pendingRemoteStarts.delete(id);
 				observed.set(id, { ...found, id, host });
 				const terminalState = isConfirmedTerminalState(found.state) ? found.state : undefined;
-				if (meta.remoteTerminalState !== terminalState) {
-					writeMeta(id, { ...readMeta(id)!, remoteTerminalState: terminalState });
+				const exitCode = terminalState ? (found.exit_code ?? undefined) : undefined;
+				if (meta.remoteTerminalState !== terminalState || meta.remoteExitCode !== exitCode) {
+					writeMeta(id, { ...readMeta(id)!, remoteTerminalState: terminalState, remoteExitCode: exitCode });
 				}
+			} else if (remoteAbsenceIsAuthoritative(meta.startedAt, pendingRemoteStarts.get(id))) {
+				// The host answered and the worker is not registered: an unverified
+				// launch that never started, or a record removed on the host. Resolve
+				// it as dead so it can be notified, killed, and collected instead of
+				// staying "running · status unknown" forever.
+				pendingRemoteStarts.delete(id);
+				if (meta.remoteTerminalState === undefined) {
+					writeMeta(id, { ...readMeta(id)!, remoteTerminalState: "dead", remoteExitCode: undefined });
+					meta.remoteTerminalState = "dead";
+				}
+				observed.set(id, {
+					...persistedRemoteSession(id, host, meta)!,
+					note: missingRemoteNote(host, meta.remoteId),
+				});
 			} else {
-				// Keep unresolved references active for polling/group delivery, never fabricate exit.
-				observed.set(id, unknownRemoteSession(id, host, remote.error ?? "tracked remote session not found"));
+				// Launch in flight or still registering: report it like a pending local start.
+				observed.set(id, { id, host, state: "running", alive: true, exit_code: null, note: null });
 			}
 		}
 		local.sessions.push(...observed.values());
 		if (options.poll) remotePollCache.set(host, { at: queriedAt, sessions: observed });
-		if (foundCount > 0) {
+		if (!remote.error) {
 			remoteHostBackoff.delete(host);
 		} else if (options.poll) {
 			const failures = (backoff?.failures ?? 0) + 1;
 			remoteHostBackoff.set(host, {
 				failures,
 				nextAt: Date.now() + remoteBackoffDelayMs(failures),
-				error: remote.error ?? "tracked remote session not found",
+				error: remote.error,
 			});
 		}
 	}));
@@ -683,7 +757,9 @@ export function resolveKillConfirmation(
 	backendError: string | null,
 	state: string | undefined,
 ): { confirmed: true; warning?: string } | { confirmed: false; error: string } {
-	if (state && isConfirmedTerminalState(state)) {
+	// `dead` has no live babysit worker left to signal, so a kill can never make
+	// progress; failing here would leave the session impossible to dismiss.
+	if (state && (isConfirmedTerminalState(state) || state === "dead")) {
 		return backendError ? { confirmed: true, warning: backendError } : { confirmed: true };
 	}
 	if (backendError) return { confirmed: false, error: backendError };
@@ -759,7 +835,9 @@ export interface SubagentBudget {
 interface Meta {
 	host?: string;
 	remoteId?: string;
+	/** Final remote state: observed `exited`/`killed`, or `dead` when the host no longer lists the worker. */
 	remoteTerminalState?: string;
+	remoteExitCode?: number;
 	kind: "process" | "subagent";
 	/** Human-facing purpose. Optional only for metadata written by older versions. */
 	description?: string;
@@ -2462,10 +2540,14 @@ async function spawnProcess(opts: ProcOpts): Promise<{ id: string } | { error: s
 	bsArgs.push("--", remote ? "sh" : SHELL, "-c", remote ? remoteProcessCommand(opts.command, opts.cwd, opts.env) : opts.command);
 
 	let r: Awaited<ReturnType<typeof bs>>;
+	// Until the launch returns (plus the registration grace), a worker missing
+	// from the host's registry is not evidence that it never started.
+	if (remote) pendingRemoteStarts.set(reservedId!, Number.POSITIVE_INFINITY);
 	try {
 		r = await bs(bsArgs, { cwd: remote ? undefined : opts.cwd, env: remote ? undefined : opts.env, host: opts.host });
 	} finally {
 		if (reservedId) reservedSessionIds.delete(reservedId);
+		if (remote) pendingRemoteStarts.set(reservedId!, Date.now());
 	}
 	if (remote) {
 		if (r.code !== 0) return { error: `Remote launch on ${opts.host} is unverified: ${r.stderr || r.stdout}. Tracked id: ${reservedId}; use check/kill to reconcile. Do not blindly retry.` };
@@ -3804,7 +3886,7 @@ export default function (pi: ExtensionAPI) {
 			const summary = ok
 				? `Process "${session.id}" completed successfully after ${runtime}.`
 				: session.state === "dead" || session.exit_code == null
-					? `Process "${session.id}" was terminated after ${runtime}.`
+					? `Process "${session.id}" was terminated after ${runtime}${session.host && session.state === "dead" && session.note ? `: ${session.note}` : ""}.`
 					: `Process "${session.id}" exited with code ${session.exit_code} after ${runtime}.`;
 			prepared.push({
 				id: session.id,
@@ -4072,6 +4154,7 @@ export default function (pi: ExtensionAPI) {
 		remoteHostBackoff.clear();
 		remotePollCache.clear();
 		pendingLocalStarts.clear();
+		pendingRemoteStarts.clear();
 		armPolling();
 		const retentionDays = Number(process.env.PI_BABYSIT_RETENTION_DAYS ?? "3");
 		if (
@@ -5475,15 +5558,14 @@ export default function (pi: ExtensionAPI) {
 
 			suppressNotify(params.id, "kill");
 			await refreshWidget(ctx);
+			const text = status.state === "dead"
+				? `${params.id} has no live babysit worker (dead${status.host && status.note ? `: ${status.note}` : ""}); nothing left to kill. ` +
+					"It is no longer tracked as running and will not send a completion notification. " +
+					"If its command could have outlived the worker, check the host's process list."
+				: `Killed ${params.id} (confirmed ${status.state}).` +
+					(confirmation.warning ? ` Backend warning after termination: ${confirmation.warning}` : "");
 			return {
-				content: [
-					{
-						type: "text",
-						text:
-							`Killed ${params.id} (confirmed ${status.state}).` +
-							(confirmation.warning ? ` Backend warning after termination: ${confirmation.warning}` : ""),
-					},
-				],
+				content: [{ type: "text", text }],
 				details: {
 					id: params.id,
 					status: status.state,
@@ -5522,13 +5604,55 @@ export default function (pi: ExtensionAPI) {
 		return sessions[labels.indexOf(choice)];
 	};
 
+	// Human escape hatch for a tracked remote session whose host can no longer
+	// answer (renamed alias, decommissioned machine). kill cannot verify such a
+	// session, so it would otherwise stay "running · status unknown" forever.
+	// Only local tracking is dropped; the remote worker, if any, is untouched.
+	const forgetRemoteSession = async (id: string, ctx: ExtensionContext): Promise<void> => {
+		if (!id || /[\\/]/.test(id) || id === "." || id === "..") {
+			ctx.ui.notify("Usage: /babysit forget <id>", "error");
+			return;
+		}
+		const meta = readMeta(id);
+		if (!meta?.host || !meta.remoteId) {
+			ctx.ui.notify(
+				`${id} is not a tracked remote session. Use babysit_kill for local sessions.`,
+				"error",
+			);
+			return;
+		}
+		const lookup = await lookupStatus(id);
+		if (!lookup.error && lookup.session?.state === "running") {
+			ctx.ui.notify(`${id} is running on ${meta.host}; kill it with babysit_kill instead.`, "error");
+			return;
+		}
+		const status = lookup.error ? `unknown (${lookup.error})` : (lookup.session?.state ?? "not found");
+		const remoteKill = `${shq(BABYSIT_BIN)} --host ${shq(meta.host)} kill -s ${shq(meta.remoteId)}`;
+		const confirmed = await ctx.ui.confirm(
+			"Forget remote babysit session?",
+			`${id} on ${meta.host} (remote worker ${meta.remoteId})\nStatus: ${status}\n` +
+				"Only local tracking is removed; a remote worker that still exists is NOT killed.",
+		);
+		if (!confirmed) return;
+		try {
+			fs.rmSync(path.join(metaDir(), `${id}.json`), { force: true });
+		} catch (error) {
+			ctx.ui.notify(`Could not forget ${id}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		settledSessionIds.delete(id);
+		pendingRemoteStarts.delete(id);
+		await refreshWidget(ctx);
+		ctx.ui.notify(`Forgot ${id}. If the remote worker may still exist, run: ${remoteKill}`, "info");
+	};
+
 	// ----- /babysit -----------------------------------------------------------
 	// Arrow up/down picker over all sessions (like /stash). Renders an INLINE
 	// snapshot (no tmux): running process → current rendered screen + recent
 	// output + a copy-paste `babysit attach` take-over hint; running subagent →
 	// read-only progress; finished → summary. Re-run to refresh.
 	pi.registerCommand("babysit", {
-		description: "Pick a session to inspect; /babysit gc [days] removes old terminal roots",
+		description: "Pick a session to inspect; /babysit gc [days] removes old terminal roots; /babysit forget <id> drops an unreachable remote session",
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (command === "gc" || command.startsWith("gc ")) {
@@ -5564,8 +5688,12 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			if (command === "forget" || command.startsWith("forget ")) {
+				await forgetRemoteSession(command.slice("forget".length).trim(), ctx);
+				return;
+			}
 			if (command) {
-				ctx.ui.notify("Usage: /babysit or /babysit gc [days]", "error");
+				ctx.ui.notify("Usage: /babysit, /babysit gc [days], or /babysit forget <id>", "error");
 				return;
 			}
 			const picked = await pickSession(ctx);

@@ -146,12 +146,28 @@ roots with unresolved remote identities; it never deletes/prunes remote logs.
 After reconnecting, check or kill tracked workers to establish terminal status
 before local retention can collect their metadata.
 
+When a host answers but its registry does not list a tracked worker (an
+uncertain launch that never started, or a record removed on the host) once the
+launch has returned and a 15s registration grace has passed, the session is
+resolved as `dead` with a "not in the host's babysit registry" note: it sends one
+completion notification, leaves the widget, and becomes collectable. A persisted
+terminal state (`exited`/`killed`, with its exit code, or `dead`) is final, so a
+finished session never reappears as running/unknown while its host is
+unreachable. `babysit_kill` on a `dead` session (local or remote) succeeds
+without a live worker to signal and suppresses its notification.
+
+If a host can no longer be reached at all (renamed alias, retired machine),
+kill cannot verify anything. A human can run `/babysit forget <id>` to drop the
+local tracking after confirmation; it refuses sessions that are confirmed
+running, never kills the remote worker, and prints the `babysit --host … kill`
+command for manual cleanup.
+
 The background poller only contacts hosts that still have unsettled tracked
 sessions, and queries each host at most once every 2.5s. When a host keeps failing (SSH error, or none of its tracked
 sessions can be found), the poller retries it with backoff (free for two
 consecutive failures, then 5s doubling up to 60s) and sleeps while such sessions
-are the only pending work. Their status stays "unknown"; it is never
-reported as an exit. Explicit `babysit_check`/`wait`/`kill` calls always query
+are the only pending work. Unless a terminal state was persisted earlier, their
+status stays "unknown"; an SSH failure is never reported as an exit. Explicit `babysit_check`/`wait`/`kill` calls always query
 the host.
 
 ## Commands (human)
@@ -159,6 +175,7 @@ the host.
 | Command | What it does |
 | ------- | ------------ |
 | `/babysit` | Arrow-key picker over all sessions. Renders an **inline snapshot** (no tmux): running **process** → current rendered screen + recent output + a copy-paste `babysit attach` take-over hint (detach `Ctrl-\ Ctrl-\`); running **subagent** → read-only progress (RPC stdin stays untouchable); finished → summary. Re-run `/babysit` to refresh |
+| `/babysit forget <id>` | Confirm and drop local tracking of a remote session whose host cannot verify it (for example a retired host). Refuses sessions confirmed running; never kills the remote worker and prints the manual `babysit --host … kill` command |
 | `/babysit gc [days]` | Preview and confirm deletion of old Pi-session roots (default 14 days). Active leases, live supervisor/child PIDs, unknown states, the current root, and recent roots are retained; old empty roots are eligible once their lease is gone. Deletion uses a GC lock and atomic rename |
 
 The TUI-only widget below the editor lists all running sessions, newest first,
